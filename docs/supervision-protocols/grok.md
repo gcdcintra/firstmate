@@ -9,9 +9,9 @@ When this session owns supervision and away mode is not active:
    `[ -f __FM_X_MODE_ENV_SH__ ] && . __FM_X_MODE_ENV_SH__; exec bin/fm-watch-arm.sh`
 
 4. Trust only the arm's one-line status.
-5. `watcher: started ...` or `watcher: attached ...` means a live cycle exists.
-   On attach, the background task follows verified identity-matched successors instead of exiting when the first cycle ends.
-6. Failure or missing cycle only: `watcher: FAILED ...` means supervision is down; fix and re-arm.
+5. `watcher: started ...` or `watcher: attached ...` means a live cycle exists; both are printed only after the arm verifies that cycle stays alive.
+   On attach, the background task follows verified identity-matched successors and takes the cycle over itself instead of exiting when the chain ends with nothing holding the lock.
+6. Failure or missing cycle only: `watcher: FAILED ...` means supervision is down; the line names what failed, so report that reason rather than the bare status when you fix and re-arm.
 7. After a successful start or attach status, end the turn.
    The background arm remains the live wait until it returns an actionable wake or failure.
 8. Waiting is silent.

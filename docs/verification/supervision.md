@@ -187,6 +187,88 @@ Observed guarantee: after ordinary `session_shutdown` for `/new`, `/resume`, and
 Stale prior-generation tool callbacks could not mutate the active child, repeated transitions kept exactly one live arm cycle, and terminal `quit` still refused late rearm.
 Plain Pi and pi-signed share the same tracked `.pi/extensions/fm-primary-pi-watch.ts` path, so both inherit the generation owner; other primary harnesses are not applicable because they do not use this Pi extension lifecycle.
 
+### Attach verification, concrete failure reasons, and cycle takeover
+
+Measured on 2026-08-01 with bash 5.2.21, ShellCheck 0.11.0, Claude Code 2.1.220, Linux 6.8.0-136-generic, against an isolated scratch state directory.
+Two arms ran against one home through tracked scripts only, and the incumbent cycle was then signalled the same way `bin/fm-watch-arm.sh --restart` signals it:
+
+```sh
+export FM_STATE_OVERRIDE="$scratch/state" FM_POLL=2 FM_SIGNAL_GRACE=1
+bin/fm-watch-arm.sh > armA.out 2>&1 &
+bin/fm-watch-arm.sh > armB.out 2>&1 &
+kill -TERM "$(cat "$FM_STATE_OVERRIDE/.watch.lock/pid")"
+```
+
+Observed before the repair, reproducing the reported state exactly:
+
+```text
+armA.out: watcher: started pid=1578935 (beacon fresh)
+armA.out: watcher: FAILED - watcher cycle exited 1 without an actionable reason
+armB.out: watcher: attached pid=1578935 (beacon 1s)
+live watchers: 0
+beacon age: 13s
+```
+
+The attached arm's own `watcher: FAILED - cycle ended without an actionable reason` followed about ten seconds later, by which time the home had already been unsupervised for that whole window.
+
+Observed after the repair from the same commands:
+
+```text
+armA.out: watcher: started pid=1809720 (beacon fresh)
+armA.out: watcher: cycle stopped by SIGTERM
+armA.out: watcher: FAILED - watcher cycle was stopped by SIGTERM (exit 143)
+armB.out: watcher: attached pid=1809720 (beacon 2s)
+armB.out: watcher: started pid=1812513 (beacon fresh)
+live watchers: 1
+beacon age: 1s
+```
+
+The signalled exit was the unexplained one: the watcher's `HUP`/`INT`/`TERM` traps exited a bare 1, so the arm could only report an exit code.
+The watcher now names the signal and exits 128 plus the signal number, and the arm quotes a bounded stderr tail with every failed cycle.
+A fresh beacon with zero live watchers is why beacon freshness alone never proves supervision is up.
+
+### Auto-arm claim reclaim
+
+Measured on 2026-08-01 with the same versions.
+A fixture primary home carried an in-flight task and a claim in the shape an interrupted claim leaves behind: `state/.claude-autoarm.lock` recording a dead owner pid and still holding the owner link that keeps its own removal failing.
+Three consecutive Stop firings ran the real `bin/fm-claude-stop-autoarm.sh` as a child of the lock-owning harness.
+
+Observed before the repair:
+
+```text
+recorded claim owner pid=1586706  alive=no
+Stop 1: exit=0 arms_run=
+Stop 2: exit=0 arms_run=
+Stop 3: exit=0 arms_run=
+epoch: NONE
+```
+
+Observed after the repair:
+
+```text
+recorded claim owner pid=1812971  alive=no
+Stop 1: exit=2 arms_run=1 firstmate watcher wake - one supervision event needs a handling turn now.
+Stop 2: exit=2 arms_run=2 firstmate watcher wake - one supervision event needs a handling turn now.
+Stop 3: exit=2 arms_run=3 firstmate watcher wake - one supervision event needs a handling turn now.
+epoch: epoch=6 owner_pid=1814136 outcome=rewake updated_at=1785604166
+```
+
+Owner-pid liveness is the exact test, so a live owner's claim is still honored and only a claim nothing owns is reclaimed.
+
+### Harness and backend applicability
+
+The arm and watcher changes are harness-agnostic, and the claim reclaim is Claude-specific.
+
+| Axis | Integration surface inspected | Applicability |
+| --- | --- | --- |
+| Claude | `bin/fm-claude-stop-autoarm.sh` matches `^watcher: FAILED` and owns the claim | Both changes apply; the matched prefix is unchanged. |
+| Codex | `bin/fm-watch-checkpoint.sh` runs the watcher directly under `timeout`, which reports 124 on timeout regardless of the child status, and prints the quiet-checkpoint line without the captured stderr | Watcher change applies with no classification or output change. |
+| OpenCode | `.opencode/plugins/fm-primary-watch-arm.js` matches `/^watcher: FAILED/` and classifies by exit code and signal | Arm change applies; the matched prefix and exit contract are unchanged, and takeover makes an empty child close rarer. |
+| Pi and pi-signed | `.pi/extensions/fm-primary-pi-watch.ts` uses the same `/^watcher: FAILED/` match through the shared tracked extension | Same as OpenCode. |
+| Grok | Tracked background task runs the arm and the model reads its status lines | Arm change applies; `docs/supervision-protocols/grok.md` carries the reported-reason wording. |
+| Kimi | No tracked arm or watcher integration; supervision follows the generic emitted protocol | Not applicable. |
+| tmux, herdr, zellij, orca, cmux, codex-app | Backends are reached through `bin/fm-backend.sh` for crew state only; no backend adapter reads the watcher lock, the arm's status lines, or the auto-arm claim | Not applicable. |
+
 Deterministic entry points:
 
 ```sh

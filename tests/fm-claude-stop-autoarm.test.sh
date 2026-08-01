@@ -373,6 +373,60 @@ test_single_flight_admits_exactly_one_owner() {
   pass "auto-arm: concurrent firings admit one owner and one rewake translation"
 }
 
+# A claim left behind by a killed hook must not become a phantom owner that
+# every later Stop stands down behind. The shape here is what an interrupted
+# claim leaves: a lock whose recorded owner is dead, still holding the owner
+# link that keeps its own removal failing.
+seed_dead_owner_claim() {
+  local dir=$1 dead
+  dead=$(bash -c 'echo $$')
+  while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
+  mkdir -p "$dir/state/.claude-autoarm.lock" "$dir/state/.claude-autoarm.lock.owner.dead"
+  printf '%s\n' "$dead" > "$dir/state/.claude-autoarm.lock/pid"
+  ln -s "$dir/state/.claude-autoarm.lock.owner.dead" \
+    "$dir/state/.claude-autoarm.lock/.claude-autoarm.lock.owner.dead"
+}
+
+test_dead_owner_claim_is_reclaimed() {
+  local dir out status stop
+  dir=$(make_primary_dir "$TMP_ROOT/dead-owner-claim")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  seed_dead_owner_claim "$dir"
+  for stop in 1 2; do
+    out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+    expect_code 2 "$status" "Stop $stop must arm and rewake instead of standing down behind a dead claim"
+  done
+  [ -e "$dir/state/arm-ran" ] || fail "hook never armed behind the dead claim"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 2 ] \
+    || fail "each Stop must arm once, saw $(wc -l < "$dir/state/arm-ran" | tr -d ' ')"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "epoch must record outcome=rewake, got: $(epoch_outcome "$dir")"
+  [ ! -e "$dir/state/.claude-autoarm.lock" ] || fail "reclaimed owner lock must be released after the cycle"
+  pass "auto-arm: a claim whose owner pid is dead is reclaimed, not honored"
+}
+
+test_live_owner_claim_is_still_honored() {
+  local dir out status holder
+  dir=$(make_primary_dir "$TMP_ROOT/live-owner-claim")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  # A genuinely live owner must still keep every other firing inert, so
+  # reclaiming a dead claim never turns into stealing a live one.
+  sleep 30 &
+  holder=$!
+  mkdir -p "$dir/state/.claude-autoarm.lock"
+  printf '%s\n' "$holder" > "$dir/state/.claude-autoarm.lock/pid"
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 0 "$status" "a firing must stand down while a live owner holds the claim"
+  [ ! -e "$dir/state/arm-ran" ] || fail "hook armed behind a live owner's claim"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch behind a live owner's claim"
+  [ "$(cat "$dir/state/.claude-autoarm.lock/pid" 2>/dev/null || true)" = "$holder" ] \
+    || fail "a live owner's claim was replaced"
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  pass "auto-arm: a claim with a live owner is still honored"
+}
+
 test_need_vanished_mid_cycle_closes_quietly() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/vanished")
@@ -429,6 +483,8 @@ test_failed_close_rewakes_with_failure_banner
 test_clean_close_exits_silently
 test_arms_for_x_mode_poll_need_without_inflight
 test_single_flight_admits_exactly_one_owner
+test_dead_owner_claim_is_reclaimed
+test_live_owner_claim_is_still_honored
 test_need_vanished_mid_cycle_closes_quietly
 test_afk_mid_cycle_suppresses_rewake
 test_active_in_marked_secondmate_home

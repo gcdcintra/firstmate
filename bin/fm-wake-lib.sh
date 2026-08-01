@@ -276,6 +276,52 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
+# True only when the lock at $1 records a pid that is alive right now. This is
+# the exact "somebody really owns this claim" test: a dead pid, an unreadable
+# pid, and a dangling owner link are all absence of an owner, never evidence of
+# one.
+fm_lock_owner_alive() {
+  local lockdir=$1 pid
+  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid"
+}
+
+# Remove a claim that no live owner backs, so the next claimant can take it.
+# fm_lock_try_acquire already steals an ordinary dead-pid lock, but it refuses
+# forever - with FM_LOCK_HELD_PID empty, so nothing distinguishes the state from
+# a genuine live owner - once a lock path survives its own removal. A claim
+# interrupted between `ln -s` and fm_lock_remove_stray_owner_link leaves an owner
+# link INSIDE a directory-shaped lock, and that entry keeps rmdir failing on
+# every later acquire. Callers that must not stand down behind a phantom owner
+# use this to reclaim those shapes explicitly.
+# Returns 0 only once the lock path is gone (including when it never existed),
+# and never touches a lock whose owner is alive.
+#
+# Call this only after fm_lock_try_acquire has already refused. That ordering is
+# what makes it safe, and it is also why this must NOT re-apply the mid-acquire
+# grace: fm_lock_try_acquire evaluated that grace against the untouched lock and
+# returns early while a live pid holds it, so a claimant is never reclaimed out
+# from under itself - but its own failed steal clears the known files and
+# refreshes the lock mtime, which would make every dead claim look mid-acquire
+# to a second evaluation here.
+fm_lock_reclaim_unowned() {
+  local lockdir=$1 entry
+  [ -e "$lockdir" ] || [ -L "$lockdir" ] || return 0
+  fm_lock_owner_alive "$lockdir" && return 1
+  fm_lock_remove_path "$lockdir" 2>/dev/null || true
+  if [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    # Owner directories are named after the lock, so a stray owner link inside a
+    # dot-prefixed lock is itself hidden: plain "*" never matches it.
+    for entry in "$lockdir"/* "$lockdir"/.[!.]* "$lockdir"/..?*; do
+      [ -L "$entry" ] || continue
+      rm -f "$entry" 2>/dev/null || true
+    done
+    fm_lock_remove_path "$lockdir" 2>/dev/null || true
+  fi
+  [ -e "$lockdir" ] || [ -L "$lockdir" ] || return 0
+  return 1
+}
+
 fm_lock_try_acquire() {
   local lockdir=$1 pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=

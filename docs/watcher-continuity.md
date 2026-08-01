@@ -13,6 +13,7 @@ Claude's `.claude/settings.json` Stop `asyncRewake` hook (`bin/fm-claude-stop-au
 The hook fires on every Stop, and an eligible primary with supervision need admits one home-scoped owner that foregrounds `bin/fm-watch-arm.sh` inside the hook-owned process tree.
 A numeric session-lock owner that fails the shared `fm_harness_pid_alive` predicate is reclaimed through `bin/fm-lock.sh` before auto-arm state changes, while a live owner, absent lock, or malformed lock keeps the competing hook inert.
 The stale-owner claim occurs only after the existing AFK and supervision-need gates pass.
+The hook's own single-flight claim in `state/.claude-autoarm.lock` is honored only while its recorded owner pid is alive, because a claim left behind by a killed hook can otherwise survive in a shape the acquisition path cannot remove and stand every later Stop down while no watcher runs at all.
 While supervision is still needed and away mode remains inactive, an actionable close or typed failure wakes the idle session through exit 2.
 
 ## Actionable wake ordering
@@ -39,8 +40,20 @@ The turn-end guard remains the final backstop rather than the normal continuity 
 
 `bin/fm-watch-arm.sh` never returns a clean empty success.
 An actionable child output returns that reason normally.
-A zero/empty child return rechecks the home lock and beacon, attaches to a verified healthy successor when one exists, or emits `watcher: FAILED - cycle ended without an actionable reason` and exits nonzero.
-An attached arm follows verified identity-matched successors and reports the same typed failure if that chain ends without one.
+A zero/empty child return rechecks the home lock and beacon, attaches to a verified healthy successor when one exists, or emits a typed `watcher: FAILED - ...` line and exits nonzero.
+
+Every `watcher: FAILED` line names what failed, and a failed cycle quotes a bounded tail of the watcher's own stderr.
+The watcher names its non-zero exits itself: a signalled cycle prints `watcher: cycle stopped by SIG<name>` and exits with the conventional 128 plus signal number, and a wake that cannot be recorded or a state check that cannot be run names that step.
+This replaced an unexplained bare exit 1 that no operator could diagnose from the message.
+
+An attach is reported only after the target keeps passing the health gate for `FM_ARM_ATTACH_VERIFY` seconds.
+A live pid with a beacon inside the grace window proves the cycle was alive recently, not that it survives the arm, so a target that dies inside the arm's own lifetime is a failed attach that starts a cycle instead of reporting one.
+
+The arm converges on exactly one live cycle rather than returning while a home has none.
+An attached arm follows verified identity-matched successors, and when that chain ends with nothing holding the singleton it takes the cycle over itself.
+The one exception is a chain end whose actionable reason is already in the durable wake queue: that needs a handling turn now, so it stays a typed nonzero failure naming the queued record count.
+A redundant start is harmless because the watcher singleton makes the loser stand down and the arm then attaches to the winner, and `FM_ARM_MAX_TRANSITIONS` keeps a flapping home loud instead of endless.
+An owned cycle that is signalled, or that self-evicts because the lock no longer names it, still fails loudly rather than restarting: a signal is an explicit stop, and a foreign lock holder means something else is managing the singleton.
 
 The arm layer appends one tab-separated record per observed cycle to `state/.watch-cycle-exits.log`.
 Each record includes arm and watcher PIDs, start and end timestamps, exit code and signal, classified reason, beacon age, lock identity before and after close, and successor disposition.
@@ -55,8 +68,9 @@ Only the watcher process touches `state/.last-watcher-beat`; no helper process c
 `tests/fm-pi-watch-extension.test.sh` checks Pi's first-cycle-or-explicit-repair tool metadata and ownership-based redundant-call no-ops, then simulates actionable and empty child closes against the actual Pi and OpenCode close handlers, blocks prompt delivery to prove the successor launches first, verifies single-flight behavior, changes the session lock before close to prove ownership is rechecked, and hangs each successor arm to prove bounded fallback delivery includes the typed restoration failure.
 The same suite covers ordinary same-process session replacement for `/new`, `/resume`, and `/fork`, same-instance shutdown-plus-start, stale prior-generation callbacks, repeated transitions with exactly one live cycle, disappearance of the shutting-down refusal after a valid replacement activates, and terminal quit still refusing late rearm.
 `tests/fm-watcher-lock.test.sh` covers verified-successor attach, the typed self-eviction failure, bounded and successor-linked lifecycle rows, and a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
+It also covers an attach target that dies during verification, a signalled watcher exit reported with a concrete reason, cycle takeover when an attached chain ends with no holder, and repeated arming converging on exactly one live cycle.
 `tests/fm-subagent-pretool-check.test.sh` proves Claude retains only the non-status Bash seatbelts.
-`tests/fm-claude-stop-autoarm.test.sh` covers the auto-arm's scope, stale and live session owners, unchanged AFK and need boundaries, single-flight, and exit-2 translation.
+`tests/fm-claude-stop-autoarm.test.sh` covers the auto-arm's scope, stale and live session owners, unchanged AFK and need boundaries, single-flight, exit-2 translation, and that a claim whose owner pid is dead is reclaimed while a live owner's claim is still honored.
 `FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-stop-autoarm-live-e2e.test.sh` starts with the reproduced stale-lock state, runs session start first, completes two tokenless cycles, and checks the competing-live-owner negative control.
 `tests/fm-turnend-guard.test.sh` covers the cooperative `--claude` guard.
 

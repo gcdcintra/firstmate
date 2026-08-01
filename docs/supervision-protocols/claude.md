@@ -13,8 +13,8 @@ When this session owns supervision and away mode is not active:
    When a repair is genuinely needed - the Stop hook did not claim this home, or a forced restart is required - run `bin/fm-watch-arm.sh` (or `bin/fm-watch-arm.sh --restart`) as its own Claude Code background task, never bundled with other commands, never with shell `&`.
    Source `__FM_X_MODE_ENV__` first when X mode is active.
    A shell `&`, a truncating pipe, or bundling is denied automatically by the PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`) registered in `.claude/settings.json`.
-6. Treat `watcher: started ...` and `watcher: attached ...` inside arm output as proof that one live cycle exists.
-   On attach, the arm follows verified identity-matched successors instead of exiting when the first cycle ends.
+6. Treat `watcher: started ...` and `watcher: attached ...` inside arm output as proof that one live cycle exists; both are printed only after the arm verifies that cycle stays alive.
+   On attach, the arm follows verified identity-matched successors and takes the cycle over itself instead of exiting when the chain ends with nothing holding the lock.
 7. The durable wake queue preserves actionable events between a rewake and the next Stop-launched arm, while the bounded turn-end guard prevents a blind Stop when recovery did not start.
    No PreToolUse hook denies fleet commands based on watcher status.
    [`watcher-continuity.md`](../watcher-continuity.md) owns the exact session-lock recovery boundary.

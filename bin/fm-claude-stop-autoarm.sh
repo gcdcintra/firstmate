@@ -23,7 +23,9 @@
 #   - Single-flight: Claude does not dedupe async hooks, so a home-scoped owner
 #     lock (state/.claude-autoarm.lock) admits exactly one owner; every other
 #     concurrent firing exits 0 without translating, which keeps one event
-#     epoch on exactly one recovery turn.
+#     epoch on exactly one recovery turn. A refused claim is honored only while
+#     its recorded owner pid is alive, so a claim left behind by a killed hook
+#     is reclaimed instead of disabling re-arm for the rest of the session.
 #   - Foreground arm: the owner runs bin/fm-watch-arm.sh in the FOREGROUND of
 #     this hook-owned process tree (never shell &); Claude owns the process
 #     group, so its timeout/session teardown kills arm and watcher together.
@@ -108,7 +110,18 @@ fi
 # Claude runs one background process per firing with no dedupe. Exactly one
 # owner foregrounds the arm and translates its close; every other firing exits
 # 0 so one watcher cycle maps to at most one exit-2 rewake.
-fm_lock_try_acquire "$OWNER_LOCK" || exit 0
+#
+# Standing down is only correct while a live owner really is arming. A refused
+# claim alone does not prove that: a claim left behind by a killed hook can
+# survive in a shape fm_lock_try_acquire cannot remove, and then EVERY later
+# Stop reads an existing claim, concludes recovery is under way, and stands
+# down while no watcher runs at all. Owner-pid liveness is the exact test, so
+# check it before honoring a refusal and reclaim a claim nothing owns.
+if ! fm_lock_try_acquire "$OWNER_LOCK"; then
+  fm_lock_owner_alive "$OWNER_LOCK" && exit 0
+  fm_lock_reclaim_unowned "$OWNER_LOCK" || exit 0
+  fm_lock_try_acquire "$OWNER_LOCK" || exit 0
+fi
 trap 'fm_lock_release "$OWNER_LOCK"' EXIT
 
 write_epoch() {  # <outcome>
