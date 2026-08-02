@@ -120,9 +120,15 @@ advance_origin_branch() {
 }
 
 # drop_cached_origin_head <clone>: remove the clone's cached origin/HEAD symref,
-# reproducing a clone that never had one (or lost it).
+# reproducing a clone that never had one (or lost it). git >= 2.47 recreates a
+# missing origin/HEAD on fetch (followRemoteHEAD defaults to "create"), which
+# would silently repair the symref before default_branch() ever runs; pin it to
+# "never" so these tests exercise fm-fleet-sync's own resolution on every git
+# version. The explicit `git remote set-head` repair is not governed by this
+# config, so the script's repair path still works.
 drop_cached_origin_head() {
   git -C "$1" remote set-head origin --delete
+  git -C "$1" config remote.origin.followRemoteHEAD never
 }
 
 head_sha() { git -C "$1" rev-parse HEAD; }
