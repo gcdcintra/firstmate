@@ -13,6 +13,10 @@
 # stashed, or discarded.
 # Still skips (benignly) local-only/no-origin projects, missing remotes/branches,
 # and fetch failures.
+# The default branch comes from the clone's cached refs/remotes/origin/HEAD; when
+# that symref is absent it is repaired once from the remote (git remote set-head
+# origin --auto), falling back to guessing main/master only when the remote
+# cannot be queried, so a repo whose default is another branch still syncs.
 # Pruning never deletes the checked-out branch or a branch that still has a
 # worktree, so it cannot discard unlanded work; set FM_FLEET_PRUNE=0 to disable it.
 # When the fetch fails on an orphaned .git/packed-refs.lock (left by a ref rewrite
@@ -113,6 +117,21 @@ default_branch() {
   if [ -n "$ref" ]; then
     echo "${ref#origin/}"
     return 0
+  fi
+  # No cached origin/HEAD (some clones never get one, and older ones can lose
+  # it). Repair it from the remote once so this and every later run resolve the
+  # real default locally; without this, a repo whose default is neither main nor
+  # master is judged against the wrong branch and wrongly reported STUCK. One
+  # remote round-trip is acceptable here because sync just fetched anyway. If
+  # the remote cannot be queried, fall through to the historical guess so an
+  # offline run stays as benign as before.
+  if git -C "$PROJ" remote set-head origin --auto >/dev/null 2>&1; then
+    ref=$(git -C "$PROJ" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [ -n "$ref" ]; then
+      echo "$label: repaired missing origin/HEAD (default branch: ${ref#origin/})" >&2
+      echo "${ref#origin/}"
+      return 0
+    fi
   fi
   for branch in main master; do
     if git -C "$PROJ" show-ref --verify --quiet "refs/heads/$branch"; then

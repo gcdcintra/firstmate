@@ -12,6 +12,12 @@
 # The pre-existing fast-forward / already-current / local-only / no-origin paths
 # must be unchanged, and bootstrap must relay the new outcomes as FLEET_SYNC lines.
 #
+# It also pins default-branch resolution when the clone's cached
+# refs/remotes/origin/HEAD symref is absent: the real remote default is repaired
+# via `git remote set-head origin --auto` (so a non-main/master default is synced,
+# not misjudged STUCK against the wrong branch), and when that repair cannot query
+# the remote the historical main/master guess keeps today's benign behavior.
+#
 # It also pins the orphaned .git/packed-refs.lock recovery in the fetch step
 # (fetch_with_packed_refs_lock_guard, backed by bin/fm-lock-lib.sh's shared
 # staleness proof): a provably-stale lock is retried then removed and the clone
@@ -72,6 +78,29 @@ build_pair() {
   printf '%s\n' "$clone"
 }
 
+# build_pair_branch <home> <name> <branch>: like build_pair, but the repo's only
+# (and default) branch is <branch> instead of main. Echoes the clone path.
+build_pair_branch() {
+  local home=$1 name=$2 branch=$3 work remote clone remote_abs
+  work="$home/work-$name"
+  remote="$home/remotes/$name.git"
+  clone="$home/projects/$name"
+  mkdir -p "$home/remotes"
+
+  git init -q "$work"
+  git -C "$work" symbolic-ref HEAD "refs/heads/$branch"
+  commit_file "$work" file.txt v0 C0
+
+  git clone --quiet --bare "$work" "$remote"
+  remote_abs=$(cd "$remote" && pwd)
+  git -C "$remote" symbolic-ref HEAD "refs/heads/$branch"
+  git -C "$work" remote add origin "file://$remote_abs"
+  git -C "$work" push -q -u origin "$branch"
+
+  git clone --quiet "file://$remote_abs" "$clone"
+  printf '%s\n' "$clone"
+}
+
 # advance_origin <home> <name> <msg>: push one more commit to <name>'s origin via
 # its work repo, so the clone (until it fetches) is one commit behind origin/main.
 advance_origin() {
@@ -79,6 +108,27 @@ advance_origin() {
   work="$home/work-$name"
   commit_file "$work" file.txt "$msg" "$msg"
   git -C "$work" push -q origin main
+}
+
+# advance_origin_branch <home> <name> <branch> <msg>: advance_origin for a repo
+# whose default branch is <branch>.
+advance_origin_branch() {
+  local home=$1 name=$2 branch=$3 msg=$4 work
+  work="$home/work-$name"
+  commit_file "$work" file.txt "$msg" "$msg"
+  git -C "$work" push -q origin "$branch"
+}
+
+# drop_cached_origin_head <clone>: remove the clone's cached origin/HEAD symref,
+# reproducing a clone that never had one (or lost it). git >= 2.47 recreates a
+# missing origin/HEAD on fetch (followRemoteHEAD defaults to "create"), which
+# would silently repair the symref before default_branch() ever runs; pin it to
+# "never" so these tests exercise fm-fleet-sync's own resolution on every git
+# version. The explicit `git remote set-head` repair is not governed by this
+# config, so the script's repair path still works.
+drop_cached_origin_head() {
+  git -C "$1" remote set-head origin --delete
+  git -C "$1" config remote.origin.followRemoteHEAD never
 }
 
 head_sha() { git -C "$1" rev-parse HEAD; }
@@ -176,6 +226,26 @@ if [ "$is_fetch" = 1 ]; then
     exit 1
   fi
 fi
+exec "$real" "$@"
+SH
+  chmod +x "$1/git"
+}
+
+# git shim: fail every `remote set-head` with a network-style error and delegate
+# everything else to the real git - the remote is reachable for fetch but the
+# cached-origin/HEAD repair cannot query it.
+git_set_head_fails() {
+  cat > "$1/git" <<'SH'
+#!/usr/bin/env bash
+real=${REAL_GIT_FOR_TEST:?}
+prev=
+for a in "$@"; do
+  if [ "$prev" = remote ] && [ "$a" = set-head ]; then
+    echo "fatal: could not read from remote repository" >&2
+    exit 128
+  fi
+  prev=$a
+done
 exec "$real" "$@"
 SH
   chmod +x "$1/git"
@@ -470,6 +540,69 @@ test_bootstrap_relays_recovered_and_stuck() {
   pass "bootstrap relays recovered: and STUCK: fleet-sync outcomes"
 }
 
+# --- default-branch resolution tests -----------------------------------------
+
+test_non_main_default_without_cached_head_syncs() {
+  local home clone out
+  home=$(new_home)
+  clone=$(build_pair_branch "$home" devdefault develop)
+  drop_cached_origin_head "$clone"
+  advance_origin_branch "$home" devdefault develop C1
+
+  out=$(run_sync "$home" "$clone")
+
+  assert_contains "$out" "devdefault: synced" "non-main default without cached origin/HEAD fast-forwards"
+  assert_not_contains "$out" "STUCK" "non-main default is not misjudged against main/master"
+  [ "$(head_sha "$clone")" = "$(git -C "$clone" rev-parse origin/develop)" ] \
+    || fail "clone was not fast-forwarded to origin/develop"
+  [ "$(git -C "$clone" symbolic-ref --short refs/remotes/origin/HEAD)" = "origin/develop" ] \
+    || fail "cached origin/HEAD was not repaired for later runs"
+  pass "non-main/master default without cached origin/HEAD is repaired and fast-forwarded"
+}
+
+test_main_default_without_cached_head_still_syncs_when_repair_fails() {
+  local home fakebin clone out err
+  home=$(new_home)
+  fakebin="$home/fb-headmain"; rm -rf "$fakebin"; mkdir -p "$fakebin"
+  clone=$(build_pair "$home" headmain)
+  drop_cached_origin_head "$clone"
+  advance_origin "$home" headmain C1
+  git_set_head_fails "$fakebin"
+  out="$home/out-headmain"; err="$home/err-headmain"
+
+  set +e
+  run_sync_guarded "$home" "$fakebin" "$out" "$err" headmain
+  set -e
+
+  assert_contains "$(cat "$out")" "headmain: synced" "main default still syncs via the guess when repair fails"
+  assert_not_contains "$(cat "$out")" "STUCK" "guess fallback is not escalated to STUCK"
+  [ "$(head_sha "$clone")" = "$(git -C "$clone" rev-parse origin/main)" ] \
+    || fail "clone was not fast-forwarded to origin/main"
+  pass "unreachable repair degrades to the main/master guess (main default unchanged)"
+}
+
+test_non_main_default_without_cached_head_skips_benignly_when_repair_fails() {
+  local home fakebin clone out err before
+  home=$(new_home)
+  fakebin="$home/fb-headdev"; rm -rf "$fakebin"; mkdir -p "$fakebin"
+  clone=$(build_pair_branch "$home" headdev develop)
+  drop_cached_origin_head "$clone"
+  advance_origin_branch "$home" headdev develop C1
+  git_set_head_fails "$fakebin"
+  before=$(head_sha "$clone")
+  out="$home/out-headdev"; err="$home/err-headdev"
+
+  set +e
+  run_sync_guarded "$home" "$fakebin" "$out" "$err" headdev
+  set -e
+
+  assert_contains "$(cat "$out")" "headdev: skipped: cannot determine default branch" \
+    "unresolvable default is a benign skip, not a failure"
+  assert_not_contains "$(cat "$out")" "STUCK" "unresolvable default is not misjudged as STUCK"
+  [ "$(head_sha "$clone")" = "$before" ] || fail "clone was moved despite unresolvable default"
+  pass "non-main default with failed repair skips benignly and touches nothing"
+}
+
 # --- packed-refs.lock guard tests -------------------------------------------
 
 test_orphaned_stale_packed_refs_lock_recovers() {
@@ -620,6 +753,9 @@ test_single_project_by_projects_relative_name_ignores_cwd_shadow
 test_single_project_unresolvable_name_still_skips
 test_whole_fleet_form
 test_bootstrap_relays_recovered_and_stuck
+test_non_main_default_without_cached_head_syncs
+test_main_default_without_cached_head_still_syncs_when_repair_fails
+test_non_main_default_without_cached_head_skips_benignly_when_repair_fails
 test_orphaned_stale_packed_refs_lock_recovers
 test_live_packed_refs_lock_is_never_removed
 test_live_git_cwd_in_clone_dir_blocks_removal
