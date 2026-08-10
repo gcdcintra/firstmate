@@ -195,6 +195,8 @@ Text is typed once; only Enter is retried.
 
 On an idle or done native baseline, submit confirmation waits for `working` or `blocked` across a bounded polling window.
 On an already active or unreadable baseline, it falls back to conservative composer clearance.
+A mid-turn harness can accept Enter, queue the message for after the current turn, and still render that text in the composer window, which the clearance read scores as unsubmitted.
+Once the Enter retry budget is spent on a proven pending composer, the adapter therefore consults native state once more: an actively working target confirms the queued delivery, and every other state keeps reporting pending as a genuine swallow.
 A fully unreadable target stops retrying and reports unknown.
 The poll density bounds the residual possibility of an extremely fast complete turn; a missed transition can cause only a redundant Enter on an empty composer, never duplicate message text.
 
@@ -290,8 +292,8 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - A Firstmate outside Herdr cannot resolve a launcher workspace, so a colliding home label refuses new spawns until the collision is cleared.
 - Ghost and placeholder recognition depends on ANSI de-emphasis and fails safely to pending when unavailable.
 - Mid-session secondmate liveness is not implemented.
-- OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
-  The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
+- A busy-queued Enter that leaves the message visible in the composer window (OpenCode 1.18.4, and Claude Code 2.1.226 under its own queued-message affordance) is confirmed only while the target still reads as actively working.
+  A target that has left the working state, or that is blocked at its own prompt, is still reported as submit pending even when the message was in fact queued.
 - Only tmux and Herdr can host the away-mode supervisor terminal.
 
 ## Regression entry points

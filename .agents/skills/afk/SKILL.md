@@ -140,9 +140,8 @@ re-send), while an idle pane keeps `pending` as a genuine swallow. The
 strict-buffer-clears-only-on-`empty` policy above still holds for the daemon
 and the lenient-`pending`-fails-for-`fm-send` policy still holds for steer
 verification - this exception is a busy-queue is treated as a delivered
-Enter, not a swallowed one. The herdr adapter observes the same opencode
-behavior but needs a separate fix; the gap is recorded in
-`docs/herdr-backend.md` rather than papered over here.
+Enter, not a swallowed one. `docs/herdr-backend.md` owns the herdr adapter's
+own native-state form of the same conversion and its residual limit.
 
 ## Classification policy
 

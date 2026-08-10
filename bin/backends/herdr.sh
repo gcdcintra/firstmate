@@ -2654,6 +2654,26 @@ EOF
 # fm_backend_herdr_composer_state) and for submit attempts whose pre-Enter
 # agent-state baseline is not legibly idle.
 #
+# Busy-queued Enter (the herdr counterpart of fm_tmux_submit_enter_core's
+# fallback, verified live against Claude Code 2.1.226 under herdr 0.8.0): a harness
+# that is mid-turn accepts Enter and QUEUES the message for after the current
+# turn, while still rendering that text in the composer window - claude puts it
+# under its own "Press up to edit queued messages" affordance. That is the
+# not-legibly-idle baseline above, so confirmation runs on the composer path,
+# reads the queued text as real unsubmitted input, and spends the whole Enter
+# retry budget still holding 'pending'. Once the budget is spent on a proven
+# 'pending', this falls back to herdr's NATIVE agent state: an actively working
+# target means the Enter was accepted and queued, so report 'empty' and let the
+# caller stop rather than re-send.
+# The fallback deliberately accepts ONLY fm_backend_herdr_classify_agent_status's
+# 'busy' (raw agent_status "working"), not the wider submit classification that
+# also counts "blocked". The two are not the same evidence: on the idle baseline
+# a post-Enter "blocked" is a TRANSITION out of idle, so this Enter demonstrably
+# started something that reached a prompt, whereas at fallback time there is no
+# transition at all - an already-blocked target may simply have had its Enter
+# consumed by the prompt it is sitting on, and it has no queue to hold the text.
+# Blocked plus pending therefore keeps reporting 'pending', unchanged.
+#
 # This also still correctly handles the earlier 2026-07-03 incident (a
 # slash-command popup selection/placeholder-fill on the FIRST Enter is not a
 # genuine submission) without any popup-specific logic at all: filling a
@@ -2708,8 +2728,18 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
       unknown) printf 'unknown'; return 0 ;;
     esac
     i=$((i + 1))
-    [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
+    [ "$i" -lt "$retries" ] || break
   done
+  # Retry budget spent. Only the composer path can reach here holding a proven
+  # 'pending', and only that verdict is eligible for the busy-queue conversion;
+  # the idle-baseline path exhausts holding 'idle' (a legibly read target that
+  # never went working) and stays a genuine swallow without any extra read.
+  if [ "$verdict" = pending ] && [ "$(fm_backend_herdr_classify_agent_status \
+    "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")" = busy ]; then
+    printf 'empty'
+    return 0
+  fi
+  printf 'pending'
 }
 
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors
