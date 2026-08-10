@@ -18,7 +18,7 @@ When this session owns supervision and away mode is not active:
    No PreToolUse hook denies fleet commands based on watcher status.
    [`watcher-continuity.md`](../watcher-continuity.md) owns the exact session-lock recovery boundary.
 8. The turn-end guard (`bin/fm-turnend-guard.sh --claude`) remains the final backstop.
-   It uses the same live-watcher and fresh-beacon predicate as the pull guard.
+   It blocks on the strict live-watcher and fresh-beacon predicate, not the pull guard's grace-based alarm gate; [`turnend-guard.md`](../turnend-guard.md) owns that split.
    It allows the stop when a watcher is healthy or the role-verified auto-arm owns recovery, while fresh failure epochs advance the bounded one-time attended fail-open progression described in [`turnend-guard.md`](../turnend-guard.md).
 9. Waiting on the hook-owned cycle is silent: do not send idle progress while the watcher is parked.
 
