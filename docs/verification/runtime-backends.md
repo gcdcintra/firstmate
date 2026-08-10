@@ -154,6 +154,28 @@ The CLI matrix was checked directly:
 All destructive verification used `bin/fm-herdr-lab.sh` with a non-default `fm-lab-` name and a byte-identical default-session tripwire.
 No ambient `herdr server stop` command is a supported test operation.
 
+### Busy-queued submit confirmation
+
+Checked 2026-08-10 with Herdr 0.8.0 on Linux x86_64 against a live Claude Code 2.1.226 agent pane held mid-turn, using only read and send calls on an existing pane.
+
+```sh
+herdr --session default agent get <pane>
+bash -c '. ./bin/backends/herdr.sh
+  fm_backend_herdr_send_text_submit default:<pane> "<probe text>" 3 0.6 1.2'
+herdr --session default pane read <pane> --lines 14
+```
+
+Observed shapes:
+
+```text
+"agent_status":"working"
+  ❯ <probe text>
+❯ Press up to edit queued messages
+```
+
+The mid-turn agent kept `agent_status` `working`, queued the message under its own affordance, and delivered it exactly once at the end of that turn.
+The same probe returned `pending` before the busy-queue conversion and `empty` after it, with one queued copy in both runs.
+
 ### Prune and respawn
 
 The real label-collision reproduction is owned by:

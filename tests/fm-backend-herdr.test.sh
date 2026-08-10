@@ -3141,22 +3141,139 @@ test_send_text_submit_confirms_blocked_after_enter() {
   pass "fm_backend_herdr_send_text_submit: a post-Enter blocked state confirms delivery without retrying into the prompt"
 }
 
-test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter() {
-  local dir log resp fb out enter_count read_count
-  dir="$TMP_ROOT/submit-preexisting-working-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/3.out"
-  printf '  \xe2\x9d\xaf hello captain\n' > "$resp/4.out"
-  printf '  \xe2\x9d\xaf hello captain\n' > "$resp/6.out"
+# --- send_text_submit: busy-queued Enter on a not-idle baseline --------------
+# Regression matrix for the false "delivery unconfirmed; verdict=pending"
+# (reproduced 2026-08-10 against a live Claude Code 2.1.226 pane under herdr 0.8.0): a
+# mid-turn harness accepts Enter, QUEUES the message, and keeps rendering it in
+# the composer window, so the not-idle-baseline composer path spends its whole
+# Enter retry budget still reading 'pending'. These quadrants pin the fallback's
+# discriminator - herdr's native agent state at the moment that budget runs out -
+# the same way tests/fm-tmux-submit-busy.test.sh pins fm_pane_is_busy for tmux.
+# Call indices with retries=2: 1 send-text, 2 baseline agent get, 3 Enter,
+# 4 pane read, 5 Enter, 6 pane read, 7 fallback agent get.
+# Every quadrant also asserts a single send-text, because a swallowed Enter is
+# only ever retried as Enter and the text is never retyped.
+
+# Canned mock responses shared by the quadrants below.
+HERDR_AGENT_WORKING='{"result":{"agent":{"agent_status":"working"}}}'
+HERDR_AGENT_IDLE='{"result":{"agent":{"agent_status":"idle"}}}'
+HERDR_AGENT_BLOCKED='{"result":{"agent":{"agent_status":"blocked"}}}'
+HERDR_COMPOSER_HOLDS_MESSAGE=$'  \xe2\x9d\xaf hello captain'
+HERDR_COMPOSER_CLEARED=$'  \xe2\x9d\xaf '
+
+# Runs one quadrant against a not-idle pre-Enter baseline, which is what routes
+# confirmation onto the composer path in the first place. Echoes the verdict;
+# the caller reads the call log at $TMP_ROOT/<dir-name>/log.
+herdr_submit_busy_quadrant() {  # <dir-name> <retries> [<call-index>=<canned response>]...
+  local dir=$1 retries=$2 log resp fb spec
+  shift 2
+  dir="$TMP_ROOT/$dir"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '%s\n' "$HERDR_AGENT_WORKING" > "$resp/2.out"
+  for spec in "$@"; do
+    printf '%s\n' "${spec#*=}" > "$resp/${spec%%=*}.out"
+  done
   fb=$(make_herdr_fakebin "$dir")
-  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" "$1" 0.01 0.01' \
+    "$ROOT" "$retries"
+}
+
+herdr_submit_log_count() {  # <log> <subcommand-args...>
+  local log=$1 pattern
+  shift
+  pattern=$(printf '\x1f%s' "$@")
+  grep -c -- "$pattern" "$log" 2>/dev/null || true
+}
+
+herdr_submit_assert_single_send_text() {  # <log>
+  [ "$(herdr_submit_log_count "$1" pane send-text)" -eq 1 ] \
+    || fail "a swallowed Enter must never retype the text, sent $(herdr_submit_log_count "$1" pane send-text) send-text call(s)"
+}
+
+# Quadrant 1 (the fix): the target is still actively working when the retry
+# budget runs out, so the queued Enter is reported as delivered.
+test_send_text_submit_busy_pending_composer_returns_empty() {
+  local out log
+  out=$(herdr_submit_busy_quadrant submit-busy-pending 2 \
+    "4=$HERDR_COMPOSER_HOLDS_MESSAGE" "6=$HERDR_COMPOSER_HOLDS_MESSAGE" "7=$HERDR_AGENT_WORKING")
+  log="$TMP_ROOT/submit-busy-pending/log"
+  [ "$out" = empty ] || fail "a still-working target proves the Enter was queued, expected empty, got '$out'"
+  [ "$(herdr_submit_log_count "$log" pane send-keys w1:p2 enter)" -eq 2 ] \
+    || fail "the busy conversion must only happen after the full Enter retry budget is spent"
+  herdr_submit_assert_single_send_text "$log"
+  pass "fm_backend_herdr_send_text_submit: a busy target still holding the message in the composer reports empty (the Enter was queued, not swallowed)"
+}
+
+# Quadrant 2: the same shape against a target that is no longer working is a
+# genuine swallow. Preexisting working is never, by itself, proof that THIS
+# Enter landed - only the native state at fallback time is.
+test_send_text_submit_idle_pending_composer_stays_pending() {
+  local out log
+  out=$(herdr_submit_busy_quadrant submit-idle-pending 2 \
+    "4=$HERDR_COMPOSER_HOLDS_MESSAGE" "6=$HERDR_COMPOSER_HOLDS_MESSAGE" "7=$HERDR_AGENT_IDLE")
+  log="$TMP_ROOT/submit-idle-pending/log"
+  [ "$out" = pending ] || fail "an idle target with the message still in the composer is a genuine swallow, expected pending, got '$out'"
+  [ "$(herdr_submit_log_count "$log" pane send-keys w1:p2 enter)" -eq 2 ] \
+    || fail "a swallowed Enter should consume the configured retry budget"
+  [ "$(herdr_submit_log_count "$log" pane read)" -eq 2 ] \
+    || fail "a not-idle baseline should confirm through composer reads"
+  herdr_submit_assert_single_send_text "$log"
+  pass "fm_backend_herdr_send_text_submit: an idle target still holding the message reports pending (the genuine-swallow signal callers depend on)"
+}
+
+# The deliberate asymmetry with the idle-baseline path: a post-Enter 'blocked'
+# there is a transition OUT of idle and confirms delivery, but a target already
+# sitting at a prompt when the budget runs out has no queue and may simply have
+# had its Enter eaten by that prompt.
+test_send_text_submit_blocked_pending_composer_stays_pending() {
+  local out
+  out=$(herdr_submit_busy_quadrant submit-blocked-pending 2 \
+    "4=$HERDR_COMPOSER_HOLDS_MESSAGE" "6=$HERDR_COMPOSER_HOLDS_MESSAGE" "7=$HERDR_AGENT_BLOCKED")
+  [ "$out" = pending ] || fail "a blocked target must not be converted to a confirmed delivery, got '$out'"
+  pass "fm_backend_herdr_send_text_submit: only an actively working target converts a pending composer, never a blocked one"
+}
+
+# Quadrants 3 and 4: a cleared composer is positive proof on its own, so the
+# fallback is never reached and the native state is never consulted for it.
+test_send_text_submit_busy_cleared_composer_returns_empty() {
+  local out log
+  out=$(herdr_submit_busy_quadrant submit-busy-cleared 2 \
+    "4=$HERDR_COMPOSER_CLEARED" "5=$HERDR_AGENT_WORKING")
+  log="$TMP_ROOT/submit-busy-cleared/log"
+  [ "$out" = empty ] || fail "a cleared composer confirms delivery on the first Enter, got '$out'"
+  [ "$(herdr_submit_log_count "$log" agent get)" -eq 1 ] \
+    || fail "a cleared composer must confirm without consulting native state beyond the baseline"
+  pass "fm_backend_herdr_send_text_submit: a busy target whose composer clears on the first Enter reports empty without a fallback state read"
+}
+
+test_send_text_submit_idle_cleared_composer_returns_empty() {
+  local out log
+  out=$(herdr_submit_busy_quadrant submit-idle-cleared 2 \
+    "4=$HERDR_COMPOSER_CLEARED" "5=$HERDR_AGENT_IDLE")
+  log="$TMP_ROOT/submit-idle-cleared/log"
+  [ "$out" = empty ] || fail "a cleared composer confirms delivery whatever the target's state, got '$out'"
+  [ "$(herdr_submit_log_count "$log" agent get)" -eq 1 ] \
+    || fail "a cleared composer must confirm without consulting native state beyond the baseline"
+  pass "fm_backend_herdr_send_text_submit: a target that went idle with a cleared composer still reports empty, unchanged by the busy conversion"
+}
+
+# The idle-baseline path exhausts holding its own 'idle' verdict, which is a
+# genuine swallow and must never be routed through the busy conversion - that
+# would both leak a foreign verdict into the fallback and cost an extra read.
+test_send_text_submit_idle_baseline_swallow_skips_the_busy_fallback() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/submit-idle-baseline-no-fallback"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/7.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
-  [ "$out" = pending ] || fail "send_text_submit must not accept preexisting working as proof that this Enter landed, got '$out'"
-  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
-  [ "$enter_count" -eq 2 ] || fail "preexisting-working swallowed Enter should retry Enter up to the configured count, sent $enter_count Enter(s)"
-  read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
-  [ "$read_count" -eq 2 ] || fail "preexisting-working confirmation should fall back to composer reads, made $read_count read(s)"
-  pass "fm_backend_herdr_send_text_submit: preexisting working is not accepted as submit proof when the composer still holds the message"
+  [ "$out" = pending ] || fail "an idle-baseline swallow must stay pending, got '$out'"
+  [ "$(herdr_submit_log_count "$log" agent get)" -eq 3 ] \
+    || fail "the idle-baseline path must not spend an extra state read on the busy fallback, made $(herdr_submit_log_count "$log" agent get) agent get call(s)"
+  pass "fm_backend_herdr_send_text_submit: an idle-baseline swallow keeps reporting pending and never enters the busy conversion"
 }
 
 # Regression for the submit-confirmation side of the 2026-07-07 incident:
@@ -3988,7 +4105,12 @@ test_send_text_submit_detects_landed_send
 test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_text_submit_confirms_blocked_after_enter
-test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
+test_send_text_submit_busy_pending_composer_returns_empty
+test_send_text_submit_idle_pending_composer_stays_pending
+test_send_text_submit_blocked_pending_composer_stays_pending
+test_send_text_submit_busy_cleared_composer_returns_empty
+test_send_text_submit_idle_cleared_composer_returns_empty
+test_send_text_submit_idle_baseline_swallow_skips_the_busy_fallback
 test_send_text_submit_confirms_despite_codex_idle_tip_composer
 test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint
 test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change
