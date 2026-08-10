@@ -115,6 +115,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  cp "$ROOT/bin/fm-session-lock-lib.sh" "$dir/bin/fm-session-lock-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -776,7 +777,11 @@ test_grok_adapter_missing_jq_and_no_supervision_allow() {
   [ ! -e "$log" ] || fail "missing jq started a resume process"
 
   dir=$(make_primary_dir "$TMP_ROOT/grok-native-no-work")
-  out=$(printf '%s' '{"sessionId":"x","stopHookActive":false}' | GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  # FM_HOME= clears any ambient FM_HOME from the calling shell (e.g. a firstmate-
+  # supervised dev session): unlike every other invocation in this file, this one
+  # relies on GROK_WORKSPACE_ROOT alone, and an inherited FM_HOME would otherwise
+  # win inside fm-turnend-guard.sh and silently point the guard at a real home.
+  out=$(printf '%s' '{"sessionId":"x","stopHookActive":false}' | FM_HOME='' GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "healthy no-supervision-needed native stop must allow"
   [ -z "$out" ] || fail "no-supervision-needed native stop produced output: $out"
   pass "fm-turnend-guard-grok: missing jq and no-supervision-needed stops stay silent and bounded"
@@ -1049,6 +1054,30 @@ record_autoarm_owner() {
   mkdir -p "$dir/state/.claude-autoarm.lock"
   printf '%s\n' "$pid" > "$dir/state/.claude-autoarm.lock/pid"
   printf 'autoarm\n' > "$dir/state/.claude-autoarm.lock/role"
+}
+
+# A live process whose executable name matches the harness regex, so it reads
+# as a genuine foreign session owner (never this test process's own ancestry).
+# Mirrors test_inert_when_lock_held_by_other_harness in
+# tests/fm-claude-stop-autoarm.test.sh, the proven pattern for this fixture.
+STANDDOWN_FAKEBIN=$(fm_fakebin "$TMP_ROOT/standdown-fakebin")
+ln -s /bin/bash "$STANDDOWN_FAKEBIN/claude"
+FAKE_CLAUDE_STANDDOWN="$STANDDOWN_FAKEBIN/claude"
+
+# Simulate "another live session already owns this home's fleet lock": start a
+# live foreign harness process and record it as the session lock owner.
+record_foreign_lock_owner() {
+  local dir=$1
+  # The trailing no-op keeps the fake harness process alive under its own name
+  # instead of allowing bash to exec the final sleep into a non-harness process.
+  "$FAKE_CLAUDE_STANDDOWN" -c 'sleep 60; :' &
+  FOREIGN_LOCK_PID=$!
+  printf '%s\n' "$FOREIGN_LOCK_PID" > "$dir/state/.lock"
+}
+
+release_foreign_lock_owner() {
+  kill "$FOREIGN_LOCK_PID" 2>/dev/null || true
+  wait "$FOREIGN_LOCK_PID" 2>/dev/null || true
 }
 
 install_integrated_autoarm() {
@@ -1535,6 +1564,98 @@ test_hook_claude_mode_secondmate_reblocks_like_primary() {
   pass "fm-turnend-guard --claude: secondmate home re-blocks unclaimed and allows auto-arm-claimed stops"
 }
 
+# --- --claude stood-down-inert path (another live session owns the lock) -----
+# The 2026-08-08 incident: a second control session held the fleet lock while
+# its own supervision had been dead for 28 hours. The Stop-owned auto-arm
+# correctly stayed inert (bin/fm-claude-stop-autoarm.sh never contests a live
+# foreign owner) and therefore never wrote the epoch/failure-notice evidence
+# the ordinary progression waits for, so the bounded fail-open below was never
+# reachable and the guard blocked every turn indefinitely.
+
+test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded() {
+  local dir out i status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-reason")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  for i in 1 2 3; do
+    out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+    expect_code 2 "$status" "--claude stood-down block $i must exit 2 within the budget"
+    assert_contains "$out" "another live session already owns this home" "stood-down block $i must name the real cause"
+    assert_not_contains "$out" "$REQUIRED_REASON" "stood-down block $i must not suggest hook misconfiguration"
+  done
+  release_foreign_lock_owner
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "bounded stood-down blocking alone must not fire the attended alarm"
+  pass "fm-turnend-guard --claude: stood-down path names the real cause and stays bounded like the ordinary path"
+}
+
+test_hook_claude_mode_standdown_reaches_fail_open() {
+  local dir out i status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-failopen")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  for i in 1 2 3; do
+    out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+    expect_code 2 "$status" "--claude stood-down block $i must exit 2 within the budget"
+    assert_not_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "stood-down fail-open fired before the bounded progression ended"
+  done
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  expect_code 0 "$status" "exhausted stood-down progression must reach the bounded attended fail-open"
+  assert_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "stood-down fail-open alarm was not unmistakable"
+  assert_contains "$out" 'another live session already owns this home' "stood-down fail-open alarm did not name the real cause"
+  assert_contains "$out" 'Keep this session attended' "stood-down fail-open alarm omitted the attended-session action"
+  assert_present "$dir/state/.claude-autoarm-failure-alarmed" "stood-down fail-open did not consume the shared episode alarm"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  release_foreign_lock_owner
+  expect_code 2 "$status" "a consumed attended alarm must make a later unhealthy stood-down stop block again"
+  assert_not_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "stood-down attended alarm repeated in one episode"
+  pass "fm-turnend-guard --claude: stood-down progression reaches the same bounded, loud, non-repeating fail-open"
+}
+
+test_hook_claude_mode_standdown_recovery_clears_both_counters() {
+  local dir out i status pid identity
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-recovery")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  for i in 1 2 3 4; do
+    run_hook_claude "$dir" true >/dev/null 2>&1
+  done
+  [ -f "$dir/state/.turnend-standdown-blocks" ] || fail "stood-down progression did not record its counter"
+  assert_present "$dir/state/.claude-autoarm-failure-alarmed" "setup did not reach the stood-down fail-open"
+  release_foreign_lock_owner
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify the positive recovery watcher"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook_claude "$dir" true); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "--claude must allow once the watcher is healthy again after a stood-down episode"
+  [ -z "$out" ] || fail "positive recovery after stood-down produced output: $out"
+  [ ! -f "$dir/state/.turnend-standdown-blocks" ] || fail "positive watcher recovery must reset the stood-down counter"
+  [ ! -f "$dir/state/.turnend-claude-blocks" ] || fail "positive watcher recovery must reset the ordinary block budget"
+  [ ! -f "$dir/state/.claude-autoarm-failure-alarmed" ] || fail "positive watcher recovery must reset the attended alarm"
+  pass "fm-turnend-guard --claude: positive watcher recovery clears the stood-down counter alongside the ordinary episode state"
+}
+
+test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-dead-foreign-lock")
+  : > "$dir/state/task1.meta"
+  dead=$(nonexistent_pid)
+  printf '%s\n' "$dead" > "$dir/state/.lock"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  expect_code 2 "$status" "a dead recorded lock owner must not take the stood-down path"
+  assert_contains "$out" "$REQUIRED_REASON" "dead lock owner must keep the ordinary repair reason"
+  assert_not_contains "$out" "another live session already owns this home" "dead lock owner must not read as a live foreign owner"
+  [ ! -f "$dir/state/.turnend-standdown-blocks" ] || fail "a dead lock owner must not create the stood-down counter"
+  pass "fm-turnend-guard --claude: a dead recorded lock owner keeps the ordinary progression (genuine failure, unaffected)"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -1598,3 +1719,7 @@ test_hook_claude_mode_away_mode_never_uses_stop_autoarm_fail_open
 test_hook_claude_mode_allow_resets_budget
 test_hook_claude_mode_waits_for_late_claim
 test_hook_claude_mode_secondmate_reblocks_like_primary
+test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded
+test_hook_claude_mode_standdown_reaches_fail_open
+test_hook_claude_mode_standdown_recovery_clears_both_counters
+test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path
