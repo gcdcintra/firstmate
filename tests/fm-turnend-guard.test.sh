@@ -1611,7 +1611,7 @@ test_hook_claude_mode_standdown_reaches_fail_open() {
   pass "fm-turnend-guard --claude: stood-down progression reaches the same bounded, loud, non-repeating fail-open"
 }
 
-test_hook_claude_mode_standdown_recovery_clears_both_counters() {
+test_hook_claude_mode_standdown_recovery_clears_episode_state() {
   local dir out i status pid identity
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-recovery")
   : > "$dir/state/task1.meta"
@@ -1619,7 +1619,7 @@ test_hook_claude_mode_standdown_recovery_clears_both_counters() {
   for i in 1 2 3 4; do
     run_hook_claude "$dir" true >/dev/null 2>&1
   done
-  [ -f "$dir/state/.turnend-standdown-blocks" ] || fail "stood-down progression did not record its counter"
+  [ -f "$dir/state/.turnend-claude-blocks" ] || fail "stood-down progression did not consume the shared block budget"
   assert_present "$dir/state/.claude-autoarm-failure-alarmed" "setup did not reach the stood-down fail-open"
   release_foreign_lock_owner
   sleep 60 &
@@ -1636,10 +1636,9 @@ test_hook_claude_mode_standdown_recovery_clears_both_counters() {
   wait "$pid" 2>/dev/null || true
   expect_code 0 "$status" "--claude must allow once the watcher is healthy again after a stood-down episode"
   [ -z "$out" ] || fail "positive recovery after stood-down produced output: $out"
-  [ ! -f "$dir/state/.turnend-standdown-blocks" ] || fail "positive watcher recovery must reset the stood-down counter"
-  [ ! -f "$dir/state/.turnend-claude-blocks" ] || fail "positive watcher recovery must reset the ordinary block budget"
+  [ ! -f "$dir/state/.turnend-claude-blocks" ] || fail "positive watcher recovery must reset the shared block budget"
   [ ! -f "$dir/state/.claude-autoarm-failure-alarmed" ] || fail "positive watcher recovery must reset the attended alarm"
-  pass "fm-turnend-guard --claude: positive watcher recovery clears the stood-down counter alongside the ordinary episode state"
+  pass "fm-turnend-guard --claude: positive watcher recovery clears the episode state a stood-down progression consumed"
 }
 
 test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path() {
@@ -1652,8 +1651,55 @@ test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path() {
   expect_code 2 "$status" "a dead recorded lock owner must not take the stood-down path"
   assert_contains "$out" "$REQUIRED_REASON" "dead lock owner must keep the ordinary repair reason"
   assert_not_contains "$out" "another live session already owns this home" "dead lock owner must not read as a live foreign owner"
-  [ ! -f "$dir/state/.turnend-standdown-blocks" ] || fail "a dead lock owner must not create the stood-down counter"
+  [ -f "$dir/state/.turnend-claude-blocks" ] || fail "the ordinary progression must still consume the shared block budget"
   pass "fm-turnend-guard --claude: a dead recorded lock owner keeps the ordinary progression (genuine failure, unaffected)"
+}
+
+# The stood-down outcome and the ordinary auto-arm-failure progression share one
+# persisted budget, so a session that stands down and then hits a genuine
+# failure cannot re-block for a second full budget: two independent counters
+# would stack to twice FM_CLAUDE_TURNEND_BLOCK_BUDGET and lose the loud attended
+# alarm to Claude Code's own 8-consecutive-block override.
+test_hook_claude_mode_standdown_and_failure_share_one_budget() {
+  local dir out i status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-shared-budget")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  for i in 1 2 3; do
+    out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+    expect_code 2 "$status" "stood-down block $i must exit 2 within the shared budget"
+  done
+  # The foreign owner exits (its dead pid stays recorded, exactly as a crashed
+  # session leaves it) and this session's own auto-arm then genuinely fails.
+  release_foreign_lock_owner
+  seed_claude_failure "$dir"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  expect_code 0 "$status" "a budget already exhausted while stood down must not restart for the ordinary progression"
+  assert_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "the shared budget did not carry into the ordinary attended fail-open"
+  assert_present "$dir/state/.claude-autoarm-failure-alarmed" "the carried-over budget did not consume the shared episode alarm"
+  pass "fm-turnend-guard --claude: stood-down and auto-arm-failure blocks share one budget instead of stacking"
+}
+
+# Away mode: the away daemon owns supervision, so the stood-down reason override
+# and its fail-open are both suppressed exactly like the ordinary progression's
+# fail-open. Blocking forever is the intended away-mode outcome; ending a turn
+# blind there is the failure mode this guards against.
+test_hook_claude_mode_away_mode_excludes_standdown_fail_open() {
+  local dir out i status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-afk")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  record_foreign_lock_owner "$dir"
+  for i in 1 2 3 4; do
+    out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+    expect_code 2 "$status" "away mode must keep blocking the stood-down path at block $i"
+    assert_contains "$out" 'Away mode owns watcher supervision' "away-mode stood-down block $i lost its daemon ownership guidance"
+    assert_not_contains "$out" 'another live session already owns this home' "away-mode block $i must not take the stood-down reason override"
+    assert_not_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "away mode must never take the stood-down fail-open"
+  done
+  release_foreign_lock_owner
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "away mode consumed the shared attended alarm on the stood-down path"
+  pass "fm-turnend-guard --claude: away ownership excludes the stood-down reason override and its fail-open"
 }
 
 test_predicate_healthy_no_inflight
@@ -1721,5 +1767,7 @@ test_hook_claude_mode_waits_for_late_claim
 test_hook_claude_mode_secondmate_reblocks_like_primary
 test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded
 test_hook_claude_mode_standdown_reaches_fail_open
-test_hook_claude_mode_standdown_recovery_clears_both_counters
+test_hook_claude_mode_standdown_recovery_clears_episode_state
 test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path
+test_hook_claude_mode_standdown_and_failure_share_one_budget
+test_hook_claude_mode_away_mode_excludes_standdown_fail_open
