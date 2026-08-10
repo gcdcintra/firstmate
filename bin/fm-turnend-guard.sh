@@ -66,13 +66,21 @@
 # above can never become reachable while waiting on that failure. This guard
 # treats "stood down because another live session owns the fleet" as its own
 # first-class outcome: it accounts that case on the SAME bounded
-# state/.turnend-claude-blocks budget as step 3, incrementing unconditionally
+# state/.turnend-claude-blocks budget as step 3, incrementing once per turn
 # instead of deduping against an epoch that cannot advance, so the two reasons
 # share one budget and can never stack past it. Once that shared budget is
 # exhausted the stood-down outcome allows the same one loud attended fail-open,
 # sharing state/.claude-autoarm-failure-alarmed with the ordinary progression so
 # only one alarm ever fires per unresolved episode regardless of which reason
 # triggered it first (2026-08-08 incident).
+#
+# Away mode (state/.afk) owns supervision itself, so a stood-down turn end there
+# blocks with the away-mode reason and accounts NOTHING: the reason override,
+# the accounting, and the fail-open are all excluded together. The attended
+# fail-open is a single-shot resource, and an unattended away stretch must not
+# spend the bounded blocks that belong to the first attended turn after the
+# return - away mode's own return catch-up already reports that supervision was
+# down while away.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -452,9 +460,11 @@ fi
 # the auto-arm above correctly stayed inert and never wrote the epoch/failure
 # evidence the ordinary progression below waits for (see the header comment).
 # Handle that stood-down outcome on the shared block budget before assuming a
-# genuine auto-arm failure.
+# genuine auto-arm failure. Away mode owns supervision itself, so it blocks here
+# without spending any of that budget (see the header comment).
 if fm_session_lock_foreign_owner_alive "$STATE"; then
   FOREIGN_LOCK_OWNER_ALIVE=1
+  [ ! -e "$STATE/.afk" ] || block_stop
   standdown_account || block_stop
   standdown_terminal_fail_open
   standdown_status=$?

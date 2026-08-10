@@ -1702,6 +1702,32 @@ test_hook_claude_mode_away_mode_excludes_standdown_fail_open() {
   pass "fm-turnend-guard --claude: away ownership excludes the stood-down reason override and its fail-open"
 }
 
+# The attended fail-open is single-shot, so an unattended away stretch must not
+# spend the bounded blocks that belong to the first attended turn after the
+# return: otherwise that turn skips its blocks and goes straight to the alarm.
+test_hook_claude_mode_away_mode_spends_no_standdown_budget() {
+  local dir out i status count
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-afk-budget")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  record_foreign_lock_owner "$dir"
+  for i in 1 2 3 4 5; do
+    out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+    expect_code 2 "$status" "away-mode stood-down turn $i must block"
+    assert_absent "$dir/state/.turnend-claude-blocks" "away-mode stood-down turn $i spent the attended block budget"
+  done
+  rm -f "$dir/state/.afk"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  release_foreign_lock_owner
+  expect_code 2 "$status" "the first attended turn after away mode must be an ordinary bounded block"
+  assert_contains "$out" 'another live session already owns this home' "the first attended turn after away mode lost the stood-down reason"
+  assert_not_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "the first attended turn after away mode skipped its bounded blocks and alarmed"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "the first attended turn after away mode consumed the one attended alarm"
+  count=$(sed -n '2s/^count=//p' "$dir/state/.turnend-claude-blocks" 2>/dev/null || true)
+  [ "$count" = 1 ] || fail "the first attended turn after away mode must start the bounded progression at count=1, got ${count:-no record}"
+  pass "fm-turnend-guard --claude: away mode blocks the stood-down path without spending the attended block budget"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -1771,3 +1797,4 @@ test_hook_claude_mode_standdown_recovery_clears_episode_state
 test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path
 test_hook_claude_mode_standdown_and_failure_share_one_budget
 test_hook_claude_mode_away_mode_excludes_standdown_fail_open
+test_hook_claude_mode_away_mode_spends_no_standdown_budget

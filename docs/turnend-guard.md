@@ -75,6 +75,10 @@ One shared counter is deliberate: two independent counters would let the two re-
 Once that shared budget is exhausted, the guard re-checks watcher health and the foreign-owner condition fresh and, if still stood down, fires the same one-time attended fail-open.
 It shares `state/.claude-autoarm-failure-alarmed` with the ordinary progression, so only one attended alarm ever fires per unresolved episode regardless of which reason triggered it first, and positive watcher recovery clears that one budget, notice, and alarm together.
 
+Away mode is excluded from that path in all three respects: while `state/.afk` is present a stood-down turn end keeps the away-mode reason, spends none of the shared budget, and never fires the attended fail-open.
+Excluding the accounting matters as much as excluding the alarm, because the attended fail-open is single-shot: if unattended away turn ends spent the budget, the first attended turn end after the return would skip its bounded blocks and go straight to the loud alarm.
+Away mode's own return catch-up already reports that supervision was down during the away stretch, so that alarm would add nothing at that moment while consuming the episode's one attended escape.
+
 OpenCode, Pi, and pi-signed expose passive callbacks for this purpose.
 Their adapters fail open at the hook boundary to protect the user session but schedule one bounded follow-up when the predicate blocks.
 The generated prompts use the canonical `turn-end-guard` kind after the U+2063 `FIRSTMATE_OP: ` prefix, so Ahoy does not treat them as captain messages.
@@ -110,7 +114,7 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it alwa
 
 ## Regression coverage
 
-`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, the stood-down-inert path (bounded progression on the shared budget, its own reason message, the shared one-time alarm, away-mode precedence over both, and that a dead or absent lock owner keeps the ordinary path), Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
+`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, the stood-down-inert path (bounded progression on the shared budget, its own reason message, the shared one-time alarm, away-mode precedence over its reason, its accounting, and its fail-open alike, and that a dead or absent lock owner keeps the ordinary path), Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
 `tests/fm-guard-stale-banner.test.sh` covers the matching pull-guard predicate, including the fresh-leftover-beacon negative control.
 `tests/fm-kimi-harness.test.sh` covers the separate Kimi crew hook's format preservation, idempotence, refusal cases, token guard, spawn registration, and teardown cleanup.
 `tests/fm-supervision-instructions.test.sh` covers recovery-line ownership and pi-signed's identity-preserving reuse of Pi's protocol.
