@@ -85,12 +85,12 @@ fm_path_age() {
 # Callers that report a watcher lapse must name this condition rather than the
 # first plausible-looking symptom: the beacon can be perfectly fresh while the
 # lock is absent, and the lock can be perfectly valid while the holder has wedged.
-# shellcheck disable=SC2034 # Read by callers after the predicate returns.
 FM_WATCHER_UNHEALTHY_REASON=
-# shellcheck disable=SC2034 # Read by callers after the predicate returns.
 FM_WATCHER_UNHEALTHY_DETAIL=
 fm_watcher_set_unhealthy() {
+  # shellcheck disable=SC2034 # Read by callers after the predicate returns.
   FM_WATCHER_UNHEALTHY_REASON=$1
+  # shellcheck disable=SC2034 # Read by callers after the predicate returns.
   FM_WATCHER_UNHEALTHY_DETAIL=${2:-}
 }
 
