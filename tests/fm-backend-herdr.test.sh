@@ -3150,7 +3150,10 @@ test_send_text_submit_confirms_blocked_after_enter() {
 # discriminator - herdr's native agent state at the moment that budget runs out -
 # the same way tests/fm-tmux-submit-busy.test.sh pins fm_pane_is_busy for tmux.
 # Call indices with retries=2: 1 send-text, 2 baseline agent get, 3 Enter,
-# 4 pane read, 5 Enter, 6 pane read, 7 fallback agent get.
+# 4 pane read, 5 Enter, 6 pane read, 7 fallback agent get. The cleared quadrants
+# consume through 6 and stop there, and deliberately still pin 7 so that a
+# fallback response IS available; their `agent get` count is what proves the
+# fallback was never reached.
 # Every quadrant also asserts a single send-text, because a swallowed Enter is
 # only ever retried as Enter and the text is never retyped.
 
@@ -3230,30 +3233,44 @@ test_send_text_submit_blocked_pending_composer_stays_pending() {
   out=$(herdr_submit_busy_quadrant submit-blocked-pending 2 \
     "4=$HERDR_COMPOSER_HOLDS_MESSAGE" "6=$HERDR_COMPOSER_HOLDS_MESSAGE" "7=$HERDR_AGENT_BLOCKED")
   [ "$out" = pending ] || fail "a blocked target must not be converted to a confirmed delivery, got '$out'"
+  herdr_submit_assert_single_send_text "$TMP_ROOT/submit-blocked-pending/log"
   pass "fm_backend_herdr_send_text_submit: only an actively working target converts a pending composer, never a blocked one"
 }
 
-# Quadrants 3 and 4: a cleared composer is positive proof on its own, so the
-# fallback is never reached and the native state is never consulted for it.
+# Quadrants 3 and 4: a composer that clears within the retry budget is positive
+# proof on its own, so the loop returns at that read (call 6) and the fallback is
+# never reached. Both quadrants run the same consumed sequence and differ only in
+# the agent state pinned at call 7 - the state the fallback WOULD have read. That
+# response is deliberately never consumed, so the `agent get` count of 1 (the
+# baseline alone) is what proves the conversion was skipped rather than merely
+# agreeing with the verdict: with 7 pinned working a wrongly-run fallback would
+# still echo 'empty' and only the count catches it, while with 7 pinned idle it
+# would flip the verdict to 'pending'.
 test_send_text_submit_busy_cleared_composer_returns_empty() {
   local out log
   out=$(herdr_submit_busy_quadrant submit-busy-cleared 2 \
-    "4=$HERDR_COMPOSER_CLEARED" "5=$HERDR_AGENT_WORKING")
+    "4=$HERDR_COMPOSER_HOLDS_MESSAGE" "6=$HERDR_COMPOSER_CLEARED" "7=$HERDR_AGENT_WORKING")
   log="$TMP_ROOT/submit-busy-cleared/log"
-  [ "$out" = empty ] || fail "a cleared composer confirms delivery on the first Enter, got '$out'"
+  [ "$out" = empty ] || fail "a composer that clears within the retry budget confirms delivery, got '$out'"
+  [ "$(herdr_submit_log_count "$log" pane send-keys w1:p2 enter)" -eq 2 ] \
+    || fail "the composer cleared on the second Enter, so exactly the two budgeted Enters should have been sent"
   [ "$(herdr_submit_log_count "$log" agent get)" -eq 1 ] \
     || fail "a cleared composer must confirm without consulting native state beyond the baseline"
-  pass "fm_backend_herdr_send_text_submit: a busy target whose composer clears on the first Enter reports empty without a fallback state read"
+  herdr_submit_assert_single_send_text "$log"
+  pass "fm_backend_herdr_send_text_submit: a busy target whose composer clears within the budget reports empty without a fallback state read"
 }
 
 test_send_text_submit_idle_cleared_composer_returns_empty() {
   local out log
   out=$(herdr_submit_busy_quadrant submit-idle-cleared 2 \
-    "4=$HERDR_COMPOSER_CLEARED" "5=$HERDR_AGENT_IDLE")
+    "4=$HERDR_COMPOSER_HOLDS_MESSAGE" "6=$HERDR_COMPOSER_CLEARED" "7=$HERDR_AGENT_IDLE")
   log="$TMP_ROOT/submit-idle-cleared/log"
-  [ "$out" = empty ] || fail "a cleared composer confirms delivery whatever the target's state, got '$out'"
+  [ "$out" = empty ] || fail "a cleared composer confirms delivery even with an idle state waiting at the fallback, got '$out'"
+  [ "$(herdr_submit_log_count "$log" pane send-keys w1:p2 enter)" -eq 2 ] \
+    || fail "the composer cleared on the second Enter, so exactly the two budgeted Enters should have been sent"
   [ "$(herdr_submit_log_count "$log" agent get)" -eq 1 ] \
     || fail "a cleared composer must confirm without consulting native state beyond the baseline"
+  herdr_submit_assert_single_send_text "$log"
   pass "fm_backend_herdr_send_text_submit: a target that went idle with a cleared composer still reports empty, unchanged by the busy conversion"
 }
 
