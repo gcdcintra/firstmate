@@ -58,6 +58,29 @@
 #      (default 3) consecutive blocks per session - safely below Claude Code's
 #      hard 8-consecutive-block override - then allow one loud attended
 #      fail-open only for an already verified failure episode.
+#
+# Stood-down outcome (another live session owns the fleet lock): when
+# state/.lock is held by a live foreign harness session, the Stop-owned
+# auto-arm correctly stays INERT by design (bin/fm-claude-stop-autoarm.sh) and
+# never writes an epoch or an EXHAUSTED FAILURE notice for this home - so step 3
+# above can never become reachable while waiting on that failure. This guard
+# treats "stood down because another live session owns the fleet" as its own
+# first-class outcome: it accounts that case on the SAME bounded
+# state/.turnend-claude-blocks budget as step 3, incrementing once per turn
+# instead of deduping against an epoch that cannot advance, so the two reasons
+# share one budget and can never stack past it. Once that shared budget is
+# exhausted the stood-down outcome allows the same one loud attended fail-open,
+# sharing state/.claude-autoarm-failure-alarmed with the ordinary progression so
+# only one alarm ever fires per unresolved episode regardless of which reason
+# triggered it first (2026-08-08 incident).
+#
+# Away mode (state/.afk) owns supervision itself, so a stood-down turn end there
+# blocks with the away-mode reason and accounts NOTHING: the reason override,
+# the accounting, and the fail-open are all excluded together. The attended
+# fail-open is a single-shot resource, and an unattended away stretch must not
+# spend the bounded blocks that belong to the first attended turn after the
+# return - away mode's own return catch-up already reports that supervision was
+# down while away.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,12 +150,15 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 # --- the actual predicate ----------------------------------------------------
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-session-lock-lib.sh
+. "$SCRIPT_DIR/fm-session-lock-lib.sh"
 
 BUDGET_FILE="$STATE/.turnend-claude-blocks"
 BUDGET_LOCK="$STATE/.turnend-claude-blocks.lock"
 OWNER_LOCK="$STATE/.claude-autoarm.lock"
 FAILURE_NOTICE="$STATE/.claude-autoarm-failure-notified"
 FAILURE_ALARM="$STATE/.claude-autoarm-failure-alarmed"
+FOREIGN_LOCK_OWNER_ALIVE=0
 SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"' 2>/dev/null || printf 'unknown')
 budget_reset() {
   [ "$CLAUDE_MODE" -eq 1 ] || return 0
@@ -158,8 +184,12 @@ block_stop() {
   [ -e "$STATE/.afk" ] && afk=1
   x_mode=0
   [ -f "$CONFIG/x-mode.env" ] && x_mode=1
-  reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
-    || printf '%s\n' 'tasks in flight, no live watcher - repair missing watcher supervision according to the session-start operating block before ending the turn')
+  if [ "$CLAUDE_MODE" -eq 1 ] && [ "$FOREIGN_LOCK_OWNER_ALIVE" -eq 1 ] && [ "$afk" -eq 0 ]; then
+    reason="another live session already owns this home's fleet lock, so the Stop-owned auto-arm here correctly stays inert by design and will never record a failure. Supervision recovery belongs to that other session; do not inspect this session's hook registration."
+  else
+    reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
+      || printf '%s\n' 'tasks in flight, no live watcher - repair missing watcher supervision according to the session-start operating block before ending the turn')
+  fi
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"
@@ -178,6 +208,18 @@ block_stop() {
     printf '●%s\n' "$rule"
   } >&2
   exit 2
+}
+
+# The one description of WHAT still needs supervision, shared by every attended
+# fail-open message so the two alarms cannot drift apart.
+need_desc() {
+  if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
+    printf '%s task(s) in flight' "$FM_SUP_IN_FLIGHT"
+  elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
+    printf '%s process-event source(s) registered' "$FM_SUP_SOURCES"
+  else
+    printf 'X-mode relay polling active'
+  fi
 }
 
 if [ "$CLAUDE_MODE" -eq 0 ]; then
@@ -338,6 +380,64 @@ failure_episode_verified() {
   esac
 }
 
+# --- stood-down accounting (another live session owns the fleet lock) --------
+# Shares the one BUDGET_FILE record, and its BUDGET_LOCK, with
+# budget_account_current_epoch() above: a single persisted counter is what keeps
+# the two reasons for re-blocking from independently reaching BLOCK_BUDGET and
+# stacking to twice it, and it keeps every writer of that record - including
+# fm_failure_episode_reset() - under the same lock.
+#
+# What it must NOT share is that function's epoch dedup: the auto-arm epoch
+# never advances while it stays inert (see the header comment), so every call
+# would see the same unchanging epoch and never distinguish "still the same
+# turn" from "the auto-arm never ran again". This outcome therefore increments
+# once per turn unconditionally, and passes the record's epoch field through
+# unchanged so a later transition back to the ordinary progression still reads
+# the epoch that progression recorded.
+standdown_account() {
+  local old_session old_count old_epoch='' tmp
+  fm_lock_try_acquire "$BUDGET_LOCK" || return 1
+  COUNT=1
+  if [ -f "$BUDGET_FILE" ]; then
+    old_session=$(sed -n '1s/^session=//p' "$BUDGET_FILE" 2>/dev/null || true)
+    old_count=$(sed -n '2s/^count=//p' "$BUDGET_FILE" 2>/dev/null || true)
+    old_epoch=$(sed -n '3s/^epoch=//p' "$BUDGET_FILE" 2>/dev/null || true)
+    case "$old_count" in
+      ''|*[!0-9]*) old_count=0 ;;
+    esac
+    [ "$old_session" = "$SESSION_ID" ] && COUNT=$((old_count + 1))
+  fi
+  tmp="$BUDGET_FILE.tmp.$$"
+  if ! printf 'session=%s\ncount=%s\nepoch=%s\n' "$SESSION_ID" "$COUNT" "$old_epoch" > "$tmp" 2>/dev/null \
+    || ! mv -f "$tmp" "$BUDGET_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    fm_lock_release "$BUDGET_LOCK"
+    return 1
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  fm_lock_release "$BUDGET_LOCK"
+  return 0
+}
+
+# Same bounded-then-loud-once contract as terminal_fail_open(), on the shared
+# block budget but keyed to the live foreign lock owner instead of the auto-arm
+# epoch/failure-notice evidence, and sharing the same FAILURE_ALARM so only one
+# attended alarm ever fires per unresolved episode. Returns 0 (alarm fired,
+# report genuinely down), 1 (not yet eligible - caller falls through to an
+# ordinary block), or 2 (recovered between accounting and this check - episode
+# reset, allow the stop).
+standdown_terminal_fail_open() {
+  [ "$COUNT" -gt "$BLOCK_BUDGET" ] || return 1
+  [ ! -e "$STATE/.afk" ] || return 1
+  [ ! -e "$FAILURE_ALARM" ] || return 1
+  if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+    fm_failure_episode_reset "$STATE" || return 1
+    return 2
+  fi
+  fm_session_lock_foreign_owner_alive "$STATE" || return 1
+  (set -C; : > "$FAILURE_ALARM") 2>/dev/null
+}
+
 i=0
 while [ "$i" -lt $((SYNC_WAIT_MS / 100)) ]; do
   if autoarm_owns_recovery; then
@@ -356,19 +456,34 @@ if autoarm_owns_recovery; then
   exit 0
 fi
 
+# Another live session may already own this home's fleet lock, in which case
+# the auto-arm above correctly stayed inert and never wrote the epoch/failure
+# evidence the ordinary progression below waits for (see the header comment).
+# Handle that stood-down outcome on the shared block budget before assuming a
+# genuine auto-arm failure. Away mode owns supervision itself, so it blocks here
+# without spending any of that budget (see the header comment).
+if fm_session_lock_foreign_owner_alive "$STATE"; then
+  FOREIGN_LOCK_OWNER_ALIVE=1
+  [ ! -e "$STATE/.afk" ] || block_stop
+  standdown_account || block_stop
+  standdown_terminal_fail_open
+  standdown_status=$?
+  if [ "$standdown_status" -eq 0 ]; then
+    NEED_DESC=$(need_desc)
+    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, another live session already owns this home fleet lock so the Stop-owned auto-arm here correctly stays inert and will never record a failure, no watcher or automatic continuation exists here, and the block budget is exhausted. Keep this session attended: wait for that other session to restore supervision or take over the fleet lock, and diagnose why that session watcher stopped beating before relying on unattended supervision here."}\n' "$NEED_DESC"
+    exit 0
+  fi
+  [ "$standdown_status" -eq 2 ] && exit 0
+  block_stop
+fi
+
 # The auto-arm genuinely failed to establish: consume the bounded re-block
 # budget before considering the verified one-time attended fail-open.
 budget_account_current_epoch || block_stop
 terminal_fail_open
 terminal_status=$?
 if [ "$terminal_status" -eq 0 ]; then
-  if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
-    NEED_DESC="$FM_SUP_IN_FLIGHT task(s) in flight"
-  elif [ "$FM_SUP_SOURCES" -gt 0 ]; then
-    NEED_DESC="$FM_SUP_SOURCES process-event source(s) registered"
-  else
-    NEED_DESC="X-mode relay polling active"
-  fi
+  NEED_DESC=$(need_desc)
   printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, the Stop-owned auto-arm exhausted its bounded retries and one failure notice, no watcher or automatic continuation exists, and the block budget is exhausted. Keep this session attended and diagnose the automatic Stop-hook and watcher startup before relying on unattended supervision."}\n' "$NEED_DESC"
   exit 0
 fi

@@ -195,6 +195,20 @@ Observed output:
 fm-claude-stop-autoarm: ok
 ```
 
+The bounded stood-down fail-open, which keeps the `--claude` guard from blocking indefinitely while another live session owns this home's fleet lock, was verified on 2026-08-10 with the isolated behavior suites for both cooperating hooks.
+
+```sh
+bin/fm-doc-audience-check.sh
+bin/fm-test-run.sh tests/fm-turnend-guard.test.sh tests/fm-claude-stop-autoarm.test.sh
+```
+
+Observed output:
+
+```text
+fm-doc-audience-check: ok surfaces=61 local_links=176
+FM_TEST_SUMMARY total=2 failed=0 skipped_gate=0 duration_ms=152927
+```
+
 ## Watcher continuity
 
 The cross-harness evidence combines the 2026-07-17 live pass with Claude's replacement Stop-owned path revalidated on 2026-07-24, all against isolated project and home state.

@@ -160,3 +160,20 @@ $pids
 EOF
   return 1
 }
+
+# True when state dir $1's session lock is held by a LIVE harness process that
+# is not this process's own ancestry: the state in which recovery genuinely
+# belongs to that other session, so this session's own Stop-owned auto-arm
+# (bin/fm-claude-stop-autoarm.sh) correctly stays inert rather than contesting
+# it. False for a missing/malformed lock and false for a dead recorded owner -
+# both remain this caller's own uncertainty or stale-owner cases to handle, not
+# a foreign live owner.
+fm_session_lock_foreign_owner_alive() {
+  local state=$1 lock_pid
+  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
+  case "$lock_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fm_session_lock_owned_by_self "$state" && return 1
+  fm_harness_pid_alive "$lock_pid"
+}
