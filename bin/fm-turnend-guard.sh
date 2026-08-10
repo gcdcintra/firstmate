@@ -201,6 +201,8 @@ block_stop() {
     else
       printf '●  X-mode relay polling needs supervision, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_BEACON_DESC"
     fi
+    printf '●  Failing condition: %s.\n' \
+      "$(fm_watcher_unhealthy_description "$FM_WATCHER_UNHEALTHY_REASON" "$FM_WATCHER_UNHEALTHY_DETAIL")"
     if [ "$CLAUDE_MODE" -eq 1 ]; then
       printf '●  The Stop-owned auto-arm did not claim this home either, so recovery is NOT already under way.\n'
     fi

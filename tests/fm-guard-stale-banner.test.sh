@@ -96,14 +96,102 @@ test_repeated_same_episode_prints_reminder_only() {
   pass "fm-guard stale banner: repeated same-episode calls print a concise reminder only"
 }
 
-test_fresh_beacon_without_live_watcher_stays_alarm() {
-  local dir out
-  dir=$(make_guard_case fresh-no-live)
-  touch "$(case_home "$dir")/state/.last-watcher-beat"
+# The exact shape observed in the main home on 2026-08-10: seven tasks in flight,
+# state/.watch.lock absent, the beacon seconds old, and an fm-watch.sh process on
+# the machine. A watcher releases its lock every time it exits on a wake, so this
+# is the ordinary gap between one cycle ending and the next arming - not a lapse.
+# The full alarm here fired on essentially every guarded command during healthy
+# supervision, which is what teaches an operator to skim past it.
+test_between_cycle_gap_without_lock_stays_silent() {
+  local dir home out pid
+  dir=$(make_guard_case between-cycle-gap)
+  home=$(case_home "$dir")
+  sleep 60 &
+  pid=$!
+  touch "$home/state/.last-watcher-beat"
+  assert_absent "$home/state/.watch.lock" "the gap fixture must have no watcher lock"
+  out=$(run_guard_case "$dir")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ -z "$out" ] \
+    || fail "the normal between-cycle gap (fresh beacon, no lock, watcher process alive) must stay silent: $out"
+  assert_absent "$home/state/.guard-watcher-stale-banner" \
+    "a silent between-cycle gap must not open a stale episode"
+  pass "fm-guard stale banner: a fresh beacon with no lock is the normal gap, not an alarm"
+}
+
+# The other direction, which must not regress: once the beacon ages past the
+# grace window nothing is supervising, and the alarm must name the ABSENT LOCK
+# rather than blaming the beacon it just reported.
+test_stale_beacon_without_lock_alarms_and_names_absent_lock() {
+  local dir home out
+  dir=$(make_guard_case stale-no-lock)
+  home=$(case_home "$dir")
+  touch -t 202001010000 "$home/state/.last-watcher-beat"
   out=$(run_guard_case "$dir")
   [ "$(count_text "$out" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
-    || fail "a fresh leftover beacon without a live watcher must still alarm: $out"
-  pass "fm-guard stale banner: a fresh beacon without a live watcher remains unhealthy"
+    || fail "a stale beacon with no live watcher must still alarm: $out"
+  assert_contains "$out" "Failing condition: no watcher process holds this home's watcher lock" \
+    "the banner must name the absent lock, not a proxy condition"
+  pass "fm-guard stale banner: a stale beacon with no lock alarms and names the absent lock"
+}
+
+# A lock left behind by a watcher that died: still a real lapse, and the banner
+# must say the recorded owner is gone instead of blaming the beacon.
+test_dead_lock_pid_alarms_and_names_the_dead_pid() {
+  local dir home out pid
+  dir=$(make_guard_case dead-lock-pid)
+  home=$(case_home "$dir")
+  sleep 60 &
+  pid=$!
+  record_live_watcher "$dir" "$pid" || fail "could not record the watcher fixture"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  touch -t 202001010000 "$home/state/.last-watcher-beat"
+  out=$(run_guard_case "$dir")
+  [ "$(count_text "$out" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "a lock naming a dead pid must alarm: $out"
+  assert_contains "$out" "Failing condition: this home's watcher lock names pid $pid, which is no longer running" \
+    "the banner must name the dead lock owner"
+  pass "fm-guard stale banner: a lock naming a dead pid alarms and names that pid"
+}
+
+# The wedged-holder shape: the lock is valid and its owner really is alive, but
+# that process stopped beating. Blaming the lock here would send the reader to a
+# lock that is perfectly fine, so the banner must name the wedged holder.
+test_wedged_live_holder_alarms_and_names_the_stalled_watcher() {
+  local dir home out pid
+  dir=$(make_guard_case wedged-holder)
+  home=$(case_home "$dir")
+  sleep 60 &
+  pid=$!
+  record_live_watcher "$dir" "$pid" || fail "could not record the live watcher fixture"
+  touch -t 202001010000 "$home/state/.last-watcher-beat"
+  out=$(run_guard_case "$dir")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$(count_text "$out" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "a live but non-beating lock holder must alarm: $out"
+  assert_contains "$out" "Failing condition: the watcher holding this home's lock (pid $pid) is running but has stopped beating" \
+    "the banner must name the wedged holder instead of the lock"
+  pass "fm-guard stale banner: a live but wedged lock holder alarms and names the stall"
+}
+
+# A verified live watcher is reported healthy and never alarms - the direction the
+# gap fix must not weaken into "any fresh beacon is fine forever".
+test_live_watcher_with_fresh_beacon_stays_silent() {
+  local dir home out pid
+  dir=$(make_guard_case live-watcher-silent)
+  home=$(case_home "$dir")
+  sleep 60 &
+  pid=$!
+  record_live_watcher "$dir" "$pid" || fail "could not record the live watcher fixture"
+  touch "$home/state/.last-watcher-beat"
+  out=$(run_guard_case "$dir")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ -z "$out" ] || fail "a live watcher with a fresh beacon must stay silent, got: $out"
+  pass "fm-guard stale banner: a live watcher with a fresh beacon stays silent"
 }
 
 test_x_mode_without_live_watcher_stays_alarm() {
@@ -285,7 +373,11 @@ test_read_only_never_mutates_stale_banner_state_files() {
 
 test_first_stale_call_prints_full_banner
 test_repeated_same_episode_prints_reminder_only
-test_fresh_beacon_without_live_watcher_stays_alarm
+test_between_cycle_gap_without_lock_stays_silent
+test_stale_beacon_without_lock_alarms_and_names_absent_lock
+test_dead_lock_pid_alarms_and_names_the_dead_pid
+test_wedged_live_holder_alarms_and_names_the_stalled_watcher
+test_live_watcher_with_fresh_beacon_stays_silent
 test_x_mode_without_live_watcher_stays_alarm
 test_healthy_recovery_rearms_next_stale_episode
 test_concurrent_same_episode_prints_one_full_banner
