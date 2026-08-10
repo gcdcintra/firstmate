@@ -6,12 +6,29 @@
 # non-default branch, because that means firstmate-on-itself work landed in the
 # primary instead of an isolated worktree.
 # Then, if a task is in flight (a state/<id>.meta exists) or X-mode relay
-# polling is active (state/x-watch.check.sh exists) and no identity-matched
-# watcher has a liveness beacon (state/.last-watcher-beat, touched every poll
-# cycle) fresh within FM_GUARD_GRACE seconds, prints a loud, clearly delimited
-# banner so the agent cannot skim past it in the tool output of whatever it was
-# doing - the one channel every harness has. The full banner is emitted once per
-# distinct staleness episode in this FM_HOME (keyed to beacon mtime or absence);
+# polling is active (state/x-watch.check.sh exists) and no watcher has left a
+# liveness beacon (state/.last-watcher-beat) fresh within FM_GUARD_GRACE seconds,
+# prints a loud, clearly delimited banner so the agent cannot skim past it in the
+# tool output of whatever it was doing - the one channel every harness has.
+#
+# The alarm gate is the BEACON-GRACE predicate (fm_supervision_unhealthy), NOT the
+# strict fm_watcher_healthy lock check, because a watcher exits and releases its
+# lock on every actionable wake: state/.watch.lock is legitimately absent for the
+# whole gap between one cycle ending and the next arming, which is most of a busy
+# home's wall clock. Gating the alarm on the lock fired "WATCHER DOWN" during
+# ordinary healthy supervision and taught operators to ignore the one banner that
+# must never be ignored. The grace window is exactly the allowance for that gap.
+# This defers, and never suppresses, a real lapse: bin/fm-watch.sh touches the
+# beacon only AFTER confirming it still owns the lock, so a fresh beacon proves a
+# verified holder was running within the grace window, and a watcher that dies
+# without a successor goes stale and alarms within FM_GUARD_GRACE. Meanwhile the
+# mechanisms that actually restore supervision - bin/fm-turnend-guard.sh,
+# bin/fm-claude-stop-autoarm.sh, and bin/fm-watch-arm.sh's attach decision - keep
+# the strict lock predicate and re-arm during the gap without waiting for grace.
+# The banner then names the condition fm_watcher_healthy actually rejected
+# (absent lock, foreign home, dead pid, identity mismatch, wedged holder), never
+# a proxy for it. The full banner is emitted once per distinct staleness episode
+# in this FM_HOME (keyed to beacon mtime or absence);
 # later guarded commands in the same episode print a one-line reminder instead.
 # Episode state lives only under state/.guard-watcher-stale-banner (volatile,
 # bounded). Independent alarms (queued wakes, worktree tangle) are never
@@ -150,9 +167,21 @@ in_flight=$FM_SUP_IN_FLIGHT
 sources=$FM_SUP_SOURCES
 needed=$FM_SUP_NEEDED
 beacon_desc=$FM_SUP_BEACON_DESC
+watcher_fresh=$FM_SUP_WATCHER_FRESH
+# The strict predicate no longer decides whether to alarm (see the header); it is
+# consulted so the banner can name the exact condition that failed, and so a
+# verified live watcher still short-circuits to silence.
 watcher_healthy=false
 if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   watcher_healthy=true
+fi
+unhealthy_desc=$(fm_watcher_unhealthy_description \
+  "$FM_WATCHER_UNHEALTHY_REASON" "$FM_WATCHER_UNHEALTHY_DETAIL")
+# Supervision has genuinely lapsed only when no verified watcher is running AND
+# the beacon has aged past the grace that covers the normal between-cycle gap.
+supervision_lapsed=false
+if [ "$watcher_healthy" = false ] && [ "$watcher_fresh" = false ]; then
+  supervision_lapsed=true
 fi
 if [ "$needed" = false ]; then
   # Leave the unhealthy state (nothing riding on the watcher): clear so a later
@@ -164,10 +193,10 @@ fi
 
 [ -s "$FM_WAKE_QUEUE" ] && queue_pending=true
 
-# No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
+# A lapsed watcher with tasks in flight is the dangerous state: emit a prominent,
 # bordered banner FIRST so it reads as an alarm, not a buried stderr line. Later
 # calls in the same episode get a one-line reminder only.
-if [ "$watcher_healthy" = false ]; then
+if [ "$supervision_lapsed" = true ]; then
   episode_key=$(fm_guard_stale_episode_key "$STATE")
   episode_key=${episode_key%$'\n'}
   print_full_banner=0
@@ -194,12 +223,13 @@ if [ "$watcher_healthy" = false ]; then
       printf '●%s\n' "$rule"
       printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
       if [ "$in_flight" -gt 0 ]; then
-        printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
+        printf '●  %s task(s) in flight, but no live watcher is supervising them (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
       elif [ "$sources" -gt 0 ]; then
-        printf '●  %s process-event source(s) registered, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$sources" "$beacon_desc" "$GRACE"
+        printf '●  %s process-event source(s) registered, but no live watcher is supervising them (last beat: %s, grace %ss).\n' "$sources" "$beacon_desc" "$GRACE"
       else
-        printf '●  X-mode relay polling needs supervision, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$beacon_desc" "$GRACE"
+        printf '●  X-mode relay polling needs supervision, but no live watcher is running (last beat: %s, grace %ss).\n' "$beacon_desc" "$GRACE"
       fi
+      printf '●  Failing condition: %s.\n' "$unhealthy_desc"
       if [ "$READ_ONLY" -eq 1 ]; then
         printf '●  This read-only session should report the lapse, not repair it.\n'
       else
@@ -210,12 +240,13 @@ if [ "$watcher_healthy" = false ]; then
       printf '●%s\n' "$rule"
     } >&2
   else
-    printf 'WARNING: watcher still down (same stale episode; last beat: %s, grace %ss) - full banner already printed this episode.\n' \
-      "$beacon_desc" "$GRACE" >&2
+    printf 'WARNING: watcher still down (same stale episode; %s; last beat: %s, grace %ss) - full banner already printed this episode.\n' \
+      "$unhealthy_desc" "$beacon_desc" "$GRACE" >&2
   fi
 else
-  # Healthy again while work is still in flight: end the episode so a later
-  # restale re-prints the full banner.
+  # Supervising again while work is still in flight - either a verified live
+  # watcher, or the normal between-cycle gap still inside the beacon grace. End
+  # the episode so a later genuine lapse re-prints the full banner.
   [ "$READ_ONLY" -eq 1 ] || fm_guard_clear_stale_banner
 fi
 

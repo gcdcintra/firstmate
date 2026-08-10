@@ -78,36 +78,130 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+# Why the last watcher-liveness check said no. Both are reset at the top of every
+# fm_watcher_healthy / fm_watcher_lock_matches_pid call and stay empty on success;
+# on failure the REASON holds exactly one token naming the condition that actually
+# failed, and the DETAIL holds that condition's subject (a pid, a recorded path).
+# Callers that report a watcher lapse must name this condition rather than the
+# first plausible-looking symptom: the beacon can be perfectly fresh while the
+# lock is absent, and the lock can be perfectly valid while the holder has wedged.
+FM_WATCHER_UNHEALTHY_REASON=
+FM_WATCHER_UNHEALTHY_DETAIL=
+fm_watcher_set_unhealthy() {
+  # shellcheck disable=SC2034 # Read by callers after the predicate returns.
+  FM_WATCHER_UNHEALTHY_REASON=$1
+  # shellcheck disable=SC2034 # Read by callers after the predicate returns.
+  FM_WATCHER_UNHEALTHY_DETAIL=${2:-}
+}
+
+# fm_watcher_unhealthy_description <reason> [detail]
+# One human sentence for a FM_WATCHER_UNHEALTHY_REASON token, kept beside the
+# predicate that produces those tokens so the two can never drift. An unknown
+# token still renders as itself, so a reason added to the predicate later is
+# reported honestly instead of being silently mistranslated into another
+# condition's wording.
+fm_watcher_unhealthy_description() {
+  local reason=${1:-} detail=${2:-}
+  case "$reason" in
+    '')
+      printf 'the watcher passed every liveness check'
+      ;;
+    lock-absent)
+      printf "no watcher process holds this home's watcher lock (state/.watch.lock is absent)"
+      ;;
+    lock-owner-missing)
+      printf "this home's watcher lock is dangling: its owner record (%s) is gone" "${detail:-unknown}"
+      ;;
+    lock-pid-unreadable)
+      printf "this home's watcher lock records no usable owner pid"
+      ;;
+    lock-pid-dead)
+      printf "this home's watcher lock names pid %s, which is no longer running" "${detail:-unknown}"
+      ;;
+    lock-foreign-home)
+      printf "this home's watcher lock belongs to another firstmate home (%s)" "${detail:-unknown}"
+      ;;
+    lock-foreign-watcher)
+      printf "this home's watcher lock names a different watcher program (%s)" "${detail:-unknown}"
+      ;;
+    lock-identity-missing)
+      printf "this home's watcher lock records no process identity for pid %s" "${detail:-unknown}"
+      ;;
+    lock-identity-unreadable)
+      printf "this home's watcher lock names pid %s, whose process identity could not be read" "${detail:-unknown}"
+      ;;
+    lock-identity-mismatch)
+      printf "this home's watcher lock names pid %s, but that pid is now a different process" "${detail:-unknown}"
+      ;;
+    beacon-missing)
+      printf "the watcher holding this home's lock (pid %s) has never recorded a beat" "${detail:-unknown}"
+      ;;
+    beacon-stale)
+      printf "the watcher holding this home's lock (pid %s) is running but has stopped beating" "${detail:-unknown}"
+      ;;
+    *)
+      printf 'watcher liveness check failed (%s)' "$reason"
+      ;;
+  esac
+}
+
 FM_WATCHER_MATCHED_IDENTITY=
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   FM_WATCHER_MATCHED_IDENTITY=
+  fm_watcher_set_unhealthy '' ''
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$home" ] || return 1
-  [ "$lock_path" = "$watch_path" ] || return 1
-  [ -n "$lock_identity" ] || return 1
-  current_identity=$(fm_pid_identity "$pid") || return 1
-  [ "$current_identity" = "$lock_identity" ] || return 1
+  [ "$lock_home" = "$home" ] || { fm_watcher_set_unhealthy lock-foreign-home "$lock_home"; return 1; }
+  [ "$lock_path" = "$watch_path" ] || { fm_watcher_set_unhealthy lock-foreign-watcher "$lock_path"; return 1; }
+  [ -n "$lock_identity" ] || { fm_watcher_set_unhealthy lock-identity-missing "$pid"; return 1; }
+  current_identity=$(fm_pid_identity "$pid") || { fm_watcher_set_unhealthy lock-identity-unreadable "$pid"; return 1; }
+  [ "$current_identity" = "$lock_identity" ] || { fm_watcher_set_unhealthy lock-identity-mismatch "$pid"; return 1; }
   FM_WATCHER_MATCHED_IDENTITY=$lock_identity
 }
 
+# THE strict "a watcher is supervising this home right now" predicate: the lock
+# must name a live process that is provably this home's watcher, and that holder
+# must have beaten within the grace window. Every arming and turn-end-blocking
+# caller depends on this strictness - a fresh beacon alone must never satisfy it,
+# because a beacon outlives the process that wrote it. Callers that only WARN a
+# human should pair this with the beacon-grace predicate in
+# bin/fm-supervision-lib.sh; see bin/fm-guard.sh for why.
 FM_WATCHER_HEALTHY_PID=
 FM_WATCHER_HEALTHY_IDENTITY=
 fm_watcher_healthy() {
   local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid identity age
   FM_WATCHER_HEALTHY_PID=
   FM_WATCHER_HEALTHY_IDENTITY=
+  fm_watcher_set_unhealthy '' ''
   lockdir="$state/.watch.lock"
   beat="$state/.last-watcher-beat"
+  if [ ! -e "$lockdir" ]; then
+    if [ -L "$lockdir" ]; then
+      fm_watcher_set_unhealthy lock-owner-missing "$(readlink "$lockdir" 2>/dev/null || true)"
+    else
+      fm_watcher_set_unhealthy lock-absent
+    fi
+    return 1
+  fi
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  fm_pid_alive "$pid" || return 1
+  case "$pid" in
+    ''|*[!0-9]*) fm_watcher_set_unhealthy lock-pid-unreadable "$pid"; return 1 ;;
+  esac
+  fm_pid_alive "$pid" || { fm_watcher_set_unhealthy lock-pid-dead "$pid"; return 1; }
   fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
   identity=$FM_WATCHER_MATCHED_IDENTITY
   age=$(fm_path_age "$beat")
-  [ "$age" -lt "$grace" ] || return 1
+  if [ "$age" -ge "$grace" ]; then
+    if [ -e "$beat" ]; then
+      fm_watcher_set_unhealthy beacon-stale "$pid"
+    else
+      fm_watcher_set_unhealthy beacon-missing "$pid"
+    fi
+    return 1
+  fi
   # shellcheck disable=SC2034 # Read by callers after fm_watcher_healthy returns.
   FM_WATCHER_HEALTHY_PID=$pid
   # shellcheck disable=SC2034 # Read by callers after fm_watcher_healthy returns.

@@ -6,10 +6,17 @@
 # work (a state/<id>.meta exists) or an X-mode relay poll
 # (state/x-watch.check.sh), and whether its watcher has a fresh liveness beacon
 # (state/.last-watcher-beat, touched every poll cycle, within the grace window).
-# bin/fm-guard.sh and bin/fm-turnend-guard.sh use fm_watcher_healthy from
-# bin/fm-wake-lib.sh for their warning and block decisions, so a fresh leftover
-# beacon never counts as a live watcher. The status fields here retain the
-# beacon-age details used in their messages.
+# Two predicates, deliberately different, and callers must pick by consequence.
+# fm_watcher_healthy (bin/fm-wake-lib.sh) is the strict one: it requires a live
+# identity-matched lock holder, so a leftover beacon never satisfies it. Every
+# caller whose decision RESTORES supervision - arming, attaching, blocking a turn
+# end - must use it, or it will decline to act while nothing is watching.
+# fm_supervision_unhealthy below is the grace-based one, for callers that only
+# WARN a human: a watcher releases its lock every time it exits on a wake, so the
+# strict predicate is false throughout the ordinary gap between cycles and a
+# warning gated on it becomes constant noise. bin/fm-guard.sh's header owns the
+# full argument. The status fields here carry the beacon-age details both use in
+# their messages.
 
 # Portable mtime; Linux stat lacks -f, macOS stat lacks -c.
 fm_sup_stat_mtime() {

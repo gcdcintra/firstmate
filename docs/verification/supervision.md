@@ -209,6 +209,64 @@ fm-doc-audience-check: ok surfaces=61 local_links=176
 FM_TEST_SUMMARY total=2 failed=0 skipped_gate=0 duration_ms=152927
 ```
 
+The pull guard's false `WATCHER DOWN` alarm through the normal between-cycle gap, and its silence after the fix, were observed live on 2026-08-10 against the running primary home under real fleet load, read-only, with the home's own watcher never stopped or disturbed.
+The gap was sampled until `state/.watch.lock` was absent while `state/.last-watcher-beat` was still inside the grace window, then both guards were run back to back over that same live state.
+
+```sh
+FM_GUARD_READ_ONLY=1 bin/fm-guard.sh
+FM_ROOT_OVERRIDE=<live home> FM_GUARD_READ_ONLY=1 <changed checkout>/bin/fm-guard.sh
+```
+
+Observed output:
+
+```text
+sampled gap: state/.watch.lock absent, state/.last-watcher-beat 24s old, grace 300s, 6 in-flight tasks
+
+before the change:
+● WATCHER DOWN - SUPERVISION IS OFF
+● 6 task(s) in flight, but no watcher has a fresh beacon (last beat: 24s ago, grace 300s).
+WARNING: queued wakes pending - left untouched because this session lacks verified fleet-lock ownership.
+
+after the change:
+WARNING: queued wakes pending - left untouched because this session lacks verified fleet-lock ownership.
+```
+
+Both directions were exercised end to end on 2026-08-10 in a throwaway `FM_HOME` against a genuinely armed `bin/fm-watch.sh` watcher, stopped only by its exact pid, across five scenarios covering silence and alarm.
+`FM_GUARD_GRACE` was forced to 1 second in scenarios 3 and 5 to age the beacon deterministically instead of waiting out a real stall.
+A scenario recorded as silent means the guard printed nothing at all.
+
+```sh
+FM_HOME=<throwaway home> bin/fm-watch.sh &
+FM_ROOT_OVERRIDE=<throwaway root> FM_HOME=<throwaway home> FM_GUARD_GRACE=<300|1> bin/fm-guard.sh
+```
+
+Observed output:
+
+```text
+1. no watcher ever armed, beacon absent, grace 300:
+● WATCHER DOWN - SUPERVISION IS OFF
+● 1 task(s) in flight, but no live watcher is supervising them (last beat: never, grace 300s).
+● Failing condition: no watcher process holds this home's watcher lock (state/.watch.lock is absent).
+
+2. live armed watcher pid 2315281 holding the lock, beacon fresh, grace 300: silent
+
+3. same live watcher pid 2315281 still holding the lock, grace 1:
+● WATCHER DOWN - SUPERVISION IS OFF
+● 1 task(s) in flight, but no live watcher is supervising them (last beat: 3s ago, grace 1s).
+● Failing condition: the watcher holding this home's lock (pid 2315281) is running but has stopped beating.
+
+4. that watcher stopped by exact pid so its own exit released the lock, beacon still fresh, grace 300: silent
+
+5. same stopped watcher, beacon now past grace, grace 1:
+● WATCHER DOWN - SUPERVISION IS OFF
+● 1 task(s) in flight, but no live watcher is supervising them (last beat: 17s ago, grace 1s).
+● Failing condition: no watcher process holds this home's watcher lock (state/.watch.lock is absent).
+```
+
+Proven live against a real watcher process: the between-cycle gap staying silent (observed both on the primary home under real fleet load and in the throwaway home after a real watcher exit), a verified live holder with a fresh beacon staying silent, a live lock holder that has stopped beating alarming and naming that holder, and an absent lock past grace alarming and naming the absent lock.
+Resting on `tests/fm-guard-stale-banner.test.sh` alone: a lock naming a dead pid alarming and naming that pid, which a real watcher cannot leave behind because its exit releases the lock, so it is only reachable through a recorded lock fixture.
+Exercised by no scenario and no test in this change: the `lock-owner-missing`, `lock-pid-unreadable`, `lock-foreign-home`, `lock-foreign-watcher`, `lock-identity-missing`, `lock-identity-unreadable`, `lock-identity-mismatch` and `beacon-missing` description branches of `fm_watcher_unhealthy_description`; the underlying predicate rejections for those conditions remain covered by the existing turn-end guard suite, but their rendered banner wording is not.
+
 ## Watcher continuity
 
 The cross-harness evidence combines the 2026-07-17 live pass with Claude's replacement Stop-owned path revalidated on 2026-07-24, all against isolated project and home state.
