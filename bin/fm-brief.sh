@@ -34,6 +34,10 @@
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                captain approves, firstmate merges to local main
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
+# Every crewmate scaffold (ship and scout) carries the shared-machine namespace
+# rules on rule 2: a worktree isolates files only, while the process table, /tmp,
+# and X display numbers stay machine-wide. The process rule states its own reason
+# inline because a worker cannot otherwise know its brief is in its argv.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
@@ -247,6 +251,33 @@ EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
 fi
 
+# Shared-machine namespace rules, appended to rule 2 of every crewmate scaffold
+# (ship and scout) so both halves of the lesson can never drift apart. A worktree
+# isolates files; the process table, /tmp, and X display numbers are machine-wide.
+# The argv reason is stated inline because it is not guessable: fm-spawn passes the
+# brief as the launch command's positional prompt, so a worker's own brief text is
+# in its argv for the whole task and any word in it matches every sibling agent.
+# Quoted heredoc: the backticks and prose must reach the brief verbatim.
+IFS= read -r -d '' SHARED_MACHINE <<'EOF' || true
+   This worktree isolates FILES ONLY. The process table, `/tmp`, and X display numbers
+   are shared with every other worker on this machine:
+   - Processes: never pattern-match them. No `pkill -f`, and no `pgrep -f` on a binary,
+     app, or test-runner name. Agent briefs are passed on the command line, so every
+     worker's brief - including this one - sits in a process's argv for its whole task.
+     A `pgrep -f ctest` wait loop therefore matches every agent whose brief merely
+     mentions ctest and can never exit, and `pkill -f <app>` kills a sibling's running
+     app. Kill and wait by exact pid, or scope the pattern to this worktree's absolute path.
+   - Temp files: `/tmp` is shared, so a fixed-name path there collides with a sibling. Your task
+     owns `/tmp/fm-<task-id>`, whose `gotmp` subdirectory is already exported as `GOTMPDIR`.
+     Export `TMPDIR` under that task root before any build or test run.
+     Do not put `TMPDIR` inside this worktree - repo tooling scans the worktree and would pick
+     up the scratch files.
+   - X displays: never hand-pick a display number - a sibling may already be driving it, and
+     coordinate-based clicks would land in its windows. Let the server allocate one
+     (`xvfb-run -a`, or `Xvfb -displayfd`), and never reuse a number you did not allocate.
+EOF
+SHARED_MACHINE=${SHARED_MACHINE%$'\n'}
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -265,6 +296,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Rules
 1. Never push to any remote and never open a PR.
 2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
+$SHARED_MACHINE
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -377,6 +409,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 # Rules
 $RULE1
 2. Stay inside this worktree; modify nothing outside it.
+$SHARED_MACHINE
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
