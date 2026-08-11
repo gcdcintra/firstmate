@@ -25,6 +25,9 @@
 #       This is the direct regression pair for the 2026-07-02 herdr incident,
 #       proving the watcher's own absorb-only-when-provably-working predicate
 #       benefits from the fix in both directions.
+#   (l) head binding when a run's own head lives only inside the local gate: the
+#       submitted head binds the live run, an older superseded run never wins,
+#       and a branch rewritten under an abandoned run still binds nothing.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -289,6 +292,63 @@ run:
   findings: none
 outcome: failed
 EOF
+}
+
+# A run the daemon has accepted but that has not produced a step result yet.
+run_no_step_yet() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: running
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+  steps[3]{step,status,findings,duration_ms}:
+    intent,pending,0,0
+    rebase,pending,0,0
+    review,pending,0,0
+EOF
+}
+
+# The branch_sync block `no-mistakes axi status` appends when it is queried from
+# the run's own worktree, reproduced field-for-field from a real live run
+# (v1.46.0, 2026-08-11). `submitted_head` is the commit the worktree handed the
+# pipeline; `current_head` is where the run sits now, which for an in-flight run
+# is a commit that exists only inside the local gate repo.
+branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state>
+  cat <<EOF
+branch_sync:
+  state: $5
+  changed: false
+  local:
+    branch: $1
+    head: $2
+    clean: true
+  pipeline:
+    run: "01RUN"
+    status: running
+    phase: pre_push
+    submitted_head: $3
+    current_head: $4
+    pushed_head: ""
+    pushed_at: 0
+    push_generation: 0
+  relation: unknown
+  safety: blocked_pipeline_owned
+EOF
+}
+
+# A commit id that is valid and real but lives in another repository, exactly
+# like a pipeline commit the local gate holds and the crew worktree cannot see.
+gate_only_head() {  # <case-dir> -> echoes a sha absent from the crew worktree
+  local gate="$1/gate-repo"
+  if [ ! -d "$gate" ]; then
+    mkdir -p "$gate"
+    git -C "$gate" init -q
+    git -C "$gate" commit -q --allow-empty -m 'pipeline fix commit inside the gate'
+  fi
+  git -C "$gate" rev-parse HEAD
 }
 
 run_ci_monitoring() {  # <branch>
@@ -1309,6 +1369,156 @@ test_missing_run_head_falls_back_to_current_state() {
   pass "missing run head falls back instead of matching by branch"
 }
 
+# --- superseded-run binding -------------------------------------------------
+# Direct regression for the 2026-08-03 incident: a crew actively applying a
+# review fix round was reported `failed`. Its live run had advanced its own head
+# inside the local gate, so the run head bound nothing here, and attribution
+# fell through to the coarse runs list, where an OLDER failed run still sitting
+# on the worktree sha won. The head the worktree submitted binds the live run.
+test_live_run_binds_by_submitted_head_over_superseded_row() {
+  reset_fakes
+  local d wt_head gate_head out
+  d=$(new_case live-submitted-head)
+  make_repo_on_branch "$d/wt" fm/feat-live
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/live.meta" "window=fm:fm-live" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: implementation committed, validating\n' > "$d/state/live.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-live
+    branch_sync_block fm/feat-live "$wt_head" "$wt_head" "$gate_head" pipeline_owned)"
+  FM_FAKE_RUNS_LIST="  running      fm/feat-live      ${gate_head:0:8}  2026-08-03 02:22
+  failed       fm/feat-live      ${wt_head:0:8}  2026-08-03 01:03"
+  out=$(run_crew_state "$d" live)
+  assert_contains "$out" "state: working" "live run with a gate-only head is working"
+  assert_contains "$out" "source: run-step" "live run verdict comes from the run step"
+  assert_contains "$out" "validating (running)" "live run detail names the live run"
+  assert_not_contains "$out" "state: failed" "superseded older run must not win"
+  assert_not_contains "$out" "background run" "live run binds before the coarse list is consulted"
+  pass "submitted head binds the live run over a superseded failed run"
+}
+
+# The same binding must never turn optimistic: when the newest run is the one
+# that failed, it stays failed.
+test_newest_run_failed_still_reports_failed() {
+  reset_fakes
+  local d wt_head gate_head out
+  d=$(new_case newest-failed)
+  make_repo_on_branch "$d/wt" fm/feat-newfail
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/newfail.meta" "window=fm:fm-newfail" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validating\n' > "$d/state/newfail.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-newfail
+    branch_sync_block fm/feat-newfail "$wt_head" "$wt_head" "$gate_head" user_owned)"
+  FM_FAKE_RUNS_LIST="  failed       fm/feat-newfail      ${gate_head:0:8}  2026-08-03 02:22"
+  out=$(run_crew_state "$d" newfail)
+  assert_contains "$out" "state: failed" "a failed newest run still reports failed"
+  assert_contains "$out" "source: run-step" "failed verdict comes from the run step"
+  assert_contains "$out" "run failed" "failed detail names the failure"
+  assert_not_contains "$out" "state: working" "submitted-head binding must not hide a real failure"
+  pass "newest run failed still reports failed"
+}
+
+# Both runs terminal: the newest one decides, so an older failed run no longer
+# outranks a newer run that finished green.
+test_both_terminal_newest_passed_outranks_older_failed_row() {
+  reset_fakes
+  local d wt_head gate_head out
+  d=$(new_case both-terminal)
+  make_repo_on_branch "$d/wt" fm/feat-both
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/both.meta" "window=fm:fm-both" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validating\n' > "$d/state/both.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-both
+    branch_sync_block fm/feat-both "$wt_head" "$wt_head" "$gate_head" user_owned)"
+  FM_FAKE_RUNS_LIST="  completed    fm/feat-both      ${gate_head:0:8}  2026-08-03 02:22
+  failed       fm/feat-both      ${wt_head:0:8}  2026-08-03 01:03"
+  out=$(run_crew_state "$d" both)
+  assert_contains "$out" "state: done" "newest terminal run decides"
+  assert_contains "$out" "source: run-step" "terminal verdict comes from the run step"
+  assert_not_contains "$out" "state: failed" "older failed run must not outrank the newer one"
+  pass "newest terminal run outranks an older failed run on the worktree sha"
+}
+
+# A newer run that has not produced a step yet has not moved its head either, so
+# it binds on that head exactly as before and reads as working.
+test_new_run_before_first_step_binds_by_head() {
+  reset_fakes
+  local d wt_head out
+  d=$(new_case no-step-yet)
+  make_repo_on_branch "$d/wt" fm/feat-nostep
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/nostep.meta" "window=fm:fm-nostep" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validation started\n' > "$d/state/nostep.status"
+  FM_FAKE_RUN_HEAD="$wt_head"
+  FM_FAKE_AXI_STATUS="$(run_no_step_yet fm/feat-nostep
+    branch_sync_block fm/feat-nostep "$wt_head" "$wt_head" "$wt_head" pipeline_owned)"
+  out=$(run_crew_state "$d" nostep)
+  assert_contains "$out" "state: working" "a run with no step yet is working"
+  assert_contains "$out" "source: run-step" "no-step-yet verdict comes from the run step"
+  pass "newer run with no step yet binds by head"
+}
+
+# The guard that keeps submitted-head binding exact rather than optimistic: a
+# crew that rewrote its branch under an abandoned still-active run submitted
+# neither head, so nothing binds and its own blocked report stays current.
+test_abandoned_active_run_after_local_rewrite_not_attributed() {
+  reset_fakes
+  local d old_head out
+  d=$(new_case abandoned-active)
+  make_repo_on_branch "$d/wt" fm/feat-abandoned
+  old_head=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" checkout -q --orphan tmp-rewrite
+  git -C "$d/wt" commit -q --allow-empty -m 'rewritten tip'
+  git -C "$d/wt" branch -q -M fm/feat-abandoned
+  [ "$old_head" != "$(git -C "$d/wt" rev-parse HEAD)" ] || fail "rewrite did not produce a new head"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/abandoned.meta" "window=fm:fm-abandoned" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: cannot reach the package registry\n' > "$d/state/abandoned.status"
+  FM_FAKE_RUN_HEAD="$old_head"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-abandoned
+    branch_sync_block fm/feat-abandoned "$old_head" "$old_head" "$old_head" pipeline_owned)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" abandoned
+  out=$(run_crew_state "$d" abandoned)
+  assert_not_contains "$out" "source: run-step" "an abandoned run under a rewritten branch binds nothing"
+  assert_not_contains "$out" "state: working" "an abandoned run must not read as a healthy pipeline"
+  assert_contains "$out" "state: blocked" "the crew's own blocked report stays current"
+  pass "abandoned active run under a rewritten branch is not attributed"
+}
+
+# The deliberate single-run delta: a lone live run whose head lives only in the
+# gate used to bind nothing and fall through to the pane. It is the same window
+# the incident happened in, so it now reports the run step it was hiding.
+test_single_live_run_with_gate_only_head_binds() {
+  reset_fakes
+  local d wt_head gate_head out
+  d=$(new_case single-live-run)
+  make_repo_on_branch "$d/wt" fm/feat-single
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/single.meta" "window=fm:fm-single" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validating\n' > "$d/state/single.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_fixing fm/feat-single
+    branch_sync_block fm/feat-single "$wt_head" "$wt_head" "$gate_head" pipeline_owned)"
+  FM_FAKE_RUNS_LIST="  running      fm/feat-single      ${gate_head:0:8}  2026-08-03 02:22"
+  out=$(run_crew_state "$d" single)
+  assert_contains "$out" "state: working" "a lone live run reads as working"
+  assert_contains "$out" "source: run-step" "a lone live run is attributed to its run step"
+  assert_contains "$out" "validating (fixing)" "detail names the live fix round"
+  pass "single live run with a gate-only head binds by submitted head"
+}
+
 test_active_run_is_authoritative
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
@@ -1358,5 +1568,11 @@ test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
+test_live_run_binds_by_submitted_head_over_superseded_row
+test_newest_run_failed_still_reports_failed
+test_both_terminal_newest_passed_outranks_older_failed_row
+test_new_run_before_first_step_binds_by_head
+test_abandoned_active_run_after_local_rewrite_not_attributed
+test_single_live_run_with_gate_only_head_binds
 
 echo "all fm-crew-state tests passed"
