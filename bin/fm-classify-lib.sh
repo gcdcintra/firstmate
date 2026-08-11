@@ -152,13 +152,28 @@ status_is_paused_or_captain_held() {  # <status-line>
 # terminal line never clears an open captain decision.
 #
 # Decision key grammar (backward-compatible with the existing "<verb>: <note>"
-# format): an OPTIONAL "[key=<slug>]" token sits between the verb and the colon,
+# format): an OPTIONAL "[key=<slug>]" token names the decision or phase a line
+# belongs to. It is read in EITHER of two positions - between the verb and the
+# colon, or immediately after the colon at the very start of the note:
 #   needs-decision [key=api-shape]: <summary>
-#   resolved       [key=api-shape]: <how it was decided>
+#   resolved: [key=api-shape] <how it was decided>
+# The first form is canonical and wins when a line carries a token in both
+# positions. The second is accepted because generated briefs described the token
+# in prose without placing it, so workers reliably wrote it after the colon and
+# every key on such a task silently collapsed into "default"; a parser that reads
+# what workers actually write also repairs the briefs already in flight, which a
+# brief-side fix alone cannot reach.
+# To count, the post-colon token must be the FIRST thing in the note, so a key
+# mentioned later in prose stays prose and never re-keys or closes a decision.
 # A line with no token uses the key "default", preserving the historical
 # one-open-decision-per-task behavior (a bare "resolved:" closes "default").
-# The three parsers are pure reads of a single line; the verb parser strips any
-# key token before the colon so the leading word is recovered cleanly.
+# A present-but-malformed token (empty, or outside [A-Za-z0-9._-]) is REJECTED in
+# either position: the key parser fails and the fold skips the line rather than
+# silently folding it into "default".
+# The three parsers are pure reads of a single line: the verb parser strips any
+# key token before the colon so the leading word is recovered cleanly, and the
+# note parser strips a recognized token after the colon so both positions yield
+# the same verb, key, and note.
 status_line_verb() {  # <status-line> -> leading verb word
   local v=${1%%:*}
   v=${v%%\[key=*}
@@ -166,23 +181,59 @@ status_line_verb() {  # <status-line> -> leading verb word
   v=${v%"${v##*[![:space:]]}"}
   printf '%s' "$v"
 }
-status_line_note() {  # <status-line> -> text after the first colon, trimmed
-  case "$1" in
-    *:*) local n=${1#*:}; printf '%s' "${n#"${n%%[![:space:]]*}"}" ;;
-    *) printf '%s' "$1" ;;
+# Single owner of the post-colon token: prints "<slug><TAB><note without the
+# token>" for a note that STARTS with one. Exit 1 means no leading token at all
+# (the caller falls back to "default" prose handling), exit 2 means a leading
+# token that is present but malformed. The key parser and the note parser both
+# read that position through this helper so neither can drift from the other.
+_fm_note_key_split() {  # <note-text> -> "<slug><TAB><rest>"; 1 = none, 2 = malformed
+  local rest=$1 k
+  case "$rest" in
+    \[key=*\]*) : ;;
+    *) return 1 ;;
   esac
+  rest=${rest#\[key=}
+  k=${rest%%\]*}
+  rest=${rest#*\]}
+  case "$k" in
+    ''|*[!A-Za-z0-9._-]*) return 2 ;;
+  esac
+  printf '%s\t%s' "$k" "${rest#"${rest%%[![:space:]]*}"}"
+}
+status_line_note() {  # <status-line> -> text after the first colon, trimmed
+  local n split
+  case "$1" in
+    *:*) n=${1#*:} ;;
+    *) printf '%s' "$1"; return 0 ;;
+  esac
+  n=${n#"${n%%[![:space:]]*}"}
+  if split=$(_fm_note_key_split "$n"); then
+    printf '%s' "${split#*$'\t'}"
+    return 0
+  fi
+  printf '%s' "$n"
 }
 _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
-  local prefix=${1%%:*} k
+  local prefix=${1%%:*} k n split rc
   case "$prefix" in
     *\[key=*\]*)
       k=${prefix#*\[key=}
       k=${k%%\]*}
       case "$k" in
         ''|*[!A-Za-z0-9._-]*) return 1 ;;
-        *) printf '%s' "$k" ;;
+        *) printf '%s' "$k"; return 0 ;;
       esac
       ;;
+  esac
+  case "$1" in
+    *:*) n=${1#*:} ;;
+    *) printf 'default'; return 0 ;;
+  esac
+  n=${n#"${n%%[![:space:]]*}"}
+  split=$(_fm_note_key_split "$n"); rc=$?
+  case "$rc" in
+    0) printf '%s' "${split%%$'\t'*}" ;;
+    2) return 1 ;;
     *) printf 'default' ;;
   esac
 }
