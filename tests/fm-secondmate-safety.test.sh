@@ -316,8 +316,10 @@ test_home_seed_returns_treehouse_acquired_home_on_assignment_failure() {
     fail "seed reused an acquired home marked for another secondmate"
   fi
   grep -F 'already marked for other' "$err" >/dev/null || fail "seed did not explain acquired marked-home rejection"
-  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
-    || fail "failed acquired seed did not return the home through treehouse"
+  # Guarded by the lease this seed took, so a rollback can never release a slot
+  # that now belongs to someone else (treehouse checks it atomically).
+  grep -F "treehouse return --force --if-lease-holder dash $acquired_abs" "$log" >/dev/null \
+    || fail "failed acquired seed did not return the home through treehouse under its own lease holder"
   if [ -f "$home/data/secondmates.md" ] && grep -F -- '- dash ' "$home/data/secondmates.md" >/dev/null; then
     fail "failed acquired seed left a registry route"
   fi
@@ -350,8 +352,8 @@ test_home_seed_warns_when_acquired_home_return_fails() {
   grep -F "warning: failed to return treehouse-acquired home $acquired_abs during seed rollback" "$err" >/dev/null \
     || fail "seed rollback did not warn when treehouse return failed"
   [ -f "$lease" ] || fail "failed rollback return did not preserve lease evidence"
-  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
-    || fail "failed rollback did not attempt to return the acquired home"
+  grep -F "treehouse return --force --if-lease-holder dash $acquired_abs" "$log" >/dev/null \
+    || fail "failed rollback did not attempt to return the acquired home under its own lease holder"
   pass "home seed rollback warns when treehouse-acquired return fails"
 }
 
@@ -1488,7 +1490,7 @@ EOF
     FM_FAKE_TREEHOUSE_LEASE_FILE="$lease" \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>/dev/null \
     || fail "teardown failed for empty secondmate home"
-  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null || fail "teardown did not release the secondmate home lease via treehouse return"
+  grep -F "treehouse return --force --if-lease-holder domain $subhome_abs" "$log" >/dev/null || fail "teardown did not release the secondmate home lease under its own lease holder"
   [ ! -e "$lease" ] || fail "teardown left the secondmate home lease held after retirement"
   [ ! -d "$subhome" ] || fail "teardown did not remove the retired secondmate home"
   [ ! -e "$home/state/domain.meta" ] || fail "teardown did not clear parent meta"
@@ -1769,7 +1771,7 @@ EOF
   set -e
 
   [ "$rc" -ne 0 ] || fail "teardown succeeded despite failed treehouse return"
-  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null || fail "teardown did not try to return the leased home"
+  grep -F "treehouse return --force --if-lease-holder domain $subhome_abs" "$log" >/dev/null || fail "teardown did not try to return the leased home under its own lease holder"
   grep -F 'treehouse return failed for secondmate home' "$err" >/dev/null || fail "teardown did not report failed leased home return"
   [ -d "$subhome" ] || fail "teardown removed a leased home after return failed"
   [ -e "$subhome/state/procevent/source.source" ] || fail "failed leased-home return did not restore the source registration"
@@ -1820,7 +1822,7 @@ EOF
     FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>/dev/null \
     || fail "teardown failed for plain-clone secondmate home"
-  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null && fail "teardown tried to return a plain-clone home through treehouse"
+  grep -F "treehouse return" "$log" | grep -F "$subhome_abs" >/dev/null && fail "teardown tried to return a plain-clone home through treehouse"
   [ ! -d "$subhome" ] || fail "teardown did not remove the plain-clone secondmate home"
   [ ! -e "$home/state/domain.meta" ] || fail "teardown did not clear parent meta for plain-clone home"
   grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null && fail "teardown did not remove plain-clone registry route"
@@ -2424,6 +2426,68 @@ EOF
   pass "force teardown refuses unregistered child worktree paths"
 }
 
+# A secondmate's child worktrees come from the same pool as any other task's and
+# go stale the same way. Forced retirement discards THAT secondmate's work; it
+# must never remove a pooled worktree the pool has since handed to another task.
+test_secondmate_force_teardown_refuses_reassigned_child_worktree() {
+  local home subhome childproj childwt fakebin err log
+  home="$TMP_ROOT/reassigned-child-home"
+  subhome="$TMP_ROOT/reassigned-child-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/reassigned-child-worktree"
+  err="$TMP_ROOT/reassigned-child.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$subhome/projects"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  # A genuine, registered worktree of the child project, so the ONLY thing wrong
+  # is who owns it now.
+  fm_git_init_commit "$childproj"
+  git -C "$childproj" worktree add --quiet -b fm/child "$childwt"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+worktree_owner=cccccccccccccccccccccccccccccccc
+EOF
+  # The pool reassigned that path: it now carries a different task's record.
+  printf 'token=dddddddddddddddddddddddddddddddd\ntask=other-task\nhome=/elsewhere\n' \
+    > "$childwt/.fm-worktree-owner"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/reassigned-child-fake")
+  log="$TMP_ROOT/reassigned-child-fake/tmux.log"
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/reassigned-child-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
+    fail "force teardown removed a child worktree another task now holds"
+  fi
+  [ -d "$childwt" ] || fail "force teardown removed the reassigned child worktree"
+  grep -F 'task=other-task' "$childwt/.fm-worktree-owner" >/dev/null \
+    || fail "force teardown disturbed the new holder's ownership record"
+  [ -d "$subhome" ] || fail "force teardown removed subhome after reassigned child refusal"
+  [ -e "$home/state/domain.meta" ] || fail "force teardown cleared parent meta after reassigned child refusal"
+  [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta after reassigned child refusal"
+  grep -F 'kill-window' "$log" >/dev/null && fail "force teardown killed windows before reassigned child refusal"
+  grep -F 'no longer provably held by child' "$err" >/dev/null \
+    || fail "force teardown did not explain the reassigned child rejection: $(cat "$err")"
+  grep -F 'held by task other-task' "$err" >/dev/null \
+    || fail "force teardown did not name the task now holding the child worktree"
+  pass "force teardown refuses a child worktree the pool has reassigned to another task"
+}
+
 test_secondmate_idle_pane_is_not_stale() {
   local home fakebin out pid window
   home="$TMP_ROOT/watch-home"
@@ -2664,6 +2728,7 @@ test_secondmate_force_teardown_prevalidates_before_child_cleanup
 test_secondmate_force_teardown_refuses_child_active_home_descendant
 test_secondmate_force_teardown_refuses_child_repo_descendant
 test_secondmate_force_teardown_refuses_unregistered_child_worktree
+test_secondmate_force_teardown_refuses_reassigned_child_worktree
 test_secondmate_teardown_path_boundary_matrix
 test_secondmate_idle_pane_is_not_stale
 test_secondmate_charter_brief_is_idle_by_default
