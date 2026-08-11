@@ -432,7 +432,8 @@ nm_run_head_matches_worktree() {
 
 # Coarse runs-list rows are "<status> <branch> <short-sha> ...". That row carries
 # only the run's current head - the runs list exposes no submitted head - so a
-# coarse row binds on that one sha alone.
+# coarse row binds on that one sha alone. Teaching this walk about submitted
+# heads is tracked as backlog item fm-crewstate-coarse-walk.
 nm_coarse_head_matches_worktree() {  # <short-sha>
   nm_commit_binds_worktree "${1:-}"
 }
