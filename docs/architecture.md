@@ -138,6 +138,7 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
 For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
 A pooled worktree is not reserved by the shell or agent inside it, so a task's recorded path can be leased to a newer task once its pane is gone; spawn records ownership of the worktree it took and every destructive consumer re-proves it, with [`bin/fm-worktree-owner-lib.sh`](../bin/fm-worktree-owner-lib.sh) owning that contract and the limits of what it proves.
+A task that predates that record carries no ownership to check and is cleaned up unchecked, so the protection covers tasks from their spawn onward rather than retroactively; respawning such a task records ownership and brings it under the check.
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
 Its operating checkout (`FM_ROOT`) and the disposable crewmate worktrees are all linked git worktrees of the same repository, so the valid discriminator is branch state, not whether the checkout is linked.
