@@ -1346,7 +1346,9 @@ fi
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
 # Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
 # later, and teardown cleans one deterministic path. GOTMPDIR (not TMPDIR) is the
-# targeted knob: TMPDIR is too broad (affects every program's temp, not just Go's).
+# targeted knob for this pane-wide export: forcing TMPDIR would affect every pane
+# process, not just Go builds. The generated brief (fm-brief.sh) instead has the
+# worker export TMPDIR under this root scoped to its own build and test runs.
 TASK_TMP="/tmp/fm-$ID"
 mkdir -p "$TASK_TMP/gotmp"
 

@@ -295,6 +295,94 @@ test_ship_project_memory_wording() {
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
+# A worktree isolates FILES ONLY, so every crewmate scaffold must carry all three
+# shared-machine namespaces: the process table, /tmp, and X display numbers.
+# Dropping any one of them is what produced the observed harms - a `pkill -f` that
+# killed a sibling's app, a self-matching `pgrep -f` wait loop that could never
+# exit, and two workers driving apps by coordinate on one hand-picked display.
+# Each namespace is asserted separately so a future edit cannot quietly drop one,
+# and the argv reason is asserted because a worker cannot otherwise know its own
+# brief is in its argv and therefore matches every pattern drawn from its text.
+assert_shared_machine_rules() {
+  local brief=$1 label=$2
+  assert_grep "This worktree isolates FILES ONLY" "$brief" \
+    "$label: brief lost the files-only isolation statement"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep 'No `pkill -f`, and no `pgrep -f` on a binary' "$brief" \
+    "$label: brief lost the process pattern-matching prohibition"
+  assert_grep "Kill and wait by exact pid" "$brief" \
+    "$label: brief lost the exact-pid alternative to pattern matching"
+  assert_grep "sits in a process's argv for its whole task" "$brief" \
+    "$label: brief lost the argv reason behind the process rule"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep 'Export `TMPDIR` under that task root before' "$brief" \
+    "$label: brief lost the private TMPDIR rule"
+  assert_grep "Do not put \`TMPDIR\` inside this worktree" "$brief" \
+    "$label: brief lost the warning against a worktree-local TMPDIR"
+  assert_grep "never hand-pick a display number" "$brief" \
+    "$label: brief lost the X display allocation rule"
+}
+
+test_shared_machine_namespace_rules() {
+  local home id proj brief
+  home="$TMP_ROOT/shared-machine-home"
+  write_registry "$home"
+
+  for id_proj in "brief-shared-nm-e1:no-registry-proj" "brief-shared-dpr-e2:direct-proj" "brief-shared-lo-e3:local-proj"; do
+    id=${id_proj%%:*}
+    proj=${id_proj##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1 \
+      || fail "$id: ship scaffold exited non-zero"
+    brief="$home/data/$id/brief.md"
+    assert_shared_machine_rules "$brief" "ship $proj"
+  done
+
+  id="brief-shared-scout-e4"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" no-registry-proj --scout >/dev/null 2>&1 \
+    || fail "$id: scout scaffold exited non-zero"
+  assert_shared_machine_rules "$home/data/$id/brief.md" "scout"
+  pass "fm-brief.sh: ship and scout briefs carry all three shared-machine namespace rules"
+}
+
+# The namespace block is interpolated into an unquoted heredoc, where a stray
+# escape or expansion would corrupt the rule the worker reads. It must also not
+# shift the numbered rules: the no-mistakes Definition of done cross-references
+# "rule 6" by number, so an inserted rule would silently misdirect escalation.
+test_shared_machine_rules_render_verbatim_without_renumbering() {
+  local home id brief block
+  home="$TMP_ROOT/shared-machine-render-home"
+  mkdir -p "$home/data"
+  id="brief-shared-render-e5"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1 \
+    || fail "$id: ship scaffold exited non-zero"
+  brief="$home/data/$id/brief.md"
+  block="$TMP_ROOT/shared-machine-block.txt"
+  sed -n '/This worktree isolates FILES ONLY/,/never reuse a number you did not allocate/p' \
+    "$brief" > "$block"
+  [ -s "$block" ] || fail "namespace rules block is missing from the generated brief"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the literal backslash must reach grep
+  assert_no_grep '\`' "$block" \
+    "namespace rules leaked a backslash-escaped backtick into the generated brief"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the literal $ must reach grep unexpanded
+  assert_no_grep '$' "$block" \
+    "namespace rules leaked an unexpanded shell variable into the generated brief"
+  assert_grep "6. If a decision belongs above the implementation worker" "$brief" \
+    "namespace rules renumbered the rule list; the Definition of done cross-references rule 6"
+  assert_grep "escalate to firstmate (rule 6) and stop" "$brief" \
+    "no-mistakes Definition of done lost its rule 6 cross-reference"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '2. Stay inside this worktree; modify nothing outside it except the status file below and your task temp root under `/tmp/fm-<task-id>`.' "$brief" \
+    "ship rule 2 lost the task temp root carve-out and contradicts the TMPDIR rule below it"
+  id="brief-shared-render-scout-e6"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1 \
+    || fail "$id: scout scaffold exited non-zero"
+  brief="$home/data/$id/brief.md"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '2. Stay inside this worktree; the only files you may write outside it are the report, the status file below, and your task temp root under `/tmp/fm-<task-id>`.' "$brief" \
+    "scout rule 2 lost the task temp root carve-out and contradicts the TMPDIR rule below it"
+  pass "fm-brief.sh: namespace rules render verbatim and preserve rule numbering"
+}
+
 test_herdr_lab_contract_is_explicit_and_complete() {
   local home id brief
   home="$TMP_ROOT/herdr-lab-home"
@@ -639,6 +727,8 @@ test_ship_modes_generate_clean_briefs
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
+test_shared_machine_namespace_rules
+test_shared_machine_rules_render_verbatim_without_renumbering
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
