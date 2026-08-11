@@ -370,6 +370,16 @@ test_shared_machine_rules_render_verbatim_without_renumbering() {
     "namespace rules renumbered the rule list; the Definition of done cross-references rule 6"
   assert_grep "escalate to firstmate (rule 6) and stop" "$brief" \
     "no-mistakes Definition of done lost its rule 6 cross-reference"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '2. Stay inside this worktree; modify nothing outside it except the status file below and your task temp root under `/tmp/fm-<task-id>`.' "$brief" \
+    "ship rule 2 lost the task temp root carve-out and contradicts the TMPDIR rule below it"
+  id="brief-shared-render-scout-e6"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1 \
+    || fail "$id: scout scaffold exited non-zero"
+  brief="$home/data/$id/brief.md"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '2. Stay inside this worktree; the only files you may write outside it are the report, the status file below, and your task temp root under `/tmp/fm-<task-id>`.' "$brief" \
+    "scout rule 2 lost the task temp root carve-out and contradicts the TMPDIR rule below it"
   pass "fm-brief.sh: namespace rules render verbatim and preserve rule numbering"
 }
 
