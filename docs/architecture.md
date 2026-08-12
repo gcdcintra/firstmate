@@ -19,8 +19,9 @@ A concurrent replacement remains armed, every non-merged or invalid observation 
 `bin/fm-pr-lib.sh` owns the receipt format and strict identity mechanics, while `bin/fm-watch.sh` owns queue-before-retirement ordering.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crew is still working: an actively running no-mistakes step attributed to that crew's current code, or an exact busy verdict from the semantic busy-state contract.
 A crew that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
-For an ordinary crew that has stopped, the normal-mode watcher first surfaces one stale wake, then applies that same cadence to an unchanged `paused:` or durable `captain-held` endpoint only when the backend confidently reports its agent dead.
-Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.
+For an ordinary crew that has stopped under a declared `paused:` or durable `captain-held` transfer, the normal-mode watcher surfaces one first-sighting stale wake naming the declared wait as its trigger while the endpoint is not confirmed dead, then bounds every later sighting to that same pause cadence for as long as the wait stays declared.
+That first sighting is keyed to the pause cadence marker rather than the pane hash, because an idle harness keeps animating its footer, so a hash identity would re-arm a fresh surface on every monitoring cycle.
+Live or inconclusive liveness remains fail-open at that initial surface, a confirmed-dead endpoint is absorbed straight into the bounded recheck, and the secondmate idle-endpoint exemption is unchanged.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or a proven busy worker outranks an old captain-relevant status-log line left behind before validation.
 No-change heartbeats are also benign.
