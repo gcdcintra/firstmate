@@ -330,7 +330,7 @@ test_fork_source_that_resumed_work_is_refused() {
   # session does not have, which is exactly the 2026-08-02 two-helms shape.
   write_transcript 00000000-0000-4000-9000-000000000003 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 9)"
   write_transcript 00000000-0000-4000-9000-000000000004 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
-  if CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000004 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000004 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
     fail "a fork source that resumed work was still treated as a yieldable source"
   fi
   pass "fork descent: a source that took a turn after the fork is refused"
@@ -345,7 +345,7 @@ test_sibling_fork_is_not_an_ancestor() {
   # so neither extends the other and neither may take the home from the other.
   write_transcript 00000000-0000-4000-9000-000000000005 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 20)"
   write_transcript 00000000-0000-4000-9000-000000000006 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 30)" "$(msg_uuid 31)"
-  if CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000006 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000006 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
     fail "one fork claimed descent from its sibling fork"
   fi
   pass "fork descent: a sibling fork is never an ancestor"
@@ -358,7 +358,7 @@ test_identical_transcript_is_not_an_ancestor() {
   register_session "$owner" 00000000-0000-4000-9000-000000000007
   write_transcript 00000000-0000-4000-9000-000000000007 "$(msg_uuid 1)" "$(msg_uuid 2)"
   write_transcript 00000000-0000-4000-9000-000000000008 "$(msg_uuid 1)" "$(msg_uuid 2)"
-  if CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000008 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000008 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
     fail "a session that merely matches the owner's transcript claimed to extend it"
   fi
   pass "fork descent: matching the source's transcript is not extending it"
@@ -388,7 +388,7 @@ test_recycled_pid_record_is_rejected() {
   register_session "$owner" 00000000-0000-4000-9000-000000000011 1
   write_transcript 00000000-0000-4000-9000-000000000011 "$(msg_uuid 1)" "$(msg_uuid 2)"
   write_transcript 00000000-0000-4000-9000-000000000012 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
-  if CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000012 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000012 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
     fail "a session record whose process start time does not match the live pid was trusted"
   fi
   pass "fork descent: a recorded owner whose process start time no longer matches is rejected"
@@ -400,7 +400,7 @@ test_live_owner_without_a_session_record_is_refused() {
   write_transcript 00000000-0000-4000-9000-000000000013 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
   # Every harness other than Claude Code, and any Claude session the registry
   # does not vouch for, lands here and keeps the unchanged refusal.
-  if CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000013 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000013 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
     fail "an owner with no session record was treated as a fork source"
   fi
   pass "fork descent: a live owner the harness does not vouch for is refused"
@@ -411,7 +411,7 @@ test_missing_own_session_identity_is_refused() {
   spawn_owner_process; owner=$OWNER_PID
   register_session "$owner" 00000000-0000-4000-9000-000000000014
   write_transcript 00000000-0000-4000-9000-000000000014 "$(msg_uuid 1)" "$(msg_uuid 2)"
-  if CLAUDE_CODE_SESSION_ID='' lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID='' lib_run "fm_claude_fork_descendant_of_pid $owner"; then
     fail "a claimant that cannot identify its own session still claimed descent"
   fi
   pass "fork descent: a claimant with no session identity of its own is refused"

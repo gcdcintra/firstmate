@@ -349,7 +349,7 @@ test_inert_when_fork_source_resumed_work() {
   write_claude_transcript "$FORK_SOURCE_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 7)"
   write_claude_transcript "$FORK_CHILD_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
   out=$(printf '%s\n' '{"session_id":"fork"}' \
-    | CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    | CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' 2>&1); status=$?
   owner_after=$(cat "$dir/state/.lock")
