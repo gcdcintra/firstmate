@@ -700,6 +700,40 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+# The generated decision rule must SHOW the keyed form instead of describing it in
+# prose. While the rule only said "add the same [key=<slug>]", workers reliably put
+# the token after the verb colon and every key on the task folded into one slot.
+# Feeding the example the brief actually prints back through the shipped classifier
+# keeps the instruction and the parser from drifting apart.
+test_keyed_decision_example_is_parseable() {
+  local home brief kind id example key
+  home="$TMP_ROOT/keyed-example-home"
+  mkdir -p "$home/data"
+  for kind in ship scout; do
+    id="brief-keyed-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+        "$ROOT/bin/fm-brief.sh" "$id" sample --scout >/dev/null 2>&1 \
+        || fail "$kind scaffold exited non-zero"
+    else
+      FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+        "$ROOT/bin/fm-brief.sh" "$id" sample >/dev/null 2>&1 \
+        || fail "$kind scaffold exited non-zero"
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind brief was not scaffolded"
+    for example in 'needs-decision [key=api-shape]:' 'resolved [key=api-shape]:'; do
+      grep -Fq "$example" "$brief" \
+        || fail "$kind brief does not show \`$example\` by example"
+      key=$(. "$ROOT/bin/fm-classify-lib.sh"; _fm_decision_key "$example") \
+        || fail "$kind brief shows a key example the classifier rejects: $example"
+      [ "$key" = api-shape ] \
+        || fail "$kind brief's key example parses as '$key', not the key it names"
+    done
+  done
+  pass "fm-brief.sh: ship and scout briefs show a keyed decision example the classifier reads"
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -738,4 +772,5 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
+test_keyed_decision_example_is_parseable
 test_scout_and_secondmate_scaffold

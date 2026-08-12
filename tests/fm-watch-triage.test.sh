@@ -224,6 +224,90 @@ EOF
   pass "classifier primitives: keyed decisions and activity phases, captain relevance, window-to-task, and overrides"
 }
 
+# The optional key token is read in BOTH accepted positions. Generated briefs used
+# to describe the token in prose without placing it, so workers wrote
+# "<verb>: [key=x] ..." and every key on such a task silently folded into
+# "default": distinct decisions shared one slot, and two concurrent ones would have
+# had the first closed by the second's resolution with nothing anywhere saying so.
+# Reading the token after the colon as well also repairs the briefs already sitting
+# in live workers' context, which a brief-side fix alone cannot reach. The
+# historical contract around it is unchanged: a token later in the note stays
+# prose, an unkeyed line still uses "default", and a malformed token is still
+# rejected instead of folding into "default".
+test_keyed_decision_token_positions() {
+  local dir state open activity
+  dir=$(make_case key-positions); state="$dir/state"
+  cat > "$state/post.status" <<'EOF'
+needs-decision: [key=gate-scope] narrow or wide gate
+needs-decision: [key=field-list] which fields to carry
+resolved: [key=gate-scope] captain chose narrow
+EOF
+  open=$(status_open_decisions "$state/post.status")
+  printf '%s' "$open" | grep -F $'field-list\tneeds-decision\twhich fields to carry' >/dev/null \
+    || fail "a post-colon key did not open its own decision with a clean summary"
+  printf '%s' "$open" | grep -F $'gate-scope\t' >/dev/null \
+    && fail "a post-colon resolution did not close its own decision"
+  printf '%s' "$open" | grep -F $'default\t' >/dev/null \
+    && fail "post-colon keyed decisions collapsed into the default slot"
+  # Mixed positions across an open/close pair: a worker resuming from an older
+  # brief writes one form, the current brief teaches the other.
+  printf 'needs-decision [key=api-shape]: pick A or B\nresolved: [key=api-shape] captain picked A\n' \
+    > "$state/mixed-close.status"
+  [ -z "$(status_open_decisions "$state/mixed-close.status")" ] \
+    || fail "a post-colon resolution did not close a canonically opened decision"
+  printf 'needs-decision: [key=api-shape] pick A or B\nresolved [key=api-shape]: captain picked A\n' \
+    > "$state/mixed-open.status"
+  [ -z "$(status_open_decisions "$state/mixed-open.status")" ] \
+    || fail "a canonical resolution did not close a post-colon opened decision"
+  printf 'needs-decision:[key=tight] no space after the colon\n' > "$state/tight.status"
+  status_open_decisions "$state/tight.status" | grep -F $'tight\t' >/dev/null \
+    || fail "a post-colon key written without a space after the colon was not read"
+  # The canonical position stays authoritative when a line carries both.
+  printf 'needs-decision [key=canonical]: [key=other] both positions\n' > "$state/both.status"
+  open=$(status_open_decisions "$state/both.status")
+  printf '%s' "$open" | grep -F $'canonical\t' >/dev/null \
+    || fail "the canonical pre-colon key did not win over a post-colon token"
+  printf '%s' "$open" | grep -F $'other\t' >/dev/null \
+    && fail "a post-colon token overrode the canonical pre-colon key"
+  # Unkeyed lines keep the historical one-open-decision behavior exactly.
+  printf 'needs-decision: pick A or B\nresolved: captain picked A\n' > "$state/legacy.status"
+  [ -z "$(status_open_decisions "$state/legacy.status")" ] \
+    || fail "a bare resolved: no longer closes the default decision"
+  printf 'needs-decision: pick A or B\n' > "$state/legacy-open.status"
+  status_open_decisions "$state/legacy-open.status" | grep -F $'default\t' >/dev/null \
+    || fail "an unkeyed decision no longer uses the default key"
+  # A malformed token is rejected in the new position too, never folded into default.
+  printf 'needs-decision: [key=bad slug] malformed\nneeds-decision: [key=] empty\n' > "$state/bad.status"
+  [ -z "$(status_open_decisions "$state/bad.status")" ] \
+    || fail "a malformed post-colon key entered the open-decision set"
+  printf 'needs-decision: pick A or B\nresolved: [key=bad slug] malformed\n' > "$state/bad-close.status"
+  status_open_decisions "$state/bad-close.status" | grep -F $'default\t' >/dev/null \
+    || fail "a malformed post-colon resolution silently closed the default decision"
+  # The same positions fold material phases, which is where the live evidence had
+  # a post-colon keyed pause.
+  cat > "$state/post-activity.status" <<'EOF'
+working: [key=phase7] Phase 7 started
+working: [key=legal] reviewing legal dependency
+paused: [key=legal] awaiting external counsel
+done: [key=phase7] Phase 7 completed
+EOF
+  activity=$(status_open_activities "$state/post-activity.status")
+  printf '%s' "$activity" | grep -F $'legal\tpaused\tawaiting external counsel' >/dev/null \
+    || fail "a post-colon keyed pause did not open its own phase"
+  printf '%s' "$activity" | grep -F $'phase7\t' >/dev/null \
+    && fail "a post-colon keyed terminal event did not close its own working phase"
+  # Line-level parsers: same verb, same note, either position; prose untouched.
+  [ "$(status_line_verb 'resolved: [key=api-shape] captain picked A')" = resolved ] \
+    || fail "the verb parser mis-read a post-colon keyed line"
+  [ "$(status_line_note 'resolved: [key=api-shape] captain picked A')" = 'captain picked A' ] \
+    || fail "a recognized post-colon key token survived into the note text"
+  [ "$(status_line_note 'resolved: docs still mention [key=q1]')" = 'docs still mention [key=q1]' ] \
+    || fail "the note parser stripped a key token that is note prose"
+  [ "$(status_line_note 'resolved: [key=bad slug] malformed')" = '[key=bad slug] malformed' ] \
+    || fail "the note parser stripped a malformed key token instead of leaving it visible"
+  pass "keyed status grammar: the key token is read before and after the verb colon, prose and malformed tokens unchanged"
+}
+
 # crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
 # benign (absorb) ONLY when fm-crew-state.sh reports the crew as working from an
 # actively-running pipeline step (source run-step) or a busy pane (source pane);
@@ -1803,6 +1887,7 @@ test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
+test_keyed_decision_token_positions
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier

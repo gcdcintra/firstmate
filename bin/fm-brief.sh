@@ -311,7 +311,9 @@ $SHARED_MACHINE
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
-   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
+   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` so the decision or blocker is durably closed and does not keep resurfacing.
+   When more than one decision or blocker can be open at once, key each pair so they close independently:
+   \`needs-decision [key=api-shape]: {summary of options}\` then \`resolved [key=api-shape]: {how it was decided}\`.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
@@ -427,7 +429,9 @@ $SHARED_MACHINE
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will apply the configured authority and reply with the decision.
-   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
+   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` so the decision or blocker is durably closed and does not keep resurfacing.
+   When more than one decision or blocker can be open at once, key each pair so they close independently:
+   \`needs-decision [key=api-shape]: {summary of options}\` then \`resolved [key=api-shape]: {how it was decided}\`.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
