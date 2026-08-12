@@ -118,6 +118,20 @@ custody: recoverable
 
 `recover` exits without acting on that state, leaving the choice between `--recover` and `--recover --keep-local` to the worker, because that choice is about content rather than about ownership.
 
+The same read against the live worktree for `fm/fm-fork-stale-lock-v2` is the sharper case, because that branch's review fixes exist only as preserved pipeline commits:
+
+```
+$ bin/fm-nm-custody.sh check --dir <live worktree>
+custody: recoverable
+  run:            01KZVPCMHBVDQZ68JNEW173K2H (failed)
+  preserved head: 6781376a6bb8da7a99c6c56e870cd0c75444d786
+  gate head:      6781376a6bb8da7a99c6c56e870cd0c75444d786
+  local head:     0c2c235026c47e9d068a730e500209c6a4fed8cf
+```
+
+A local head well behind the preserved head is not a strand.
+Classifying it as one would invite a sidestep at the local head and orphan every preserved fix, which is exactly why the gate comparison, and not the local-versus-preserved distance, is the discriminator.
+
 ## Re-establishing this record
 
 Run `tests/fm-nm-custody.test.sh` after any no-mistakes upgrade.

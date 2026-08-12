@@ -276,6 +276,23 @@ test_no_mistakes_dod_wording() {
   assert_grep "firstmate's authority check" "$brief" \
     "no-mistakes DOD lost the apostrophe prose that the structural fix makes parse-safe"
   pass "fm-brief.sh: no-mistakes DOD keeps its apostrophe prose, now parse-safe"
+
+  # A run that dies mid-flight can leave the branch in a custody state whose own
+  # guarded recovery can never succeed. Only the worker can step around it, so
+  # the brief is the one surface that reaches it: without this the worker would
+  # hand-edit refs or stall. Assert the quoted absolute helper path and the
+  # status flag that makes the recovery report itself.
+  assert_grep "$ROOT/bin/fm-nm-custody.sh' recover --status " "$brief" \
+    "no-mistakes DOD lost the stranded-branch recovery command"
+  assert_grep "$home/state/$id.status'" "$brief" \
+    "the stranded-branch recovery must report itself to this task's status file"
+  assert_grep "a run died mid-flight and its guarded recovery can never succeed again" "$brief" \
+    "no-mistakes DOD must name the state the recovery command is for"
+  assert_grep "Do not hand-edit refs or the gate" "$brief" \
+    "no-mistakes DOD must forbid hand-working the stranded state"
+  assert_grep "Three firstmate-specific rules" "$brief" \
+    "no-mistakes DOD lost a firstmate-specific rule or its count"
+  pass "fm-brief.sh: no-mistakes DOD carries the stranded-branch recovery command"
 }
 
 test_ship_project_memory_wording() {
