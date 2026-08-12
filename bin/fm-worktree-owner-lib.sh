@@ -89,11 +89,19 @@ fm_worktree_owner_token_valid() {  # <token>
 
 # Record ownership of <worktree> for <task-id>. Private (0600) so another user
 # cannot forge a holder, and excluded from git so it never reaches a commit.
+# Refuses to follow what the read side refuses to read: a marker path that is a
+# symlink or any other non-regular file is never written through - a planted one
+# survives `treehouse return --force` (the clean skips git-excluded files) and
+# would otherwise let the next spawn truncate whatever it points at. It is
+# removed and replaced with a fresh regular file, or the write fails.
 fm_worktree_owner_write() {  # <worktree> <token> <task-id> <home>
   local wt=$1 token=$2 id=$3 home=${4:-} marker excl old_umask
   [ -n "$wt" ] && [ -d "$wt" ] || return 1
   fm_worktree_owner_token_valid "$token" || return 1
   marker=$(fm_worktree_owner_marker_path "$wt") || return 1
+  if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
+    rm -f -- "$marker" 2>/dev/null || return 1
+  fi
   old_umask=$(umask)
   umask 077
   {

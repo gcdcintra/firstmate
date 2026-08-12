@@ -29,6 +29,8 @@
 #   (j) fm-spawn.sh                                        -> writes both halves of the
 #                                                             proof, agreeing
 #   (k) uncommitted-work protection with a record present  -> still REFUSES
+#   (l) spawn onto a planted marker-named symlink          -> replaces it, never
+#                                                             writes through it
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -404,6 +406,78 @@ SH
   pass "spawn records ownership of the worktree it took, in metadata and in the worktree, out of git's view"
 }
 
+# (l) The write side refuses what the read side refuses. A marker-named symlink
+# planted in a pooled slot survives `treehouse return --force` (the clean skips
+# git-excluded files), so the next spawn into that slot must replace it with a
+# fresh regular record - never write through it into whatever it points at.
+test_spawn_never_writes_through_a_planted_marker_symlink() {
+  local case_dir home proj wt fakebin id victim out rc
+  id=owner-spawn-z2
+  case_dir="$TMP_ROOT/spawn-symlink"
+  home="$case_dir/home"
+  proj="$case_dir/project"
+  wt="$case_dir/wt"
+  victim="$case_dir/victim.txt"
+  fakebin=$(fm_fakebin "$case_dir/fake")
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
+  printf 'codex\n' > "$home/config/crew-harness"
+  fm_git_worktree "$proj" "$wt" "wt-owner-spawn-symlink"
+  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  touch "$home/state/.last-watcher-beat"
+  printf 'sibling data that must survive\n' > "$victim"
+  ln -s "$victim" "$wt/$MARKER"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+esac
+case "${1:-}" in
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
+  fm_fake_exit0 "$fakebin" treehouse
+
+  set +e
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_FAKE_PANE_PATH="$wt" \
+    PATH="$fakebin:$PATH" "$SPAWN" "$id" "$proj" 2>&1)
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "spawn-symlink: spawn failed: $out"
+
+  [ "$(cat "$victim")" = 'sibling data that must survive' ] \
+    || fail "spawn-symlink: spawn wrote through the planted symlink and clobbered its target"
+  [ ! -L "$wt/$MARKER" ] || fail "spawn-symlink: the planted symlink is still the ownership record"
+  [ -f "$wt/$MARKER" ] || fail "spawn-symlink: spawn did not leave a regular ownership record"
+  grep -q "task=$id" "$wt/$MARKER" || fail "spawn-symlink: the fresh record does not name the task"
+  pass "spawn replaces a planted marker symlink instead of writing through it"
+}
+
+# The no-argument help is the header contract: whole sentences from the first
+# one on, comment prefixes stripped, like every other bin script's usage.
+test_usage_prints_the_header_from_its_first_sentence() {
+  local out rc first
+  set +e
+  out=$("$OWNER" 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "usage: bare invocation should exit 2"
+  first=$(printf '%s\n' "$out" | head -1)
+  case "$first" in
+    'Inspect or restore'*) : ;;
+    *) fail "usage: help does not open with the header's first sentence: '$first'" ;;
+  esac
+  assert_not_contains "$out" '# ' "usage: help kept raw comment prefixes"
+  assert_contains "$out" 'fm-worktree-owner.sh show <task-id>' "usage: help lost the show synopsis"
+  pass "usage help starts at the header's first sentence with prefixes stripped"
+}
+
 test_reassigned_worktree_refuses_and_changes_nothing
 test_force_does_not_override_a_reassigned_worktree
 test_owned_worktree_is_torn_down_normally
@@ -417,5 +491,7 @@ test_claim_restores_a_missing_record
 test_claim_refuses_to_take_another_tasks_worktree
 test_show_reports_both_halves_of_the_proof
 test_spawn_records_ownership_of_the_worktree_it_took
+test_spawn_never_writes_through_a_planted_marker_symlink
+test_usage_prints_the_header_from_its_first_sentence
 
 echo "# all fm-worktree-owner tests passed"

@@ -66,7 +66,13 @@
 # owns the contract and the exact limits of what it proves.
 # Secondmate homes are leased from treehouse (`treehouse get --lease`), so their
 # holder is recorded by treehouse itself and their return is guarded with
-# `treehouse return --if-lease-holder <id>` instead of a marker.
+# `treehouse return --if-lease-holder <id>` instead of a marker. That holder
+# precondition is carried by EVERY return attempt for the call, including lock
+# retries and the post-stale-lock retry. Only treehouse's explicit "is not
+# leased" refusal on the first attempt (a home leased before holders were
+# recorded) falls back to an unguarded return; any other guarded failure,
+# including an older treehouse that rejects the flag, aborts loudly rather than
+# degrading to a return with no holder precondition.
 # Usage: fm-teardown.sh <task-id> [--force] [--disown-worktree]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
@@ -188,6 +194,14 @@ ORCA_PATH_MATCH_VERIFIED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
+# Refused at preflight so an invalid flag combination can never destroy anything
+# first: for kind=secondmate the forced child cleanup below would otherwise run
+# before a later --disown-worktree refusal.
+if [ "$DISOWN_WORKTREE" = 1 ] && [ "$KIND" = secondmate ]; then
+  echo "REFUSED: --disown-worktree does not apply to secondmate $ID; its home is leased from treehouse, which records the holder itself." >&2
+  echo "Retire it with the ordinary secondmate path once its home holds no work under way." >&2
+  exit 1
+fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 PUBLIC_FOLLOWUP_HOME=$FM_HOME
@@ -728,42 +742,52 @@ treehouse_return_is_unleased() {
   printf '%s\n' "$1" | grep -Fq 'is not leased'
 }
 
+# The single refusal wording for a guarded return whose lease now belongs to
+# someone else, wherever in the attempt sequence treehouse reports it.
+refuse_lease_mismatch() {  # <label> <dir> <lease-holder>
+  echo "REFUSED: $1 $2 is no longer leased to $3; returning it would release a worktree another holder is using. Nothing was changed." >&2
+}
+
 # Return a worktree/home via `treehouse return --force`, tolerating a transient or
 # stale git index.lock left by a killed crew process. See the script header.
 # <lease-holder>, when given, names the holder this caller expects treehouse to have
 # recorded (secondmate homes are taken with `treehouse get --lease --lease-holder
-# <id>`). It is checked by treehouse itself, atomically with the return, so a home
-# whose lease now belongs to someone else is refused rather than returned out from
-# under them. A slot carrying no lease at all predates that record and falls back to
-# the unguarded return, which is exactly what happened before this guard existed.
+# <id>`). It is checked by treehouse itself, atomically with the return, and the
+# precondition rides EVERY attempt this call makes - lock retries and the
+# post-stale-lock retry included - so a lease that changes hands during a wait is
+# refused rather than released out from under its new holder. The one fallback to
+# an unguarded return is treehouse's explicit "is not leased" signature on the
+# first attempt: a slot carrying no lease at all predates the holder record, which
+# is exactly what happened before this guard existed. Every other guarded failure,
+# including an older treehouse that rejects --if-lease-holder, fails this call
+# loudly instead of degrading to an unguarded return.
 teardown_treehouse_return() {
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-} lease_holder=${5:-}
   local out lock attempt=0 max_retries lock_desc
-
-  if [ -n "$lease_holder" ]; then
-    if out=$( ( cd "$cd_dir" && treehouse return --force --if-lease-holder "$lease_holder" "$dir" ) 2>&1 ); then
-      [ -n "$out" ] && printf '%s\n' "$out"
-      return 0
-    fi
-    if treehouse_return_is_lease_mismatch "$out"; then
-      printf '%s\n' "$out" >&2
-      echo "REFUSED: $label $dir is no longer leased to $lease_holder; returning it would release a worktree another holder is using. Nothing was changed." >&2
-      return 1
-    fi
-    if treehouse_return_is_unleased "$out"; then
-      echo "teardown: $label $dir carries no treehouse lease to verify; returning it unguarded" >&2
-    else
-      [ -n "$out" ] && printf '%s\n' "$out" >&2
-    fi
-  fi
+  local -a return_cmd=(treehouse return --force)
+  [ -z "$lease_holder" ] || return_cmd=(treehouse return --force --if-lease-holder "$lease_holder")
 
   # Capture stdout+stderr so non-lock failures stay visible and lock failures can
   # be matched by signature even when the lock file is already gone mid-check.
-  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+  if out=$( ( cd "$cd_dir" && "${return_cmd[@]}" "$dir" ) 2>&1 ); then
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
+
+  if [ -n "$lease_holder" ] && treehouse_return_is_unleased "$out"; then
+    echo "teardown: $label $dir carries no treehouse lease to verify; returning it unguarded" >&2
+    lease_holder=
+    return_cmd=(treehouse return --force)
+    if out=$( ( cd "$cd_dir" && "${return_cmd[@]}" "$dir" ) 2>&1 ); then
+      [ -n "$out" ] && printf '%s\n' "$out"
+      return 0
+    fi
+  fi
   [ -n "$out" ] && printf '%s\n' "$out" >&2
+  if [ -n "$lease_holder" ] && treehouse_return_is_lease_mismatch "$out"; then
+    refuse_lease_mismatch "$label" "$dir" "$lease_holder"
+    return 1
+  fi
 
   if ! treehouse_return_is_index_lock_error "$out"; then
     return 1
@@ -784,12 +808,16 @@ teardown_treehouse_return() {
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    if out=$( ( cd "$cd_dir" && "${return_cmd[@]}" "$dir" ) 2>&1 ); then
       [ -n "$out" ] && printf '%s\n' "$out"
       echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
       return 0
     fi
     [ -n "$out" ] && printf '%s\n' "$out" >&2
+    if [ -n "$lease_holder" ] && treehouse_return_is_lease_mismatch "$out"; then
+      refuse_lease_mismatch "$label" "$dir" "$lease_holder"
+      return 1
+    fi
 
     if ! treehouse_return_is_index_lock_error "$out"; then
       echo "teardown: $label return failed with a non-lock error after retry; aborting" >&2
@@ -811,12 +839,16 @@ teardown_treehouse_return() {
           return 1
         fi
       fi
-      if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      if out=$( ( cd "$cd_dir" && "${return_cmd[@]}" "$dir" ) 2>&1 ); then
         [ -n "$out" ] && printf '%s\n' "$out"
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
         return 0
       fi
       [ -n "$out" ] && printf '%s\n' "$out" >&2
+      if [ -n "$lease_holder" ] && treehouse_return_is_lease_mismatch "$out"; then
+        refuse_lease_mismatch "$label" "$dir" "$lease_holder"
+        return 1
+      fi
       echo "teardown: $label return still failing after stale-lock cleanup" >&2
       return 1
     fi
@@ -934,13 +966,9 @@ require_worktree_ownership() {
 # The --disown-worktree precondition. Disowning is allowed exactly when the
 # worktree is NOT provably this task's; a worktree that still IS this task's must
 # go through ordinary cleanup so its landed-work checks apply, which is what keeps
-# this from becoming a way around them.
+# this from becoming a way around them. kind=secondmate never reaches this: it is
+# refused at preflight, before the forced child cleanup can destroy anything.
 require_disownable_worktree() {
-  if [ "$KIND" = secondmate ]; then
-    echo "REFUSED: --disown-worktree does not apply to secondmate $ID; its home is leased from treehouse, which records the holder itself." >&2
-    echo "Retire it with the ordinary secondmate path once its home holds no work under way." >&2
-    return 1
-  fi
   if [ -z "$WT_OWNER_EXPECTED" ]; then
     echo "REFUSED: task $ID has no ownership record to disown; it predates worktree ownership records." >&2
     echo "Ordinary cleanup already applies to it: bin/fm-teardown.sh $ID" >&2
@@ -967,6 +995,22 @@ revalidate_worktree_before_return() {
     secondmate|scout) return 0 ;;
   esac
   validate_worktree_teardown_safety
+}
+
+# The child-return counterpart of revalidate_worktree_before_return, which closes
+# over the parent task's $WT/$KIND/$FORCE and so cannot speak for a child. Bound
+# through these globals, set at the child return call site, because
+# teardown_treehouse_return invokes its post_cleanup_check with no arguments; it
+# re-proves the child's own ownership record and removal boundaries against the
+# CURRENT worktree before a post-stale-lock return.
+TEARDOWN_CHILD_RECHECK_WT=
+TEARDOWN_CHILD_RECHECK_PROJ=
+TEARDOWN_CHILD_RECHECK_META=
+TEARDOWN_CHILD_RECHECK_ID=
+revalidate_child_worktree_before_return() {
+  validate_child_worktree_for_removal "$TEARDOWN_CHILD_RECHECK_WT" \
+    "$TEARDOWN_CHILD_RECHECK_PROJ" "$TEARDOWN_CHILD_RECHECK_META" \
+    "$TEARDOWN_CHILD_RECHECK_ID" >/dev/null
 }
 
 require_orca_worktree_path_match() {
@@ -1600,7 +1644,11 @@ cleanup_firstmate_home_children() {
         "$child_wt/.opencode/plugins/fm-busy-state.js" \
         "$child_wt/.fm-grok-turnend" "$child_wt/.fm-kimi-turnend"
       if [ -n "$child_proj" ] && [ -d "$child_proj" ] && command -v treehouse >/dev/null 2>&1; then
-        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree"; then
+        TEARDOWN_CHILD_RECHECK_WT=$child_wt
+        TEARDOWN_CHILD_RECHECK_PROJ=$child_proj
+        TEARDOWN_CHILD_RECHECK_META=$child_meta
+        TEARDOWN_CHILD_RECHECK_ID=$child_id
+        if teardown_treehouse_return "$child_wt" "$child_proj" "child worktree" revalidate_child_worktree_before_return; then
           :
         else
           child_return_rc=$?

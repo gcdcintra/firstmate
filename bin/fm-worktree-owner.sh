@@ -33,7 +33,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-worktree-owner-lib.sh"
 
 usage() {
-  sed -n '3,20p' "$0" >&2
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
