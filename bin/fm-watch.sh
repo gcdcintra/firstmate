@@ -21,8 +21,8 @@
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
 #                          re-surface cadence, never as a wedge; it surfaces once on
-#                          first sighting, with a reason, when the crew's own state
-#                          does not confirm the wait, and that first sighting is
+#                          first sighting, with a reason, while the crew's endpoint is
+#                          not confirmed dead, and that first sighting is
 #                          bounded by the cadence marker rather than by the pane hash
 #                          (an idle harness animates its footer, so the hash alone
 #                          would re-arm a first sighting every cycle). Only when neither
@@ -442,7 +442,7 @@ surface_nonterminal_stale() {  # <window> <hash>
     if [ -e "$STATE/.paused-resurfaced-$key" ]; then
       handle_paused_stale "$win" "$task" "$h"
     else
-      reason="stale: $win (declared wait, first sighting - the worker's own state does not confirm the wait and its endpoint is still live, so check it once; later sightings use the long pause recheck cadence)"
+      reason="stale: $win (declared wait, first sighting - the worker's endpoint is not confirmed dead, so the declaration alone is not proof it is idle on purpose; check it once, then later sightings use the long pause recheck cadence)"
       fm_wake_append stale "$win" "$reason" || exit 1
       printf '%s' "$h" > "$STATE/.stale-$key"
       rm -f "$STATE/.stale-since-$key"
