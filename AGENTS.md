@@ -312,6 +312,9 @@ Custody recovery settles branch ownership, not content: the worker must replace 
 Apart from that single supported abort, do not hand-edit, commit, restart, or start a second validation run while the obsolete run still owns the branch.
 Once ownership is settled, validate exactly once against that final head so no obsolete or intermediate head is ever treated as authoritative.
 
+A run that dies mid-flight can instead leave its branch held by a terminal run whose guarded custody return can never succeed again.
+`bin/fm-nm-custody.sh` owns recognizing that state read-only and stepping around it at the identical head, never firing on an ordinary recoverable or live branch and never deleting the stranded ref; the worker that owns the worktree runs the recovery and reports it.
+
 An ask-user finding returns as `needs-decision`; firstmate decides only when the configured authority permits, otherwise escalates to the captain.
 Send the same worker one exact decision naming the decision key, step, action, affected finding IDs, instructions where needed, and exact response command.
 Require the matching `resolved` event, forbid `--yes`, and require the worker to process every synchronous return until completion or a genuinely new escalation.
