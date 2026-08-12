@@ -13,12 +13,39 @@ Claude's `.claude/settings.json` Stop `asyncRewake` hook (`bin/fm-claude-stop-au
 The hook fires on every Stop, and an eligible primary with supervision need admits one home-scoped owner that foregrounds `bin/fm-watch-arm.sh` inside the hook-owned process tree.
 A numeric session-lock owner that fails the shared `fm_harness_pid_alive` predicate is reclaimed through `bin/fm-lock.sh` before auto-arm state changes, while a live owner, absent lock, or malformed lock keeps the competing hook inert.
 `fm_session_lock_foreign_owner_alive` in `bin/fm-session-lock-lib.sh` is the single owner of that live-foreign-owner test, shared with the Claude turn-end guard's stood-down outcome in [`turnend-guard.md`](turnend-guard.md#harness-integrations).
-The stale-owner claim occurs only after the existing AFK and supervision-need gates pass.
+That test has one evidence-gated exception, owned by the same library and described under [Session fork recovery](#session-fork-recovery) below.
+The recoverable-owner claim occurs only after the existing AFK and supervision-need gates pass.
 After each non-actionable arm close, the hook rechecks the identity-matched watcher lock and fresh beacon before retrying a bounded number of times.
 A cycle-end failure is benign when that live-watcher predicate is true, and the hook suppresses the arm output and continues silently.
 Only an exhausted failure with no verified watcher emits one last-resort notice for the continuous failure episode; later consecutive Stop cycles exit 2 to guarantee another Stop-owned retry without repeating the notice until the turn-end guard consumes the attended fail-open.
 The Claude turn-end guard owns the monotonic failure progression, one-time attended fail-open, post-alarm continuation suppression, and positive recovery reset described in [`turnend-guard.md`](turnend-guard.md#harness-integrations).
 While supervision is still needed and away mode remains inactive, an actionable close wakes the idle session through exit 2.
+
+## Session fork recovery
+
+A forked Claude session continues the same conversation under a new pid while the pre-fork process stays alive, so the lock keeps naming a live process that is not in the fork's ancestry.
+That is a third case: neither the same session nor a competing one.
+Refusing it left supervision unable to re-claim its own home, so every turn end needed a manual arm.
+
+The fork is separated from a competing session by evidence only, never by assumption, and never by inspecting or ending either process.
+Claude Code's own live-session registry maps the recorded lock pid to the session it is running, bound to that incarnation of the pid by its process start time.
+A forked transcript is a verbatim copy of its source's, so the source's message uuids reappear in it unchanged and in order.
+The claim therefore requires the owner's transcript to be a strict positional prefix of this session's, which proves the owner is this session's fork source and, in the same test, that it has produced nothing since the fork.
+When it holds, `bin/fm-lock.sh` takes the lock and leaves the source process running; it re-proves the claim before releasing, so a source that resumes work mid-claim gets the lock straight back.
+[`verification/supervision.md`](verification/supervision.md#session-fork-lock-recovery) records the measured evidence.
+
+Everything else keeps the unchanged refusal, so the boundary the fleet depends on does not move:
+
+- A source that took any turn after the fork appends a uuid this session does not have, so it is a live session in use and keeps the home.
+- Sibling forks of one source extend each other in neither direction, and an identical transcript is not an extension.
+- A background agent never claims on this evidence, because Claude Code seeds one by forking the live session it must not displace.
+- A live owner with no registry record, a record whose process start time no longer matches, or a claimant that cannot identify its own session all fail closed.
+- The process start time is read from `/proc`, so fork recovery is Linux-only and every other platform refuses.
+- Every primary harness other than Claude keeps today's behavior, having no such registry.
+
+Two limits are deliberate.
+A fork taken from a point earlier than the source's own tip leaves post-boundary uuids in the source, so it never auto-claims and the manual path remains.
+A source that has been idle since the fork loses the lock to its descendant and goes read-only if it is used again; the home still has exactly one owner at all times, and this is the only direction in which the change is more permissive - never the direction where two live sessions both act on one home.
 
 ## Actionable wake ordering
 

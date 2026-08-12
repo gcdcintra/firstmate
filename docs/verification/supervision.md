@@ -313,6 +313,99 @@ tests/fm-claude-stop-autoarm.test.sh
 tests/fm-turnend-guard.test.sh
 ```
 
+## Session fork lock recovery
+
+A harness session fork runs the continuation under a new pid while the pre-fork process stays alive, so the home's session lock keeps naming a live process that is not in the new session's ancestry.
+The evidence below is what lets `bin/fm-session-lock-lib.sh` separate that source from a genuinely competing session without inspecting or touching either process.
+Measured on 2026-08-11 with Claude Code 2.1.227 on Linux, entirely in a throwaway project directory and two throwaway terminal sessions.
+
+The `SessionStart` hook payload identifies the fork but nothing above it.
+`claude --resume <id> --fork-session` with a `SessionStart` hook that echoes its stdin produced:
+
+```text
+{"session_id":"d69f5a17-ee02-46de-8775-39fc0d5f5406","transcript_path":"/home/ubuntu/.claude/projects/-tmp-fm-fork-stale-lock-probe/d69f5a17-ee02-46de-8775-39fc0d5f5406.jsonl","cwd":"/tmp/fm-fork-stale-lock/probe","hook_event_name":"SessionStart","source":"fork"}
+```
+
+The payload carries the new session id only: no source session id, no source pid, and no other statement of the relationship.
+`CLAUDE_CODE_RESUME_SOURCE_ALIVE` was empty in the same hook environment, because Claude Code sets it only when it spawns a session from a live source itself.
+The forked transcript is rewritten to the new session id throughout, so the source id does not appear there either.
+
+Two harness-maintained facts do carry the relationship.
+
+Claude Code keeps a live-session registry at `<config>/sessions/<pid>.json`:
+
+```text
+{"pid":39387,"sessionId":"b215a5c6-46d4-4f83-b982-704b97ef871b","cwd":"/tmp/fm-fork-stale-lock/probe","startedAt":1786464523520,"procStart":"4391894","version":"2.1.227","peerProtocol":1,"kind":"interactive","entrypoint":"cli","tmux":"fm-fork-repro:@0.%0","messagingSocketPath":"/run/user/1000/cc-socks/39387.sock","name":"probe-9b","nameSource":"derived","status":"idle","updatedAt":1786464544549,"statusUpdatedAt":1786464544549}
+```
+
+`procStart` equals field 22 of `/proc/<pid>/stat` (`awk '{ print $22 }' /proc/39387/stat` printed `4391894`), which binds the record to that incarnation of the pid.
+Every record enumerated on the host mapped to a live process, and both throwaway records were gone once their sessions exited, so a stale record does not survive to vouch for a dead session.
+Reading it needs no privilege beyond the user's own configuration directory, and the record for the forked session was already present when its own `SessionStart` hook ran.
+
+A fork's transcript is a verbatim copy of its source's, so the copied records keep their original message uuids.
+With a live interactive session forked from a second terminal, the source pid stayed alive and foreground on its tty while the continuation ran under a new pid, reproducing the reported shape:
+
+```text
+39387 Ssl+ pts/16   claude      (source, still the foreground window)
+104131 -            claude      (forked continuation, new pid)
+```
+
+Comparing the two transcripts after the fork took one turn:
+
+```text
+parent uuids: 11  fork uuids: 15
+parent set subset of fork set: True
+strict superset: True
+parent uuids are a positional PREFIX of fork uuids: True
+```
+
+The source transcript stayed byte-identical across the fork and the fork's turn while its window sat idle, so the prefix relation is reachable in practice rather than only in principle.
+After the source took one more turn of its own, the same comparison printed:
+
+```text
+parent uuids: 15  fork uuids: 15
+still a prefix (must be False): False
+still a subset  (must be False): False
+```
+
+That is the guarantee the design rests on: the same test that proves the owner is this session's fork source also proves it has done nothing since, and any turn the source takes breaks it in both directions.
+
+`procStart` has no portable equivalent, so fork recovery is Linux-only by construction and every other platform keeps the unchanged live-owner refusal.
+Non-Claude primaries have no such registry and are unaffected for the same reason.
+
+The recovery itself was measured the same day against two real interactive sessions in a throwaway home, using the tracked `.claude/settings.json` Stop registration and an arm fixture in place of a real watcher.
+The source session acquired the lock through `bin/fm-lock.sh`, was forked from a second terminal, and was then left untouched while the fork completed one turn.
+
+Observed at the fork's own turn end, with no arm command issued by either model:
+
+```text
+=== lock now ===            1457529   (the forked session)
+=== fork pane pid ===       1457529
+=== source still alive? === 1409153 pts/16   Ssl+ claude
+=== epoch ===               epoch=4 owner_pid=1483946 outcome=rewake
+```
+
+The lock moved to the forked continuation on its own turn end, supervision armed without a manual step, and the source process stayed alive and foreground on its tty throughout.
+
+The same lab then proved the boundary in the other direction.
+With the lock restored to the source and the source given one further turn of its own, the evidence path refused and the acquirer left the lock alone:
+
+```text
+=== AFTER the source took a turn: predicate must refuse ===
+REFUSED (correct)
+lock: held by live harness pid 1409153
+error: another live firstmate session holds the lock (pid 1409153); operate read-only until resolved
+acquire rc=1
+lock after refused acquire: 1409153
+```
+
+Deterministic entry points:
+
+```sh
+tests/fm-session-lock-ancestry.test.sh
+tests/fm-claude-stop-autoarm.test.sh
+```
+
 ## Wedge-alarm channels
 
 The two real notification channels were bounded manually on 2026-07-10 on macOS 26.5.2 with Herdr 0.7.3.

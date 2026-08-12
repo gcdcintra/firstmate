@@ -12,9 +12,11 @@
 #     exact fm-turnend-guard.sh scope. Child crew/scout worktrees stay inert.
 #   - Identity: only when THIS session's harness ancestor holds state/.lock.
 #     When an existing numeric owner fails the shared harness-liveness predicate,
-#     the hook delegates guarded recovery to bin/fm-lock.sh and then re-verifies
-#     ownership. A live owner, missing lock, malformed lock, or unresolved
-#     ancestry remains inert, so a competing session never arms or rewakes.
+#     or is proven to be this session's own quiescent fork source, the hook
+#     delegates guarded recovery to bin/fm-lock.sh and then re-verifies
+#     ownership. Any other live owner, a missing lock, a malformed lock, or an
+#     unresolved ancestry remains inert, so a competing session never arms or
+#     rewakes.
 #   - AFK: while state/.afk exists the away daemon owns the watcher and triage;
 #     this hook exits 0 and NEVER rewakes the primary (checked again at
 #     translation time so a mid-cycle AFK transition is honored).
@@ -87,11 +89,12 @@ cat >/dev/null 2>&1 || true
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 # --- identity: only the lock-owning session's hooks may arm ------------------
-# A prior session may have died after leaving its numeric harness pid in .lock.
-# Use the shared liveness predicate to recognize only that stale-owner case.
+# A prior session may have died after leaving its numeric harness pid in .lock,
+# or this session may be a fork whose still-live source recorded it. Both are
+# recoverable owners, and the shared predicate recognizes only those two cases.
 # Defer the mutating claim until after the unchanged AFK and need gates, so an
 # idle or away home remains byte-for-byte inert. Missing or malformed locks are
-# uncertainty rather than stale-owner evidence and remain inert.
+# uncertainty rather than recoverable-owner evidence and remain inert.
 RECOVER_SESSION_LOCK=0
 if ! fm_session_lock_owned_by_self "$STATE"; then
   fm_session_lock_foreign_owner_alive "$STATE" && exit 0
@@ -111,10 +114,10 @@ need_supervision() {
 }
 need_supervision || exit 0
 
-# --- stale session-lock recovery ---------------------------------------------
-# Delegate the claim to fm-lock.sh so its live-owner refusal and write semantics
-# remain the single acquisition owner, then re-verify current-session identity
-# before touching any auto-arm state.
+# --- recoverable session-lock claim -------------------------------------------
+# Delegate the claim to fm-lock.sh so its live-owner refusal, fork-source
+# evidence, and write semantics remain the single acquisition owner, then
+# re-verify current-session identity before touching any auto-arm state.
 if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
   "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || exit 0
   fm_session_lock_owned_by_self "$STATE" || exit 0

@@ -22,6 +22,50 @@ ln -s /bin/bash "$FAKEBIN/claude"
 FAKE_CLAUDE="$FAKEBIN/claude"
 export FAKE_CLAUDE
 
+# A private Claude Code configuration root. Empty by default so no live-owner
+# case can accidentally read this machine's real sessions; the fork cases below
+# populate it with the registry and transcripts the harness would have written.
+CLAUDE_CONFIG_DIR="$TMP_ROOT/claude-config"
+export CLAUDE_CONFIG_DIR
+mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$CLAUDE_CONFIG_DIR/projects/probe"
+
+# Record live pid $1 as running Claude session $2, exactly as Claude Code's own
+# live-session registry does, including the process start time that binds the
+# record to this incarnation of the pid.
+register_claude_session() {  # <pid> <session-id>
+  local pid=$1 session_id=$2 start=''
+  [ ! -r "/proc/$pid/stat" ] || start=$(awk '{ print $22 }' "/proc/$pid/stat")
+  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
+    "$pid" "$session_id" "$start" > "$CLAUDE_CONFIG_DIR/sessions/$pid.json"
+}
+
+# A transcript for session $1 carrying message uuids $2.., in the record shape a
+# fork copies verbatim.
+write_claude_transcript() {  # <session-id> <uuid>...
+  local session_id=$1 uuid file
+  shift
+  file="$CLAUDE_CONFIG_DIR/projects/probe/$session_id.jsonl"
+  : > "$file"
+  for uuid in "$@"; do
+    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
+      "$uuid" "$session_id" >> "$file"
+  done
+}
+
+msg_uuid() {  # <n>
+  printf '00000000-0000-4000-8000-%012d\n' "$1"
+}
+
+FORK_SOURCE_SESSION=00000000-0000-4000-9000-000000000001
+FORK_CHILD_SESSION=00000000-0000-4000-9000-000000000002
+
+# True when this host can supply the process start time the registry check
+# requires. Fork recovery is deliberately Linux-only; everywhere else the
+# evidence is unavailable and the unchanged live-owner refusal stands.
+fork_evidence_available() {
+  [ -r "/proc/$$/stat" ]
+}
+
 # Copy the hook and its sourced dependencies into a fixture checkout.
 install_autoarm_scripts() {
   local dir=$1
@@ -241,6 +285,74 @@ test_inert_when_lock_held_by_other_harness() {
   [ ! -e "$dir/state/arm-ran" ] || fail "hook armed while another session owned the lock"
   [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch while another session owned the lock"
   pass "auto-arm: inert without arm, rewake, or lock replacement when another live harness owns the home"
+}
+
+# The defect this covers: a forked continuation runs under a new pid while the
+# pre-fork process stays alive - often the captain's own foreground window - so
+# the lock keeps naming a live non-ancestor and supervision can never re-claim
+# its own home without a manual arm every turn.
+test_reclaims_lock_from_quiescent_fork_source() {
+  local dir source_pid out status owner_after
+  dir=$(make_primary_dir "$TMP_ROOT/fork-source")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  "$FAKE_CLAUDE" -c 'sleep 60; :' &
+  source_pid=$!
+  printf '%s\n' "$source_pid" > "$dir/state/.lock"
+  register_claude_session "$source_pid" "$FORK_SOURCE_SESSION"
+  write_claude_transcript "$FORK_SOURCE_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_claude_transcript "$FORK_CHILD_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  out=$(printf '%s\n' '{"session_id":"fork"}' \
+    | CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+        printf "%s\n" "$$" > "$FM_HOME/state/expected-owner"
+        "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
+      ' 2>&1); status=$?
+  owner_after=$(cat "$dir/state/.lock")
+  if ! fork_evidence_available; then
+    kill "$source_pid" 2>/dev/null || true
+    wait "$source_pid" 2>/dev/null || true
+    expect_code 0 "$status" "without a process start time the live owner must still be refused"
+    [ "$owner_after" = "$source_pid" ] || fail "the lock moved without the evidence that justifies it"
+    pass "auto-arm: no process start time available, so a fork source keeps the home"
+    return
+  fi
+  kill "$source_pid" 2>/dev/null || true
+  wait "$source_pid" 2>/dev/null || true
+  expect_code 2 "$status" "a proven quiescent fork source must be reclaimed and rewake supervision"
+  [ "$owner_after" = "$(cat "$dir/state/expected-owner")" ] \
+    || fail "the forked session did not take the home: lock names $owner_after"
+  [ -e "$dir/state/arm-ran" ] || fail "supervision never armed after reclaiming from the fork source"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "fork reclaim must record outcome=rewake"
+  assert_not_contains "$out" "another live firstmate session" "fork reclaim must not report a competing session"
+  pass "auto-arm: a forked continuation reclaims the home from its quiescent source, which stays running"
+}
+
+test_inert_when_fork_source_resumed_work() {
+  local dir source_pid out status owner_after
+  fork_evidence_available || { pass "auto-arm: resumed fork source needs a process start time, refused everywhere else"; return; }
+  dir=$(make_primary_dir "$TMP_ROOT/fork-source-active")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  "$FAKE_CLAUDE" -c 'sleep 60; :' &
+  source_pid=$!
+  printf '%s\n' "$source_pid" > "$dir/state/.lock"
+  register_claude_session "$source_pid" "$FORK_SOURCE_SESSION"
+  # The source took its own turn after the fork, so both sessions are live and
+  # in use - the 2026-08-02 two-helms shape this must keep refusing.
+  write_claude_transcript "$FORK_SOURCE_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 7)"
+  write_claude_transcript "$FORK_CHILD_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  out=$(printf '%s\n' '{"session_id":"fork"}' \
+    | CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+        "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
+      ' 2>&1); status=$?
+  owner_after=$(cat "$dir/state/.lock")
+  kill "$source_pid" 2>/dev/null || true
+  wait "$source_pid" 2>/dev/null || true
+  expect_code 0 "$status" "a fork source that resumed work must keep the home"
+  [ "$owner_after" = "$source_pid" ] || fail "an active fork source lost the home: lock names $owner_after"
+  [ ! -e "$dir/state/arm-ran" ] || fail "hook armed while its fork source was still working"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch while its fork source was still working"
+  pass "auto-arm: a fork source that resumed work is a competing session again and keeps the home"
 }
 
 test_inert_when_afk() {
@@ -579,6 +691,8 @@ test_inert_in_child_worktree
 test_inert_without_session_lock
 test_reclaims_stale_session_lock_before_arming
 test_inert_when_lock_held_by_other_harness
+test_reclaims_lock_from_quiescent_fork_source
+test_inert_when_fork_source_resumed_work
 test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain
