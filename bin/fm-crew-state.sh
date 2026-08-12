@@ -27,7 +27,9 @@
 #      A run matches when its head equals the worktree HEAD, or the worktree HEAD
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
 #      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution.
+#      diverged from it, invalidates attribution. The head an in-flight run
+#      reports is often invisible to this worktree, so the head the worktree
+#      SUBMITTED binds the run too - see nm_run_head_matches_worktree.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -384,41 +386,56 @@ nm_runs_status_for_branch() {  # <branch>
 # scratch worktree); with no branch there is no run to attribute to this crew.
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 
-# 0 if the active axi-status run's head field matches this worktree's code
-# identity. Branch match is a precondition (caller). Rules:
-#   - missing/empty head field: cannot bind; reject the run
+# 0 if <commit> is this worktree's code identity. The single owner of that test.
+# Rules:
+#   - missing/empty: cannot bind; no match
 #   - equal commits (short or full SHA): match
-#   - worktree HEAD is an ancestor of run head: match (pipeline fix commits on
-#     the same history advanced the run tip)
-#   - run head is a strict ancestor of worktree HEAD: no match (local work
-#     advanced outside the run)
-#   - diverged / run head not in this worktree: no match (rewritten branch tip)
-nm_run_head_matches_worktree() {
-  local run_head local_full run_full
-  run_head=$(strip_quotes "$(nm_field head)")
-  [ -n "$run_head" ] || return 1
+#   - worktree HEAD is an ancestor of it: match (pipeline fix commits on the same
+#     history advanced the run tip)
+#   - it is a strict ancestor of worktree HEAD: no match (local work advanced
+#     outside the run)
+#   - diverged / not resolvable in this worktree: no match (rewritten branch tip,
+#     or a commit that only exists inside the local gate repo)
+nm_commit_binds_worktree() {  # <commit-ish>
+  local cand=${1:-} local_full cand_full
+  [ -n "$cand" ] || return 1
   local_full=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
-  run_full=$(git -C "$WT" rev-parse --verify "${run_head}^{commit}" 2>/dev/null) || return 1
-  [ "$run_full" = "$local_full" ] && return 0
-  if git -C "$WT" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null; then
-    return 0
-  fi
-  return 1
+  cand_full=$(git -C "$WT" rev-parse --verify "${cand}^{commit}" 2>/dev/null) || return 1
+  [ "$cand_full" = "$local_full" ] && return 0
+  git -C "$WT" merge-base --is-ancestor "$local_full" "$cand_full" 2>/dev/null
 }
 
-# Coarse runs-list rows are "<status> <branch> <short-sha> ...". 0 if the short
-# sha for this branch row matches the worktree head under the same rules as
-# nm_run_head_matches_worktree (equal, or local is ancestor of run tip).
+# 0 if the axi-status run reported for this branch is validating this worktree's
+# code. Branch match is a precondition (caller). Two heads can bind it, and
+# either one is sufficient:
+#   - `head`, where the run sits NOW. It binds a run whose commits this worktree
+#     can still see: no pipeline commit yet, or the crew already synchronized to
+#     the pipeline-pushed head.
+#   - `branch_sync.pipeline.submitted_head`, the exact commit this worktree
+#     handed the pipeline. A run in flight rewrites its own head inside the local
+#     gate repo - the rebase step alone does it, before any fix round - and those
+#     commits are not in the crew worktree until the pipeline pushes, so `head`
+#     resolves to nothing here and, on its own, disowns the very run that is
+#     validating this crew right now (verified 2026-08-11 against a real live
+#     run: worktree c27c5d94, run head e62fa96c present only in the gate repo,
+#     submitted_head c27c5d94). Attribution then fell through to the coarse runs
+#     list, which matched an OLDER superseded run still sitting on the worktree
+#     sha and reported a healthy crew as failed.
+# Binding on the submitted head stays exact rather than optimistic: it is the
+# pipeline's own record of whose code a run is validating, so a crew that rewrote
+# its branch under an abandoned still-active run matches neither head and
+# correctly falls through to the pane/log sources below.
+nm_run_head_matches_worktree() {
+  nm_commit_binds_worktree "$(strip_quotes "$(nm_field head)")" && return 0
+  nm_commit_binds_worktree "$(strip_quotes "$(nm_field submitted_head)")"
+}
+
+# Coarse runs-list rows are "<status> <branch> <short-sha> ...". That row carries
+# only the run's current head - the runs list exposes no submitted head - so a
+# coarse row binds on that one sha alone. Teaching this walk about submitted
+# heads is tracked as backlog item fm-crewstate-coarse-walk.
 nm_coarse_head_matches_worktree() {  # <short-sha>
-  local run_head=$1 local_full run_full
-  [ -n "$run_head" ] || return 1
-  local_full=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
-  run_full=$(git -C "$WT" rev-parse --verify "${run_head}^{commit}" 2>/dev/null) || return 1
-  [ "$run_full" = "$local_full" ] && return 0
-  if git -C "$WT" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null; then
-    return 0
-  fi
-  return 1
+  nm_commit_binds_worktree "${1:-}"
 }
 
 HAVE_RUN=0
