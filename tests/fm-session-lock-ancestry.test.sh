@@ -310,7 +310,7 @@ test_quiescent_fork_source_is_provable() {
   write_transcript 00000000-0000-4000-9000-000000000002 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
 
   if proc_start_available; then
-    CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000002 lib_run "fm_claude_fork_descendant_of_pid $owner" \
+    CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000002 lib_run "fm_claude_fork_descendant_of_pid $owner" \
       || fail "a forked session could not prove descent from its own quiescent source"
     pass "fork descent: a forked session proves descent from its still-live, quiescent source"
   else

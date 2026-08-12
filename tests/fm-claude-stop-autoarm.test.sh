@@ -292,7 +292,7 @@ test_inert_when_lock_held_by_other_harness() {
 # the lock keeps naming a live non-ancestor and supervision can never re-claim
 # its own home without a manual arm every turn.
 test_reclaims_lock_from_quiescent_fork_source() {
-  local dir source_pid out status owner_after
+  local dir source_pid out status owner_after source_state
   dir=$(make_primary_dir "$TMP_ROOT/fork-source")
   : > "$dir/state/task.meta"
   write_arm_fixture "$dir" actionable
@@ -303,22 +303,29 @@ test_reclaims_lock_from_quiescent_fork_source() {
   write_claude_transcript "$FORK_SOURCE_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)"
   write_claude_transcript "$FORK_CHILD_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
   out=$(printf '%s\n' '{"session_id":"fork"}' \
-    | CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    | CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/expected-owner"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' 2>&1); status=$?
   owner_after=$(cat "$dir/state/.lock")
+  source_state=$(ps -o state= -p "$source_pid" 2>/dev/null || true)
   if ! fork_evidence_available; then
     kill "$source_pid" 2>/dev/null || true
     wait "$source_pid" 2>/dev/null || true
     expect_code 0 "$status" "without a process start time the live owner must still be refused"
     [ "$owner_after" = "$source_pid" ] || fail "the lock moved without the evidence that justifies it"
+    case "$source_state" in
+      ''|*Z*) fail "the refused claim killed the fork source: a live captain-visible window must never be killed" ;;
+    esac
     pass "auto-arm: no process start time available, so a fork source keeps the home"
     return
   fi
   kill "$source_pid" 2>/dev/null || true
   wait "$source_pid" 2>/dev/null || true
   expect_code 2 "$status" "a proven quiescent fork source must be reclaimed and rewake supervision"
+  case "$source_state" in
+    ''|*Z*) fail "the reclaim killed the fork source: a live captain-visible window must never be killed" ;;
+  esac
   [ "$owner_after" = "$(cat "$dir/state/expected-owner")" ] \
     || fail "the forked session did not take the home: lock names $owner_after"
   [ -e "$dir/state/arm-ran" ] || fail "supervision never armed after reclaiming from the fork source"
@@ -328,7 +335,7 @@ test_reclaims_lock_from_quiescent_fork_source() {
 }
 
 test_inert_when_fork_source_resumed_work() {
-  local dir source_pid out status owner_after
+  local dir source_pid out status owner_after source_state
   fork_evidence_available || { pass "auto-arm: resumed fork source needs a process start time, refused everywhere else"; return; }
   dir=$(make_primary_dir "$TMP_ROOT/fork-source-active")
   : > "$dir/state/task.meta"
@@ -346,10 +353,14 @@ test_inert_when_fork_source_resumed_work() {
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' 2>&1); status=$?
   owner_after=$(cat "$dir/state/.lock")
+  source_state=$(ps -o state= -p "$source_pid" 2>/dev/null || true)
   kill "$source_pid" 2>/dev/null || true
   wait "$source_pid" 2>/dev/null || true
   expect_code 0 "$status" "a fork source that resumed work must keep the home"
   [ "$owner_after" = "$source_pid" ] || fail "an active fork source lost the home: lock names $owner_after"
+  case "$source_state" in
+    ''|*Z*) fail "the refusal killed the fork source: a live captain-visible window must never be killed" ;;
+  esac
   [ ! -e "$dir/state/arm-ran" ] || fail "hook armed while its fork source was still working"
   [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch while its fork source was still working"
   pass "auto-arm: a fork source that resumed work is a competing session again and keeps the home"
