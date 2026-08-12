@@ -766,8 +766,9 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
 # confirmed-dead agent plus the declared wait or captain-held transfer must retain
 # bounded pause handling.
 # A still-live agent at an external-decision gate is the disconfirming case: it
-# must surface once, while the unchanged hash must not append the same wake on
-# every watcher re-arm.
+# must surface once - carrying the reason that triggered it, since a wake with no
+# reason is unactionable - while the unchanged hash must not append the same wake
+# on every watcher re-arm.
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes bare
   dir=$(make_case exited-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
@@ -866,8 +867,100 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
   bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
   [ "$wakes" -eq 1 ] || fail "live external-decision gate should surface once, got $wakes wakes"
-  [ "$bare" -eq 1 ] || fail "live external-decision gate lost its immediate bare stale surface"
-  pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
+  [ "$bare" -eq 0 ] || fail "live external-decision gate surfaced as an unactionable bare stale wake"
+  grep -F "declared wait, first sighting" "$state/.wake-queue" >/dev/null \
+    || fail "live external-decision gate did not say what triggered its surface"
+  pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once, with its reason"
+}
+
+# A declared external wait must not be re-escalated merely because the monitoring
+# cycle restarted. Each Stop-armed cycle delivers one wake and exits, and a crew
+# idling at its prompt still renders an animated footer, so the gap between one
+# cycle and the next reliably produces a pane hash the next cycle has never seen.
+# While the "surface once" identity was that hash, every restart minted a fresh
+# first sighting and cost one supervisor turn per cycle for as long as the wait
+# lasted. Both directions are asserted here: the wait stays quiet across repeated
+# restarts, and it still cannot rot invisibly or hide a worker that died holding
+# it.
+test_declared_wait_not_reescalated_across_cycle_restarts() {
+  local dir state fakebin out capture_file statusf window key sig pid back round wakes bare status
+  dir=$(make_case declared-wait-cycle-restart); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/wait.status"
+  window="test:fm-wait"
+  printf 'idle at the prompt, waiting on CI\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/wait.meta"
+  printf 'paused: CI queued with no runner assigned; expect a long quiet stretch\n' > "$statusf"
+  back=$(( $(date +%s) - 500 ))
+  set_mtime "$back" "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-wait_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '0\n' > "$dir/churn"
+
+  # Six monitoring cycles, each with its own animated-footer captures.
+  round=1
+  while [ "$round" -le 6 ]; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=claude FM_FAKE_TMUX_CHURN_FILE="$dir/churn" \
+      FM_FAKE_CREW_STATE='state: unknown · source: none · no run attributed' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_PAUSE_RESURFACE_SECS=3600 FM_STALE_ESCALATE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    # Each cycle either exits on an actionable wake or keeps absorbing until this
+    # stops it; wait_for_exit covers both without ever blocking on a live watcher.
+    wait_for_exit "$pid" 40
+    status=$?
+    [ "$status" -eq 0 ] || [ "$status" -eq 124 ] \
+      || fail "monitoring cycle $round exited $status: $(cat "$out")"
+    round=$((round + 1))
+  done
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  [ "$wakes" -eq 1 ] || fail "a declared wait was re-escalated $wakes times across six monitoring cycles"
+  [ "$bare" -eq 0 ] || fail "a declared wait surfaced as $bare unactionable bare stale wakes"
+  grep -F "declared wait, first sighting" "$state/.wake-queue" >/dev/null \
+    || fail "the declared wait's one surface did not say what triggered it"
+  grep -F "absorbed stale (paused, awaiting external" "$state/.watch-triage.log" >/dev/null \
+    || fail "absorb accounting did not record the suppressed churned-hash sightings"
+
+  # The bound is a cadence, not a mute: age the throttle past its window and the
+  # same wait re-surfaces on its own annotated recheck, so it cannot rot unseen.
+  set_mtime "$(( $(date +%s) - 5000 ))" "$state/.paused-resurfaced-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude FM_FAKE_TMUX_CHURN_FILE="$dir/churn" \
+    FM_FAKE_CREW_STATE='state: unknown · source: none · no run attributed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_STALE_ESCALATE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || fail "an aged declared wait never came back for its bounded recheck"
+  grep -F "awaiting external" "$out" >/dev/null \
+    || fail "the aged declared wait's recheck lost its external-wait reason: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a declared wait was mislabeled a possible wedge"
+
+  # A worker that declared a wait and then DIED holding it is still escalated:
+  # the pause claim never outranks a confirmed-dead endpoint, and an animated
+  # footer cannot hide it either.
+  dir=$(make_case declared-wait-worker-died); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/wait.status"
+  printf 'idle bare shell after the agent exited\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/wait.meta"
+  printf 'paused: CI queued with no runner assigned; expect a long quiet stretch\n' > "$statusf"
+  set_mtime "$(( $(date +%s) - 500 ))" "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-wait_status"
+  printf '0\n' > "$dir/churn"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_TMUX_CHURN_FILE="$dir/churn" \
+    FM_FAKE_CREW_STATE='state: unknown · source: none · backend target gone' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_STALE_ESCALATE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || fail "a worker that died holding a declared wait was never escalated"
+  grep -F "stale: $window" "$out" >/dev/null \
+    || fail "the dead worker's escalation lost its window identity: $(cat "$out")"
+  pass "a declared wait survives monitoring-cycle restarts without re-escalating, while its bounded recheck and a dead worker still escalate"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1911,6 +2004,7 @@ test_busy_pane_default_turn_age_bound_is_3600s
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_declared_wait_not_reescalated_across_cycle_restarts
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking

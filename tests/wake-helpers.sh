@@ -76,6 +76,19 @@ fi
 if [ "${1:-}" = "capture-pane" ]; then
   if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ]; then
     cat "$FM_FAKE_TMUX_CAPTURE"
+    # Opt-in animated footer (FM_FAKE_TMUX_CHURN_FILE names a counter file). A
+    # crew idling at its prompt still renders a live footer - Claude rotates a
+    # spinner word and ticks an elapsed-seconds counter - so its pane hash
+    # changes with no crew activity at all. Each rendered word repeats
+    # FM_FAKE_TMUX_CHURN_REPEAT captures so consecutive polls still match often
+    # enough to reach the watcher's >=2 stable-hash stale threshold, which is
+    # what a real footer does at a 15s poll. Off unless a test asks for it.
+    if [ -n "${FM_FAKE_TMUX_CHURN_FILE:-}" ]; then
+      n=$(cat "$FM_FAKE_TMUX_CHURN_FILE" 2>/dev/null || echo 0)
+      case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      printf 'spinner %s - 1 shell still running\n' $(( n / ${FM_FAKE_TMUX_CHURN_REPEAT:-3} ))
+      printf '%s\n' $(( n + 1 )) > "$FM_FAKE_TMUX_CHURN_FILE"
+    fi
   fi
   exit 0
 fi
