@@ -106,6 +106,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-gh-lib.sh
+. "$SCRIPT_DIR/fm-gh-lib.sh"
 # shellcheck source=bin/fm-public-followup-lib.sh
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
@@ -368,13 +370,20 @@ remove_pr_poll_artifacts() {
   fi
 }
 
-# Resolve the PR number for a worktree branch via gh-axi. Echoes the number on a
-# single match and returns 0; returns non-zero on no match or any lookup failure,
-# so the caller treats it as "no PR found" (fail-safe).
+# Resolve the PR number for a worktree branch. Echoes the number on a single
+# match and returns 0; returns non-zero on no match or any lookup failure, so
+# the caller treats it as "no PR found" (fail-safe).
+#
+# The repository comes from bin/fm-gh-lib.sh rather than the tool's own remote
+# inference, which is what makes this lookup answerable at all: a branch name is
+# not unique across repositories, and a fork and its parent both using the
+# fm/<task-id> convention can hold the same head branch on unrelated pull
+# requests. Asking the wrong repository for "the PR on branch X" is how a
+# landed-work check ends up reading another project's merge.
 pr_number_from_branch() {
   local branch=$1 out n
   [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
+  out=$(fm_gh_query gh-axi "$WT" pr list --state all --head "$branch" --limit 1 2>/dev/null) || return 1
   n=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\),.*/\1/p' | head -1)
   [ -n "$n" ] || return 1
   printf '%s' "$n"
@@ -443,6 +452,11 @@ EOF
 # for both the PR state and head. Returns non-zero when the PR is not merged, the
 # current work is not contained in the PR head, no PR is found, or any gh error
 # occurs - the caller then falls back to the content check.
+#
+# A recorded pr= URL names its repository on its own, but a branch-derived
+# number does not, so both go through bin/fm-gh-lib.sh. A repository that cannot
+# be established there refuses the query, which lands on that same content-check
+# fallback rather than on a state read from some other repository.
 pr_is_merged() {
   local branch=$1 target view state head current
   if [ -n "$PR_URL" ]; then
@@ -451,7 +465,7 @@ pr_is_merged() {
     target=$(pr_number_from_branch "$branch") || return 1
   fi
   [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  view=$(fm_gh_query gh "$WT" pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
   state=${view%%$'\t'*}
   head=${view#*$'\t'}
   [ "$state" != "$view" ] || return 1

@@ -128,6 +128,72 @@ SH
   printf '%s\n' "$case_dir"
 }
 
+# Give the case's origin a GitHub identity while keeping every git operation on
+# the local bare repo, so the landed-work check resolves a repository exactly as
+# it does in a real clone. `git config` reads the declared URL and insteadOf
+# rewrites only the transport, which is the split bin/fm-gh-lib.sh relies on.
+# Args: case_dir [owner/repo]
+identify_origin_as_github() {
+  local case_dir=$1 owner_repo=${2:-example/repo} url
+  url="https://github.com/$owner_repo.git"
+  git -C "$case_dir/project" config remote.origin.url "$url"
+  git -C "$case_dir/project" config "url.$case_dir/origin.git.insteadOf" "$url"
+}
+
+# A gh-axi whose answer depends on whether the caller named a repository: with
+# --repo it reports no pull request for the branch, and without one it reports a
+# merged pull request belonging to another project. This is the observed defect -
+# a fork and its parent both using fm/<task-id> branch names, so an unpinned
+# branch lookup can return a stranger's merged PR - and teardown must never act
+# on the unpinned answer. Every invocation is recorded. Args: case_dir
+add_gh_axi_upstream_collision() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+pinned=no
+for arg in "$@"; do
+  case "$arg" in
+    --repo|--repo=*|-R|-R?*) pinned=yes ;;
+  esac
+done
+case "${1:-} ${2:-}" in
+  "pr list")
+    if [ "$pinned" = yes ]; then
+      printf '%s\n' "count: 0 (showing first 0)" "pull_requests[]: []"
+    else
+      printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  2287,merged"
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
+pinned=no
+for arg in "$@"; do
+  case "$arg" in
+    --repo|--repo=*|-R|-R?*) pinned=yes ;;
+    https://github.com/*/pull/*) pinned=yes ;;
+  esac
+done
+case "${1:-} ${2:-}" in
+  "pr view")
+    # Only the other project knows this number, and only when asked unpinned.
+    if [ "$pinned" = no ]; then
+      printf '%s\t%s\n' 'MERGED' '0000000000000000000000000000000000000000'
+      exit 0
+    fi
+    ;;
+esac
+echo "error: pull request not found" >&2
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
+}
+
 add_compatible_tasks_axi() {
   local case_dir=$1
   cat > "$case_dir/fakebin/tasks-axi" <<'SH'
@@ -494,6 +560,8 @@ run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
+  FM_TEST_GH_LOG="$case_dir/gh.log" \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" task-x1 "$@"
 }
@@ -687,6 +755,10 @@ test_no_pr_recorded_discovers_merged_pr_by_branch_allows() {
   local_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   pr_head=$(commit_tree_from_wt_head "$case_dir" "$local_head" "no-mistakes auto-fix")
   land_on_origin_main "$case_dir" feature.txt hello
+  # The branch lookup only reaches GitHub for a clone whose origin identifies a
+  # GitHub repository; without this the query is refused and this case would
+  # quietly pass on the content fallback instead of the discovery it names.
+  identify_origin_as_github "$case_dir"
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
   # No append_pr_meta_* call: state/task-x1.meta has no pr= or pr_head= line.
 
@@ -701,6 +773,65 @@ test_no_pr_recorded_discovers_merged_pr_by_branch_allows() {
   expect_code 0 "$rc" "no-pr-branch-discovery: teardown should succeed by discovering the merged PR from the branch name"
   ! grep -q REFUSED "$case_dir/stderr" || fail "no-pr-branch-discovery: teardown printed a REFUSED line"
   pass "teardown discovers a merged PR by branch name and tears down when no pr= was ever recorded"
+}
+
+# The landed-work check decides whether unlanded work may be discarded, so the
+# repository it asks about has to be this project's. A fork and its parent both
+# name branches fm/<task-id>, and an unpinned branch lookup prefers the parent,
+# which is how "is my branch's PR merged?" can be answered by a stranger's merge.
+# Here the work has NOT landed anywhere: if the unpinned answer were used,
+# teardown would discard it.
+test_branch_lookup_ignores_another_repositorys_merged_pr() {
+  local case_dir rc
+  case_dir=$(make_case branch-lookup-collision)
+  write_meta "$case_dir" no-mistakes ship
+  identify_origin_as_github "$case_dir"
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  add_gh_axi_upstream_collision "$case_dir"
+  # No pr= recorded, so the branch lookup is the only PR path available.
+  ! grep -qE '^(pr|pr_head)=' "$case_dir/state/task-x1.meta" \
+    || fail "branch-lookup-collision: test setup bug, meta unexpectedly has a pr= line"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] \
+    || fail "branch-lookup-collision: teardown discarded unlanded work on another repository's merged PR"
+  assert_grep REFUSED "$case_dir/stderr" \
+    "branch-lookup-collision: teardown neither refused nor explained itself"
+  assert_present "$case_dir/wt" "branch-lookup-collision: the worktree was removed"
+  assert_grep "--repo example/repo" "$case_dir/gh-axi.log" \
+    "branch-lookup-collision: the branch lookup did not name this project's repository"
+  assert_no_grep 2287 "$case_dir/stderr" \
+    "branch-lookup-collision: the other repository's PR number reached the operator"
+  pass "teardown's branch lookup names its own repository and ignores another project's merged PR"
+}
+
+# When no repository can be established the query is refused, and a refusal must
+# read as "no answer" rather than "not merged is proven" - it falls through to
+# the content check, which still refuses to discard work that never landed.
+test_unresolvable_repository_still_refuses_unlanded_work() {
+  local case_dir rc
+  case_dir=$(make_case branch-lookup-unresolvable)
+  write_meta "$case_dir" no-mistakes ship
+  # Origin stays a local path, so no GitHub repository can be derived from it.
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  add_gh_axi_upstream_collision "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] \
+    || fail "branch-lookup-unresolvable: unlanded work was discarded after an unresolvable lookup"
+  assert_grep REFUSED "$case_dir/stderr" \
+    "branch-lookup-unresolvable: teardown did not refuse"
+  [ ! -s "$case_dir/gh-axi.log" ] \
+    || fail "branch-lookup-unresolvable: an unpinned query ran anyway: $(cat "$case_dir/gh-axi.log")"
+  pass "an unresolvable repository refuses the lookup and still protects unlanded work"
 }
 
 test_squash_merged_pr_allows_replayed_unpushed_patch() {
@@ -1845,6 +1976,8 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
+test_branch_lookup_ignores_another_repositorys_merged_pr
+test_unresolvable_repository_still_refuses_unlanded_work
 test_squash_merged_pr_allows_replayed_unpushed_patch
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head

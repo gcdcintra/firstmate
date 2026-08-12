@@ -760,6 +760,109 @@ test_routine_bootstrap_contract_runs_under_system_bash() {
   pass "bootstrap routine contract runs under system /bin/bash"
 }
 
+# The session-start banner prints issue and pull-request numbers straight from
+# `gh-axi`, so whatever base repository `gh` resolves is what the captain reads
+# under this repo's own name. In a fork with an upstream remote and no
+# gh-resolved setting that is the parent project's numbers. Pinning the base
+# repository to origin is local and idempotent, and it corrects every consumer -
+# banner, gh, and gh-axi - at once.
+#
+# Args: case_name [--detect-only] [remote-spec...] ("<name>=<url>")
+run_gh_base_repo_fixture() {
+  local case_name=$1 detect_only=0 case_dir fakebin pair remote url
+  shift
+  if [ "${1:-}" = --detect-only ]; then detect_only=1; shift; fi
+  case_dir="$TMP_ROOT/$case_name"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  # A gh that records `repo set-default` so a test can prove whether the pin was
+  # attempted, and applies it the way the real one does.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = repo ] && [ "${2:-}" = set-default ]; then
+  printf '%s\n' "$3" >> "$FM_TEST_SET_DEFAULT_LOG"
+  git config remote.origin.gh-resolved base
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/gh"
+  git init -q "$case_dir/home"
+  for pair in "$@"; do
+    remote=${pair%%=*}
+    url=${pair#*=}
+    git -C "$case_dir/home" remote add "$remote" "$url"
+  done
+  : > "$case_dir/set-default.log"
+  if [ "$detect_only" -eq 1 ]; then
+    PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_TEST_SET_DEFAULT_LOG="$case_dir/set-default.log" FM_BOOTSTRAP_DETECT_ONLY=1 \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null
+  else
+    PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_TEST_SET_DEFAULT_LOG="$case_dir/set-default.log" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null
+  fi
+}
+
+test_gh_base_repo_is_pinned_to_origin() {
+  local out case_dir
+  out=$(run_gh_base_repo_fixture gh-base-pin \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-pin"
+  assert_contains "$out" "BOOTSTRAP_INFO: pinned GitHub pull-request and issue queries" \
+    "bootstrap did not report pinning the base repository"
+  assert_grep "gcdcintra/firstmate" "$case_dir/set-default.log" \
+    "bootstrap did not pin the base repository to origin"
+  [ "$(git -C "$case_dir/home" config --get remote.origin.gh-resolved)" = base ] \
+    || fail "the base repository pin was not recorded in the checkout"
+
+  # Idempotent: a second run has nothing left to do and says nothing.
+  : > "$case_dir/set-default.log"
+  out=$(PATH="$(fm_fakebin "$case_dir"):$BASE_PATH" FM_HOME="$case_dir/home" \
+    FM_ROOT_OVERRIDE="$case_dir/home" FM_TEST_SET_DEFAULT_LOG="$case_dir/set-default.log" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_not_contains "$out" "GH_BASE_REPO" "an already-pinned checkout still reported a problem"
+  assert_not_contains "$out" "BOOTSTRAP_INFO: pinned" "an already-pinned checkout pinned again"
+  [ ! -s "$case_dir/set-default.log" ] || fail "an already-pinned checkout re-ran the pin"
+  pass "bootstrap pins the GitHub base repository to origin, once"
+}
+
+test_gh_base_repo_read_only_session_reports_without_writing() {
+  local out case_dir
+  out=$(run_gh_base_repo_fixture gh-base-detect --detect-only \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-detect"
+  assert_contains "$out" "GH_BASE_REPO:" "a read-only session did not report the wrong base repository"
+  assert_contains "$out" "gcdcintra/firstmate" "the report did not name the repository that should answer"
+  assert_contains "$out" "read-only session" "the read-only report did not say why it stopped short"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a read-only session wrote to the checkout"
+  [ -z "$(git -C "$case_dir/home" config --get remote.origin.gh-resolved || true)" ] \
+    || fail "a read-only session changed the checkout's git config"
+  pass "a read-only session reports the wrong base repository without writing to the checkout"
+}
+
+test_gh_base_repo_leaves_unambiguous_checkouts_alone() {
+  local out case_dir
+  # A single GitHub remote gives `gh` no choice to get wrong, and a non-GitHub
+  # origin is not this check's business. Neither should be touched.
+  out=$(run_gh_base_repo_fixture gh-base-single "origin=https://github.com/gcdcintra/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-single"
+  [ -z "$out" ] || fail "a single-remote checkout was not left silent, got: $out"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a single-remote checkout was pinned needlessly"
+
+  out=$(run_gh_base_repo_fixture gh-base-nongithub \
+    "origin=https://gitlab.com/group/project.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-nongithub"
+  [ -z "$out" ] || fail "a non-GitHub origin was not left silent, got: $out"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a non-GitHub origin was pinned to something"
+  pass "bootstrap leaves unambiguous and non-GitHub checkouts untouched"
+}
+
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info() {
   local case_dir fakebin out expect
   case_dir="$TMP_ROOT/dispatch-active"
@@ -851,5 +954,8 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_routine_bootstrap_confirmations_are_silent
 test_routine_bootstrap_contract_runs_under_system_bash
+test_gh_base_repo_is_pinned_to_origin
+test_gh_base_repo_read_only_session_reports_without_writing
+test_gh_base_repo_leaves_unambiguous_checkouts_alone
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
 test_crew_dispatch_validation
