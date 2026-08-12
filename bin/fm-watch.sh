@@ -20,7 +20,12 @@
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
-#                          re-surface cadence, never as a wedge. Only when neither
+#                          re-surface cadence, never as a wedge; it surfaces once on
+#                          first sighting, with a reason, when the crew's own state
+#                          does not confirm the wait, and that first sighting is
+#                          bounded by the cadence marker rather than by the pane hash
+#                          (an idle harness animates its footer, so the hash alone
+#                          would re-arm a first sighting every cycle). Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
@@ -411,22 +416,48 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
+# Surface a stale pane whose status log carries no captain-relevant line. A crew
+# with NO declared external wait surfaces immediately on every distinct stale
+# hash, unchanged.
+#
+# A crew whose last status line DECLARES a wait is bounded instead. The
+# declaration is a claim, not proof, so the FIRST sighting still surfaces
+# promptly - a live agent may really be parked at a gate it called a pause - but
+# every later sighting belongs to handle_paused_stale's long cadence. The
+# first-sighting identity is the presence of the .paused-resurfaced-<key>
+# throttle marker, NOT the pane hash: a pane hash is not a stable identity for an
+# idle harness. A crew sitting at its prompt still renders an animated footer
+# (Claude rotates its spinner word and ticks an elapsed-seconds counter), so it
+# mints a new hash - and, when the hash was the identity, a new "first sighting" -
+# on nearly every capture. That is what re-escalated a declared wait once per
+# monitoring cycle for as long as the wait lasted: each cycle's restart gap
+# guaranteed at least one fresh hash. PAUSE_RESURFACE_SECS stays stated once, in
+# handle_paused_stale.
 surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key task last
+  local win=$1 h=$2 key task last reason
   key=$(printf '%s' "$win" | tr ':/.' '___')
-  fm_wake_append stale "$win" "stale: $win" || exit 1
-  printf '%s' "$h" > "$STATE/.stale-$key"
-  rm -f "$STATE/.stale-since-$key"
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
   if status_is_paused_or_captain_held "$last"; then
-    : > "$STATE/.paused-$key"
-    date +%s > "$STATE/.paused-rechecked-$key"
-    date +%s > "$STATE/.paused-resurfaced-$key"
+    if [ -e "$STATE/.paused-resurfaced-$key" ]; then
+      handle_paused_stale "$win" "$task" "$h"
+    else
+      reason="stale: $win (declared wait, first sighting - the worker's own state does not confirm the wait and its endpoint is still live, so check it once; later sightings use the long pause recheck cadence)"
+      fm_wake_append stale "$win" "$reason" || exit 1
+      printf '%s' "$h" > "$STATE/.stale-$key"
+      rm -f "$STATE/.stale-since-$key"
+      : > "$STATE/.paused-$key"
+      date +%s > "$STATE/.paused-rechecked-$key"
+      date +%s > "$STATE/.paused-resurfaced-$key"
+      wake "$reason"
+    fi
   else
+    fm_wake_append stale "$win" "stale: $win" || exit 1
+    printf '%s' "$h" > "$STATE/.stale-$key"
+    rm -f "$STATE/.stale-since-$key"
     rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
+    wake "stale: $win"
   fi
-  wake "stale: $win"
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -1078,8 +1109,15 @@ EOF
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
         case "$(pause_state_class "$w" "$task")" in
-          paused) handle_paused_stale "$w" "$task" "$h" ;;
-          *)      clear_pause_tracking "$w" ;;
+          paused)  handle_paused_stale "$w" "$task" "$h" ;;
+          working) clear_pause_tracking "$w" ;;
+          # An UNCORROBORATED declared wait keeps its bounded-cadence tracking.
+          # The wait is still declared - the guard at the top of this loop owns
+          # clearing once it is not - so the crew has not resumed and nothing
+          # here has been decided. Dropping .paused-resurfaced-<key> at this
+          # point is what re-armed a fresh first sighting on every churned hash,
+          # and an idle harness churns its hash on nearly every capture.
+          *)       : ;;
         esac
       else
         [ -e "$pf" ] && clear_pause_tracking "$w"
