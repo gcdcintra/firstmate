@@ -91,6 +91,7 @@ EXIT_BLOCKED=4
 
 # How far the `-vN` search walks before giving up rather than spinning.
 MAX_ATTEMPT=${FM_NM_CUSTODY_MAX_ATTEMPT:-20}
+case "$MAX_ATTEMPT" in ''|*[!0-9]*) MAX_ATTEMPT=20 ;; esac
 # Every no-mistakes and ls-remote call is bounded: this runs inside a worker's
 # turn and must never hang it.
 NM_TIMEOUT=${FM_NM_CUSTODY_TIMEOUT:-60}
@@ -401,19 +402,23 @@ if printf '%s\n' "$PROBE_OUT" | grep -q '^branch_sync:'; then
   PROBE_SAFETY=$(toon_field safety)
   SYNC_OUT=""
 fi
-if [ "$PROBE_SAFETY" != blocked_recover_gate_diverged ]; then
-  if [ -z "$PROBE_SAFETY" ]; then
+case "$PROBE_SAFETY" in
+  '')
     echo "error: the confirming \`no-mistakes axi sync --recover --keep-local\` gave no readable answer; nothing was created" >&2
-    exit "$EXIT_BLOCKED"
-  fi
-  report_line working \
-    "no-mistakes custody on $BRANCH returned through the supported recovery after all (safety: $PROBE_SAFETY) - the local head $(short "$CURRENT_HEAD") is unchanged and no branch was created; a pipeline run still died mid-flight, which is why this ran"
-  echo
-  echo "This did NOT need the sidestep: custody came back through no-mistakes' own guarded path,"
-  echo "keeping the local head, dropping no commit and rewriting no history."
-  echo "Validate on $BRANCH as usual."
-  exit 0
-fi
+    exit "$EXIT_BLOCKED" ;;
+  blocked_recover_gate_diverged) : ;;
+  blocked_*)
+    echo "error: the confirming \`no-mistakes axi sync --recover --keep-local\` refused with safety: $PROBE_SAFETY - custody was not returned and $BRANCH is still held; nothing was created" >&2
+    exit "$EXIT_BLOCKED" ;;
+  *)
+    report_line working \
+      "no-mistakes custody on $BRANCH returned through the supported recovery after all (safety: $PROBE_SAFETY) - the local head $(short "$CURRENT_HEAD") is unchanged and no branch was created; a pipeline run still died mid-flight, which is why this ran"
+    echo
+    echo "This did NOT need the sidestep: custody came back through no-mistakes' own guarded path,"
+    echo "keeping the local head, dropping no commit and rewriting no history."
+    echo "Validate on $BRANCH as usual."
+    exit 0 ;;
+esac
 
 # Apply the sidestep: a plain branch at the identical head. No -B, no force, no
 # reset, no delete - the stranded ref is not touched at all.

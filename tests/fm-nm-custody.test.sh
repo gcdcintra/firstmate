@@ -124,13 +124,13 @@ diverged_report() {  # <branch> <local-head> <preserved> <gate-head>
 # stranded_case <name> -> sets DIR/GATE/HEAD/FAKEBIN globals for a stranded
 # branch: a terminal run holding custody at a preserved head the gate is not at.
 DIR=""; GATE=""; HEAD=""; FAKEBIN=""
-stranded_case() {  # <name> [branch]
-  local name=$1 branch=${2:-feat/work} preserved
+stranded_case() {  # <name> [branch] [clean]
+  local name=$1 branch=${2:-feat/work} clean=${3:-true} preserved
   read -r DIR GATE HEAD < <(make_repo "$name" "$branch")
   # A head the gate is NOT at: the commits the dead run made and never published.
   preserved=$(printf '%s' "$HEAD" | tr '0-9a-f' '1-9a-f0')
   FAKEBIN=$(fm_fakebin "$TMP/$name-bin")
-  sync_report "$branch" "$HEAD" true 01KZW462QQ0DRRMFBMPDDP97YR failed \
+  sync_report "$branch" "$HEAD" "$clean" 01KZW462QQ0DRRMFBMPDDP97YR failed \
     "$preserved" blocked_pipeline_owned_recoverable recover_custody > "$TMP/$name.check"
   diverged_report "$branch" "$HEAD" "$preserved" > "$TMP/$name.recover"
   install_nm "$FAKEBIN" "$TMP/$name.check" "$TMP/$name.recover"
@@ -274,9 +274,8 @@ pass "an unreadable gate head classifies unknown rather than stranded"
 # --- safety refusals --------------------------------------------------------
 
 # Uncommitted work: refuse rather than carry it onto a new branch silently.
-stranded_case dirty
+stranded_case dirty feat/work false
 printf 'scratch\n' > "$DIR/uncommitted.txt"
-sed -i 's/    clean: true/    clean: false/' "$TMP/dirty.check"
 out=$(run_custody "$FAKEBIN" recover --dir "$DIR"); code=$?
 expect_code 4 "$code" "recover must refuse a dirty worktree"
 assert_contains "$out" "uncommitted changes" "the refusal must name the reason"
@@ -295,6 +294,26 @@ expect_code 0 "$code" "custody returned by the supported probe is a usable outco
 assert_contains "$out" "returned through the supported recovery" \
   "an unexpected recovery must be reported, not silently treated as a sidestep"
 pass "custody returned by the confirming probe creates no branch and is reported"
+
+# Any other blocked_* refusal - including a renamed or unrecognized diverged
+# code - means the branch is STILL held: block honestly, never claim a recovery.
+stranded_case probeheld
+sync_report feat/work "$HEAD" true 01KZW462QQ0DRRMFBMPDDP97YR failed "$HEAD" \
+  blocked_recover_gate_diverged_v2 > "$TMP/probeheld.recover"
+status="$TMP/probeheld.status"
+: > "$status"
+out=$(run_custody "$FAKEBIN" recover --dir "$DIR" --status "$status"); code=$?
+expect_code 4 "$code" "an unrecognized blocked_* probe refusal must block"
+assert_contains "$out" "blocked_recover_gate_diverged_v2" "the refusal must name the safety code that came back"
+assert_contains "$out" "custody was not returned" "the refusal must say custody was not returned"
+assert_not_contains "$out" "returned through the supported recovery" \
+  "an unrecognized refusal must never be reported as a successful recovery"
+[ "$(git -C "$DIR" symbolic-ref --short HEAD)" = feat/work ] \
+  || fail "a branch was created despite the probe refusing"
+[ -z "$(git -C "$DIR" for-each-ref --format='%(refname:short)' refs/heads/feat/work-v2)" ] \
+  || fail "recover created a branch despite the probe refusing"
+[ ! -s "$status" ] || fail "a status line was appended despite the probe refusing"
+pass "an unrecognized blocked_* probe refusal blocks and creates nothing"
 
 stranded_case probemute
 : > "$TMP/probemute.recover"
