@@ -200,6 +200,35 @@ fm_backend_tmux_agent_state() {  # <target>
   esac
 }
 
+# fm_backend_tmux_agent_pid: the pid of the harness agent running in <target>,
+# for the CPU-progress read in bin/fm-cpu-progress-lib.sh. Resolved as the pane
+# tty's FOREGROUND PROCESS GROUP LEADER: `#{pane_pid}` is the pane's shell (the
+# agent is launched by typing into it, so it is a descendant, not the pane
+# process), and field 8 of that shell's /proc stat is the tty's current
+# foreground pgid, whose leader is the agent regardless of nesting depth.
+# Guarded by the agent_state inventory first, because tmux silently falls back
+# to the ACTIVE window for an absent target and would otherwise hand back a
+# different task's pid. Fails on any doubt; the caller reads a failure as
+# `unknown`, which escalates.
+fm_backend_tmux_agent_pid() {  # <target>
+  local target=$1 pane_pid tpgid
+  [ "$(fm_backend_tmux_agent_state "$target")" = alive ] || return 1
+  pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null) || return 1
+  case "$pane_pid" in ''|*[!0-9]*) return 1 ;; esac
+  tpgid=$(awk '{
+    n = 0
+    for (i = length($0); i > 0; i--) { if (substr($0, i, 1) == ")") { n = i; break } }
+    if (n == 0) exit 1
+    split(substr($0, n + 2), f, " ")
+    if (f[6] == "") exit 1
+    print f[6]
+  }' "/proc/$pane_pid/stat" 2>/dev/null) || return 1
+  case "$tpgid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$tpgid" -gt 1 ] || return 1
+  [ -r "/proc/$tpgid/stat" ] || return 1
+  printf '%s' "$tpgid"
+}
+
 # Backward-compatible three-state view for callers that only need a yes/no
 # agent verdict. The detailed state contract is owned by fm_backend_agent_state.
 fm_backend_tmux_agent_alive() {  # <target>

@@ -21,6 +21,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-classify-lib.sh"
+# The worker-CPU cases read the same counters the watcher does, to bind a test
+# fixture process to a pane's CPU record.
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-cpu-progress-lib.sh"
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
@@ -1516,6 +1520,216 @@ test_busy_pane_default_turn_age_bound_is_3600s() {
   pass "the production default busy-turn-age bound is 3600s (5min under does not wedge, 66min over does)"
 }
 
+# --- worker CPU progress before a wedge escalation --------------------------
+#
+# 2026-08-11 reproduction: sm-cf-nf11-labor spent over 100 minutes inside ONE
+# agent turn driving an app through end-to-end verification. A worker only
+# reaches its status file BETWEEN turns, so it could not declare a pause, and
+# its pane output was starved by the tool calls - it was escalated as a possible
+# wedge seven times, each costing a supervisor turn to disprove with a single
+# /proc CPU read. These cases pin all three outcomes of consulting that counter
+# first: a productive turn is deferred, a hung worker still escalates, and a
+# worker whose counter is flat or unreadable still escalates.
+#
+# The fixtures bind the pane's CPU record to a REAL process the test controls,
+# then let the watcher measure it over real time (Phase A matures the sampling
+# window, Phase B decides). Only the pid binding is seeded; the verdict itself
+# is always measured, because a canned verdict would not prove the counter is
+# what separates a working worker from a wedged one.
+
+CPU_KIDS=()
+cpu_reap_kids() {
+  local p
+  for p in "${CPU_KIDS[@]:-}"; do
+    [ -n "$p" ] || continue
+    kill "$p" 2>/dev/null || true
+    wait "$p" 2>/dev/null || true
+  done
+  CPU_KIDS=()
+}
+
+# Self-terminating so a killed test run can never leave a spin loop burning a
+# core on a machine shared with other workers.
+CPU_FIXTURE_LIFE=120
+CPU_SPAWNED=""
+spawn_cpu_fixture() {  # <busy|hung>
+  case "$1" in
+    busy) bash -c "end=\$((SECONDS + $CPU_FIXTURE_LIFE)); while [ \$SECONDS -lt \$end ]; do :; done" >/dev/null 2>&1 & ;;
+    *)    bash -c "exec sleep $CPU_FIXTURE_LIFE" >/dev/null 2>&1 & ;;
+  esac
+  CPU_SPAWNED=$!
+  CPU_KIDS+=("$CPU_SPAWNED")
+}
+
+# seed_cpu_anchor: bind <key>'s CPU record to <pid> with no verdict yet, so the
+# watcher measures the real process rather than reading a canned answer.
+seed_cpu_anchor() {  # <state> <key> <pid>
+  local state=$1 key=$2 pid=$3 start ticks
+  start=$(fm_cpu_progress_starttime "$pid") || fail "could not read start time of fixture process $pid"
+  ticks=$(fm_cpu_progress_ticks "$pid") || fail "could not read CPU counters of fixture process $pid"
+  printf 'v1 pid=%s start=%s ticks=%s ts=%s class=unknown delta=0 window=0\n' \
+    "$pid" "$start" "$ticks" "$(date +%s)" > "$state/.cpu-$key"
+}
+
+# cpu_wedge_case: the shared fixture - a busy pane whose completed-turn age is
+# past the bound, which is exactly the state the reproduction reached.
+cpu_wedge_case() {  # <name> <window> -> echoes dir
+  local name=$1 window=$2 dir state id key
+  dir=$(make_case "$name"); state="$dir/state"
+  id=${window#*:fm-}
+  printf 'Working...' > "$dir/pane.txt"
+  printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/$id.meta"
+  record_pi_busy "$state" "$id"
+  printf 'working: setup complete\n' > "$state/$id.status"
+  printf '%s' "$(seen_sig "$state/$id.status")" > "$state/.seen-${id}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "Working...")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  touch -t 200001010000 "$state/$id.meta"
+  printf '%s\n' "$dir"
+}
+
+test_long_productive_turn_is_not_escalated_as_a_wedge() {
+  local dir state fakebin out window key pid
+  window="test:fm-cpu-busy"
+  dir=$(cpu_wedge_case cpu-progress-productive "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  # Phase A: no escalation is due yet, so the watcher just matures the window
+  # by measuring the real process on each poll.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "the productive-turn fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the spinning worker as progressing: $(cat "$state/.cpu-$key")"; }
+
+  # Phase B: the wedge timer is now well past the threshold. Before this change
+  # that escalated unconditionally; now the measured CPU progress defers it.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "a worker inside a long productive turn was escalated as a possible wedge: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { cpu_reap_kids; reap "$pid"; fail "a productive long turn printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { cpu_reap_kids; reap "$pid"; fail "a productive long turn queued a wake"; }
+  reap "$pid"
+  cpu_reap_kids
+  pass "a worker inside a long productive turn is not escalated as a possible wedge while its CPU counter keeps moving"
+}
+
+test_hung_worker_still_escalates_with_its_evidence() {
+  local dir state fakebin out window key pid
+  window="test:fm-cpu-hung"
+  dir=$(cpu_wedge_case cpu-progress-hung "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  spawn_cpu_fixture hung
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "the hung fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=flat' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the hung worker as flat: $(cat "$state/.cpu-$key")"; }
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { cpu_reap_kids; fail "a hung worker did not escalate"; }
+  cpu_reap_kids
+  grep -F "possible wedge" "$out" >/dev/null || fail "the hung-worker escalation did not flag a possible wedge"
+  # An escalation with no observation is unactionable: it must carry what it saw.
+  grep -F "CPU ticks in" "$out" >/dev/null \
+    || fail "the hung-worker escalation carried no CPU evidence: $(cat "$out")"
+  pass "a hung worker still escalates, and its escalation reports the flat CPU reading it observed"
+}
+
+# The 2026-08-10 socket wedge held 539136 bytes in a TCP send queue with a
+# near-flat counter, invisible to every application-level signal. A pane whose
+# CPU cannot be measured at all is the same class of risk, so both must escalate
+# rather than be excused: measurement failure degrades toward noise, never
+# toward blindness.
+test_unmeasurable_worker_still_escalates() {
+  local dir state fakebin out window key pid
+  window="test:fm-cpu-unknown"
+  dir=$(cpu_wedge_case cpu-progress-unknown "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # No CPU record seeded and no resolvable worker process behind the fake pane.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || fail "a worker whose CPU cannot be measured did not escalate"
+  grep -F "possible wedge" "$out" >/dev/null || fail "the unmeasurable-worker escalation did not flag a possible wedge"
+  grep -F "could not resolve the worker process" "$out" >/dev/null \
+    || fail "the unmeasurable-worker escalation did not say why it could not measure: $(cat "$out")"
+  pass "a worker whose CPU cannot be measured escalates as before, and the reason says the measurement failed"
+}
+
+# CPU progress cannot tell productive work from a wedge that SPINS, so deferral
+# is capped rather than indefinite and the escalation names the distinction.
+test_cpu_progress_deferral_is_bounded() {
+  local dir state fakebin out window key pid
+  window="test:fm-cpu-capped"
+  dir=$(cpu_wedge_case cpu-progress-capped "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "the deferral-cap fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { cpu_reap_kids; fail "CPU-progress deferral was not bounded"; }
+  cpu_reap_kids
+  grep -F "possible wedge" "$out" >/dev/null || fail "the capped-deferral escalation did not flag a possible wedge"
+  grep -F "spin loop" "$out" >/dev/null \
+    || fail "the capped-deferral escalation did not name the spin-loop case it cannot rule out: $(cat "$out")"
+  pass "CPU-progress deferral is bounded, and the escalation past the cap names the spin loop it cannot see"
+}
+
 test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
   local dir state fakebin out capture_file window key pane_hash sig pid since
   dir=$(make_case nonterminal-stale-timer-repair); state="$dir/state"; fakebin="$dir/fakebin"
@@ -2072,6 +2286,10 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound
 test_busy_pane_turn_end_touch_resets_age
 test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
 test_busy_pane_default_turn_age_bound_is_3600s
+test_long_productive_turn_is_not_escalated_as_a_wedge
+test_hung_worker_still_escalates_with_its_evidence
+test_unmeasurable_worker_still_escalates
+test_cpu_progress_deferral_is_bounded
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces

@@ -894,6 +894,25 @@ fm_backend_agent_state() {  # <backend> <target>
   esac
 }
 
+# fm_backend_agent_pid: the pid of the harness agent process running at
+# <target>, printed on stdout, or a non-zero exit when this backend cannot
+# resolve one or the read is in any way doubtful. Its only consumer is the
+# CPU-progress read in bin/fm-cpu-progress-lib.sh, whose contract turns a
+# failure into `unknown` - which escalates - so a backend with no resolver
+# simply keeps the pre-existing wedge behavior rather than being blinded.
+# Zellij, Orca, and cmux have no resolver: none of them exposes a pane's
+# foreground process group through a verified interface the way tmux's tty
+# tpgid and Herdr's process-info do.
+fm_backend_agent_pid() {  # <backend> <target>
+  local backend=$1 target=$2
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_agent_pid "$target" ;;
+    herdr) fm_backend_herdr_agent_pid "$target" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Backward-compatible three-state view for existing callers. An
 # authoritatively missing endpoint is confidently not a live agent, while every
 # ambiguous, unreadable, or unverified result stays unknown.
