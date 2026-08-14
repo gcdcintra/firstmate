@@ -354,9 +354,9 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         # The age counts seconds without PANE OUTPUT, which is not the same as
         # seconds idle once CPU progress has deferred: say what was measured.
         if [ "$cpu_class" = progressing ]; then
-          reason="stale: $win (no pane output for ${age}s, possible wedge, escalation $n; $cpu_detail, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent)"
+          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent)"
         else
-          reason="stale: $win (no pane output for ${age}s, possible wedge, escalation $n; $cpu_detail)"
+          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail)"
         fi
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="$reason (demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"

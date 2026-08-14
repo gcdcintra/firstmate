@@ -166,9 +166,9 @@ test_measurable_but_below_floor_is_flat() {
   local rec v used
   rec=$(new_record below-floor); rm -f "$rec"
   spawn_busy; FAKE_PID=$SPAWNED
-  # Floor of 6000 ticks/min (60 ticks/s, i.e. 60% of a core) over a 3s window
-  # is 180 ticks; one spinning process cannot reach that here, but it will
-  # certainly log some.
+  # Floor of 60000 ticks/min (1000 ticks/s - ten cores' worth at the typical
+  # 100 Hz tick rate) over the ~4s matured window is ~4000 ticks; one spinning
+  # process cannot reach that here, but it will certainly log some.
   FM_CPU_PROGRESS_WINDOW=3 FM_CPU_PROGRESS_MIN_TICKS_PER_MIN=60000 \
     fm_cpu_progress_check "$rec" tmux test:win >/dev/null
   settle_window 4

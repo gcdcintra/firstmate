@@ -1212,8 +1212,14 @@ handle_wake() {  # <reason> <state>
     stale:*)  kind=stale; arg="${reason#stale: }"; stale_detail="${arg#"$arg"}"
               case "$arg" in *" ("*) stale_detail="${arg#*" ("}"; arg="${arg%% \(*}" ;; esac
               decision=$(classify_stale "$arg" "$state")
+              # A watcher wedge escalation carries the shared
+              # FM_CLASSIFY_WEDGE_REASON_SEGMENT (fm-classify-lib.sh owns the
+              # one definition for producer and matcher): force-escalate it
+              # past status-log absorption, because a transient stale marker
+              # for a pane that still looks busy is deleted by housekeeping's
+              # recheck and a worker wedged mid-turn would never surface.
               case "$stale_detail" in
-                idle\ *s,\ possible\ wedge,\ escalation\ *)
+                *"$FM_CLASSIFY_WEDGE_REASON_SEGMENT"*)
                   decision="escalate|${reason#stale: }" ;;
               esac ;;
     check:*)  decision=$(classify_check "$reason") ;;
