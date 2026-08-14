@@ -131,6 +131,9 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+# The stranded-branch recovery a no-mistakes worker may need mid-validation.
+# Only the worker can run it: it creates a branch in the project worktree.
+CUSTODY_HELPER=$(shell_quote "$FM_ROOT/bin/fm-nm-custody.sh")
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -375,7 +378,10 @@ Follow the guidance no-mistakes itself provides for the mechanics: it loads when
 When starting no-mistakes, make \`--intent\` preserve all relevant content from this brief's \`# Task\` section plus every later accepted Firstmate requirement, clarification, constraint, exclusion, and supersession, carrying only each requirement's current accepted form; retain direct requirements instead of substituting a diff summary, and exclude generic operational, status, delivery, and other scaffold boilerplate unless it is task-specific.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
 
-Two firstmate-specific rules layer on top of that guidance:
+Three firstmate-specific rules layer on top of that guidance:
+- If the pipeline will not return custody of your branch because the gate has diverged, a run died mid-flight and its guarded recovery can never succeed again.
+  Do not hand-edit refs or the gate: run \`$CUSTODY_HELPER recover --status $STATUS_FILE\` and continue validating on the branch it creates at your identical head.
+  It refuses unless the branch is genuinely stranded, so it is also the safe way to tell that state apart from an ordinary one you should recover normally.
 - ask-user findings are never yours to answer: escalate to firstmate (rule 6) and stop.
   Firstmate applies the authority contract in its \`AGENTS.md\` and obtains any required captain decision.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
