@@ -156,8 +156,8 @@ SH
     node --input-type=module 2>&1 <<'JS'
 import { pathToFileURL } from "node:url";
 const { encodeFirstmateOperationalInput } = await import(pathToFileURL(process.env.HELPER).href);
-// Large enough that the pipe buffer cannot absorb the write, so the encoder's
-// early exit is certain to break the pipe underneath the adapter.
+// Large enough that the pipe buffer cannot absorb the write, so the early
+// exit of the encoder is certain to break the pipe underneath the adapter.
 const body = "x".repeat(1024 * 1024);
 try {
   await encodeFirstmateOperationalInput(process.env.FM_TEST_ROOT, "watcher", body);

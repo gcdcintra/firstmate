@@ -1326,7 +1326,7 @@ const event = { event: { type: "session.idle", properties: { sessionID: "session
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
 await hooks.event(event);
 // The idle hook starts the arm attempt without awaiting it, so join that exact
-// attempt through the plugin's own coordinator rather than guessing how long it
+// attempt through the plugin-owned coordinator rather than guessing how long it
 // takes to settle. A fixed sleep that expires first leaves the attempt in
 // flight, and the second event below then joins THAT stale attempt - which read
 // the unowned lock - so the arm never starts and no later wait can rescue it.
