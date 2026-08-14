@@ -140,6 +140,38 @@ JS
   pass "operational input: the OpenCode adapter constructs through the canonical owner"
 }
 
+test_cross_language_adapter_survives_an_encoder_that_never_reads_stdin() {
+  local case_root out
+  case_root=$(fm_test_tmproot fm-operational-input-early-exit)
+  mkdir -p "$case_root/bin"
+  cat > "$case_root/bin/fm-operational-input.sh" <<'SH'
+#!/usr/bin/env bash
+# Stands in for version skew: an encoder that does not recognize the adapter's
+# subcommand prints usage and exits before it ever reads the body from stdin.
+printf 'unrecognized subcommand\n' >&2
+exit 2
+SH
+  chmod +x "$case_root/bin/fm-operational-input.sh"
+  out=$(FM_TEST_ROOT="$case_root" HELPER="$ROOT/.opencode/plugins/lib/fm-operational-input.js" \
+    node --input-type=module 2>&1 <<'JS'
+import { pathToFileURL } from "node:url";
+const { encodeFirstmateOperationalInput } = await import(pathToFileURL(process.env.HELPER).href);
+// Large enough that the pipe buffer cannot absorb the write, so the early
+// exit of the encoder is certain to break the pipe underneath the adapter.
+const body = "x".repeat(1024 * 1024);
+try {
+  await encodeFirstmateOperationalInput(process.env.FM_TEST_ROOT, "watcher", body);
+  process.stdout.write("RESOLVED");
+} catch (error) {
+  process.stdout.write(`REJECTED: ${error.message}`);
+}
+JS
+  ) || fail "the adapter took its whole host down instead of rejecting: $out"
+  [ "$out" = "REJECTED: unrecognized subcommand" ] \
+    || fail "expected the encoder's own diagnostic, got: $out"
+  pass "operational input: an encoder that exits before draining stdin rejects instead of crashing the host"
+}
+
 test_invalid_current_encodings_are_rejected() {
   local output
   output=$(printf 'body' | "$OWNER" encode legacy-operational 2>/dev/null) \
@@ -157,4 +189,5 @@ test_landed_untyped_prefix_is_explicitly_legacy
 test_isolated_legacy_matrix
 test_genuine_near_misses_remain_unclassified
 test_cross_language_adapter_uses_the_owner
+test_cross_language_adapter_survives_an_encoder_that_never_reads_stdin
 test_invalid_current_encodings_are_rejected

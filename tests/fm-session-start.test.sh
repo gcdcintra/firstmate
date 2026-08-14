@@ -54,6 +54,27 @@ new_world() {
   printf '%s|%s|%s\n' "$root" "$home" "$fakebin"
 }
 
+# mask_missing_tool <dir> <tool>: echo the path of a BASH_ENV file that makes
+# `command -v <tool>` fail for every bash the digest composes, so a test that
+# needs a MISSING diagnostic gets one on any host.
+# Deleting the stub from $fakebin is NOT enough: run_session_start appends the
+# real BASE_PATH, so a host that ships the tool in /usr/bin still resolves it
+# and the expected diagnostic never appears. Absence cannot be arranged from a
+# PATH prefix; masking the lookup can. Mirrors fm-bootstrap.test.sh's masking.
+mask_missing_tool() {
+  local dir=$1 tool=$2 mask
+  mask="$dir/mask-missing-$tool.bash"
+  cat > "$mask" <<SH
+command() {
+  if [ "\${1:-}" = -v ] && [ "\${2:-}" = $tool ]; then
+    return 1
+  fi
+  builtin command "\$@"
+}
+SH
+  printf '%s\n' "$mask"
+}
+
 # make_fake_toolchain <fakebin>: every tool fm-bootstrap.sh detects, present
 # and compatible, so its own detect-only section stays quiet except where a
 # test deliberately breaks one. Mirrors fm-bootstrap.test.sh's fixture.
@@ -760,7 +781,7 @@ SH
 # --- output ordering ----------------------------------------------------------
 
 test_output_ordering_diagnostics_lead() {
-  local rec root home fakebin out lock_line boot_line wake_line context_line fleet_line next_line
+  local rec root home fakebin mask out lock_line boot_line wake_line context_line fleet_line next_line
   rec=$(new_world ordering)
   IFS='|' read -r root home fakebin <<EOF
 $rec
@@ -768,11 +789,11 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   # Force a MISSING diagnostic line so the bootstrap section is non-trivial.
-  rm -f "$fakebin/node"
+  mask=$(mask_missing_tool "$home" node)
 
   printf 'window=fm-sess:w1\nkind=ship\n' > "$home/state/task-a.meta"
 
-  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  out=$(BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
 
   lock_line=$(printf '%s\n' "$out" | grep -n '^LOCK$' | head -1 | cut -d: -f1)
   boot_line=$(printf '%s\n' "$out" | grep -n '^BOOTSTRAP$' | head -1 | cut -d: -f1)
@@ -810,15 +831,7 @@ EOF
     rm -f "$fakebin/tmux"
     fm_fake_exit0 "$fakebin" herdr jq
     printf '%s\n' manual > "$home/config/backlog-backend"
-    mask="$home/mask-tmux.bash"
-    cat > "$mask" <<'SH'
-command() {
-  if [ "${1:-}" = -v ] && [ "${2:-}" = tmux ]; then
-    return 1
-  fi
-  builtin command "$@"
-}
-SH
+    mask=$(mask_missing_tool "$home" tmux)
     if [ "$mode" = configured ]; then
       printf '%s\n' herdr > "$home/config/backend"
       out=$(TMUX='' HERDR_ENV='' BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
@@ -1043,19 +1056,19 @@ EOF
 # --- composition: real scripts run, not reimplemented ------------------------
 
 test_composition_invokes_real_scripts() {
-  local rec root home fakebin out
+  local rec root home fakebin mask out
   rec=$(new_world composition)
   IFS='|' read -r root home fakebin <<EOF
 $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  rm -f "$fakebin/node"
+  mask=$(mask_missing_tool "$home" node)
 
   printf 'needs-decision: pick a library\n' > "$home/state/task-z.status"
   append_wake "$home/state" signal task-z.status "needs-decision: pick a library"
 
-  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  out=$(BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
 
   # fm-lock.sh's own exact success text.
   assert_contains "$out" "lock acquired: harness pid" "fm-lock.sh's real output did not appear (composition, not reimplementation)"

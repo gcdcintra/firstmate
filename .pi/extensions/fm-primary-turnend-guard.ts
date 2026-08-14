@@ -72,6 +72,12 @@ function runGuard(): Promise<{ code: number; stderr: string }> {
     });
     child.on("error", () => resolveResult({ code: 0, stderr: "" }));
     child.on("close", (code) => resolveResult({ code: code ?? 0, stderr }));
+    // A guard that exits before draining stdin leaves this write to fail with
+    // EPIPE. Unhandled, that error event is thrown on the stdin socket and
+    // takes the whole extension host down. Whether the payload landed never
+    // decides the outcome here - the guard's exit code does - so swallow it
+    // and let the close handler above report.
+    child.stdin.on("error", () => {});
     child.stdin.end('{"stop_hook_active":false}');
   });
 }

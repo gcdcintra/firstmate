@@ -1325,7 +1325,16 @@ const hooks = await mod.FmPrimaryWatchArm({
 const event = { event: { type: "session.idle", properties: { sessionID: "session-test" } } };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
 await hooks.event(event);
-await new Promise((resolve) => setTimeout(resolve, 120));
+// The idle hook starts the arm attempt without awaiting it, so join that exact
+// attempt through the plugin-owned coordinator rather than guessing how long it
+// takes to settle. A fixed sleep that expires first leaves the attempt in
+// flight, and the second event below then joins THAT stale attempt - which read
+// the unowned lock - so the arm never starts and no later wait can rescue it.
+const unowned = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+if (unowned !== "read-only") {
+  console.error(`expected read-only while another pid holds the lock, got ${unowned}`);
+  process.exit(1);
+}
 if (existsSync(process.env.FM_ARM_LOG)) {
   console.error("watch arm ran without owning the session lock");
   process.exit(1);
@@ -1376,8 +1385,9 @@ await mod.FmPrimaryWatchArm({
   worktree: process.env.WORKTREE,
 });
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+// Awaiting the coordinator already settles the attempt, so the status below is
+// the condition to assert on - no sleep needed to let it catch up.
 const status = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
-await new Promise((resolve) => setTimeout(resolve, 120));
 if (status !== "not-primary") {
   console.error(`expected not-primary, got ${status}`);
   process.exit(1);

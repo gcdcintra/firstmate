@@ -32,6 +32,13 @@ export function encodeFirstmateOperationalInput(root, kind, content) {
       }
       reject(new Error(stderr.trim() || `operational-input encoder exited ${code ?? "unknown"}`));
     });
+    // An encoder that exits before draining stdin - an unknown subcommand or
+    // wrong argument count under plugin/script version skew both return 2
+    // before reading - leaves this write to fail with EPIPE. Unhandled, that
+    // error event is thrown on the stdin socket and takes the whole plugin
+    // host down. Swallow it here so the close handler above still rejects with
+    // the encoder's own diagnostic.
+    child.stdin.on("error", () => {});
     child.stdin.end(content);
   });
 }
