@@ -2,14 +2,17 @@
 # tests/fm-session-lock-ancestry.test.sh - session-lock harness identity
 # (bin/fm-session-lock-lib.sh).
 #
-# Two layers. The unit cases drive the library's own functions behind a
+# Three layers. The unit cases drive the library's own functions behind a
 # deterministic fake ps, so both platforms' reporting semantics are covered from
 # either host: macOS reports argv[0] in `ps -o comm=`, while procps on Linux
-# reports the kernel exec name and ignores argv[0] entirely. The end-to-end cases
-# run the REAL Stop auto-arm inside real process trees whose shapes differ only
-# in how the per-session process is named and what its parent is. Those trees are
-# orphaned before the hook fires, so the ancestry walk terminates inside the
-# fixture and can never escape into the session running this suite.
+# reports the kernel exec name and ignores argv[0] entirely. The fork-descent
+# cases build a Claude Code configuration root of their own and drive the real
+# evidence path against real live processes, because the process start time that
+# makes the registry pid-reuse proof cannot be faked through ps. The end-to-end
+# cases run the REAL Stop auto-arm inside real process trees whose shapes differ
+# only in how the per-session process is named and what its parent is. Those
+# trees are orphaned before the hook fires, so the ancestry walk terminates
+# inside the fixture and can never escape into the session running this suite.
 # shellcheck disable=SC2016 # single quotes are deliberate: $FM_HOME and $$ expand inside the fixture child
 set -u
 
@@ -220,6 +223,200 @@ SH
   pass "session-lock: a live version-named session holding the lock is not mistaken for a stale owner"
 }
 
+# --- fork-descent layer: the real evidence path against live processes -------
+#
+# A private Claude Code configuration root stands in for the real one, so these
+# cases read the same registry and transcript layout the harness writes without
+# depending on this machine's own sessions.
+
+CLAUDE_CONFIG_DIR="$TMP_ROOT/claude-config"
+export CLAUDE_CONFIG_DIR
+mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$CLAUDE_CONFIG_DIR/projects/probe"
+
+FORK_HELPER_PIDS=()
+stop_helper_processes() {
+  local pid
+  for pid in "${FORK_HELPER_PIDS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+}
+trap 'stop_helper_processes; fm_test_cleanup' EXIT
+
+# Publish a live process in OWNER_PID to stand in for a session owner. The
+# descent evidence never consults the process table, so any real pid carries the
+# start time this needs. Its output is detached from this shell so no command
+# substitution around a caller can wait on it.
+OWNER_PID=
+spawn_owner_process() {
+  sleep 60 >/dev/null 2>&1 &
+  OWNER_PID=$!
+  FORK_HELPER_PIDS+=("$OWNER_PID")
+}
+
+# Read the kernel start time of pid $1 straight from /proc, independently of the
+# library's own parsing. Empty on a platform without /proc.
+raw_proc_start() {  # <pid>
+  [ -r "/proc/$1/stat" ] || return 0
+  awk '{ print $22 }' "/proc/$1/stat" 2>/dev/null
+}
+
+# True when this host can supply the process start time the registry check
+# requires. Everywhere else the evidence is unavailable by design and every
+# claim below must be refused instead.
+proc_start_available() {
+  [ -n "$(raw_proc_start $$)" ]
+}
+
+# Claude Code's own live-session record for pid $1 running session $2, with an
+# optional start time that does NOT match the live process.
+register_session() {  # <pid> <session-id> [<proc-start>]
+  local pid=$1 session_id=$2 start=${3:-}
+  [ -n "$start" ] || start=$(raw_proc_start "$pid")
+  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
+    "$pid" "$session_id" "$start" > "$CLAUDE_CONFIG_DIR/sessions/$pid.json"
+}
+
+# A transcript for session $1 carrying message uuids $2.., in the record shape a
+# fork copies verbatim.
+write_transcript() {  # <session-id> <uuid>...
+  local session_id=$1 uuid file
+  shift
+  file="$CLAUDE_CONFIG_DIR/projects/probe/$session_id.jsonl"
+  : > "$file"
+  for uuid in "$@"; do
+    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
+      "$uuid" "$session_id" >> "$file"
+  done
+}
+
+# Distinct, well-formed v4-shaped message uuids.
+msg_uuid() {  # <n>
+  printf '00000000-0000-4000-8000-%012d\n' "$1"
+}
+
+# Evaluate one library expression against the REAL process table.
+lib_run() {  # <expression>
+  local expr=$1
+  bash -c ". \"\$0\"; $expr" "$LIB"
+}
+
+test_quiescent_fork_source_is_provable() {
+  local owner
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000001
+  write_transcript 00000000-0000-4000-9000-000000000001 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000002 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+
+  if proc_start_available; then
+    CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000002 lib_run "fm_claude_fork_descendant_of_pid $owner" \
+      || fail "a forked session could not prove descent from its own quiescent source"
+    pass "fork descent: a forked session proves descent from its still-live, quiescent source"
+  else
+    if CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000002 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+      fail "descent was claimed on a host that cannot supply the process start time"
+    fi
+    pass "fork descent: no process start time available, so the claim is refused"
+  fi
+}
+
+test_fork_source_that_resumed_work_is_refused() {
+  local owner
+  proc_start_available || { pass "fork descent: resumed-source case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000003
+  # The source took another turn after the fork: its own new uuid is one this
+  # session does not have, which is exactly the 2026-08-02 two-helms shape.
+  write_transcript 00000000-0000-4000-9000-000000000003 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 9)"
+  write_transcript 00000000-0000-4000-9000-000000000004 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000004 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a fork source that resumed work was still treated as a yieldable source"
+  fi
+  pass "fork descent: a source that took a turn after the fork is refused"
+}
+
+test_sibling_fork_is_not_an_ancestor() {
+  local owner
+  proc_start_available || { pass "fork descent: sibling-fork case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000005
+  # Two forks of one source: each carries the shared history plus its own turns,
+  # so neither extends the other and neither may take the home from the other.
+  write_transcript 00000000-0000-4000-9000-000000000005 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 20)"
+  write_transcript 00000000-0000-4000-9000-000000000006 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 30)" "$(msg_uuid 31)"
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000006 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "one fork claimed descent from its sibling fork"
+  fi
+  pass "fork descent: a sibling fork is never an ancestor"
+}
+
+test_identical_transcript_is_not_an_ancestor() {
+  local owner
+  proc_start_available || { pass "fork descent: identical-transcript case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000007
+  write_transcript 00000000-0000-4000-9000-000000000007 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000008 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000008 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a session that merely matches the owner's transcript claimed to extend it"
+  fi
+  pass "fork descent: matching the source's transcript is not extending it"
+}
+
+test_background_agent_never_claims_by_fork_evidence() {
+  local owner
+  proc_start_available || { pass "fork descent: background-agent case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000009
+  write_transcript 00000000-0000-4000-9000-000000000009 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000010 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # Claude Code seeds a background agent by forking the live session, so the
+  # transcript evidence alone would let a worker take its captain's home.
+  if CLAUDE_JOB_DIR=/tmp/job CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000010 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a background agent claimed the home on fork evidence"
+  fi
+  pass "fork descent: a background agent is excluded even with a satisfied transcript proof"
+}
+
+test_recycled_pid_record_is_rejected() {
+  local owner
+  proc_start_available || { pass "fork descent: recycled-pid case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  # A record left by a dead session whose pid was handed to something else.
+  register_session "$owner" 00000000-0000-4000-9000-000000000011 1
+  write_transcript 00000000-0000-4000-9000-000000000011 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000012 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000012 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a session record whose process start time does not match the live pid was trusted"
+  fi
+  pass "fork descent: a recorded owner whose process start time no longer matches is rejected"
+}
+
+test_live_owner_without_a_session_record_is_refused() {
+  local owner
+  spawn_owner_process; owner=$OWNER_PID
+  write_transcript 00000000-0000-4000-9000-000000000013 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # Every harness other than Claude Code, and any Claude session the registry
+  # does not vouch for, lands here and keeps the unchanged refusal.
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000013 lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "an owner with no session record was treated as a fork source"
+  fi
+  pass "fork descent: a live owner the harness does not vouch for is refused"
+}
+
+test_missing_own_session_identity_is_refused() {
+  local owner
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000014
+  write_transcript 00000000-0000-4000-9000-000000000014 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID='' lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a claimant that cannot identify its own session still claimed descent"
+  fi
+  pass "fork descent: a claimant with no session identity of its own is refused"
+}
+
 # --- end-to-end layer: the real Stop auto-arm in real process trees ----------
 
 install_autoarm_scripts() {
@@ -358,6 +555,14 @@ test_version_named_session_is_identified_on_both_platforms
 test_ordinary_paths_are_never_harness_processes
 test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
+test_quiescent_fork_source_is_provable
+test_fork_source_that_resumed_work_is_refused
+test_sibling_fork_is_not_an_ancestor
+test_identical_transcript_is_not_an_ancestor
+test_background_agent_never_claims_by_fork_evidence
+test_recycled_pid_record_is_rejected
+test_live_owner_without_a_session_record_is_refused
+test_missing_own_session_identity_is_refused
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock
