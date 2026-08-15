@@ -913,6 +913,22 @@ fm_backend_agent_pid() {  # <backend> <target>
   esac
 }
 
+# fm_backend_current_path: the working directory of the shell at <target>,
+# printed on stdout, or a non-zero exit when this backend cannot resolve one.
+# Its only consumer is the endpoint-absence report in bin/fm-watch.sh, which
+# uses it to name the worktree-drift hazard on a pane whose agent died and left
+# a bare shell behind; a backend with no resolver simply omits that note rather
+# than blocking the wake. Only tmux exposes a pane's cwd through a verified
+# interface today.
+fm_backend_current_path() {  # <backend> <target>
+  local backend=$1 target=$2
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_current_path "$target" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Backward-compatible three-state view for existing callers. An
 # authoritatively missing endpoint is confidently not a live agent, while every
 # ambiguous, unreadable, or unverified result stays unknown.

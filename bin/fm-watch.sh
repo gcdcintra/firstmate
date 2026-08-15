@@ -182,6 +182,12 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # secs without pane output before a provably-working stale escalates as a possible wedge
+# Consecutive polls an endpoint must keep reporting the SAME absence verdict
+# before endpoint_absence_check wakes on it. Two costs one extra poll and
+# absorbs the two races that produce a one-poll false absence: a teardown
+# mid-flight, and a spawn whose endpoint is recorded a moment before its agent
+# starts. Still an order of magnitude faster than STALE_ESCALATE_SECS.
+ENDPOINT_ABSENCE_CONFIRM_POLLS=${FM_ENDPOINT_ABSENCE_CONFIRM_POLLS:-2}
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
 # footer changes every poll. BUSY_TURN_MAX_SECS bounds how long any busy pane
@@ -359,6 +365,133 @@ clear_wedge_tracking() {  # <window>
   key=$(window_key "$win")
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" \
     "$STATE/.cpu-$key" "$STATE/.cpu-defer-since-$key"
+}
+
+# --- endpoint absence: a killed endpoint is not a quiet worker ---------------
+#
+# A wedged agent and a killed one look identical to every heuristic this
+# watcher had: both render a frozen pane, both hold a stable hash, and both
+# read flat on the worker-CPU counter that clears a long productive turn. The
+# one signal that separates them is not a heuristic at all - it is asking the
+# backend whether the endpoint still holds a running agent, which is cheap and
+# unambiguous.
+#
+# Until this check existed a killed endpoint took one of two wrong paths. If
+# its capture failed it dropped silently out of the stale loop's `continue` and
+# produced no wake at all; if the capture still returned bytes it aged into a
+# wedge alarm worded exactly like a hung worker's, and telling the two apart
+# cost a manual inspection every time. Observed 2026-08-15: a desktop-session
+# collapse SIGKILLed an entire user cgroup, killing every pane on the machine
+# in one instant, and supervision reported it as a run of ordinary wedges
+# discovered one at a time over the following two hours.
+#
+# fm_backend_agent_state (bin/fm-backend.sh) owns the state vocabulary, and
+# only its two CONFIDENT non-agent verdicts wake anything here - the same two
+# that contract already says are the only ones licensing recovery:
+#   missing - the endpoint is authoritatively absent. Covers both a killed pane
+#             and a dead backend server: the tmux adapter maps tmux's own "no
+#             server running on"/"can't find session" replies to missing rather
+#             than to a read failure, so a server that died with its session
+#             still reaches this wake instead of a blind spot.
+#   dead    - the endpoint is still there but runs a bare shell where an agent
+#             belongs: the agent died without reporting.
+# alive, ambiguous, unreadable, and unverified never wake, and never divert a
+# window from the path it would have taken before. That is what keeps a
+# genuinely wedged worker with a live pane escalating exactly as it did, keeps
+# an unreadable probe from inventing an absence it cannot see, and keeps a
+# backend with no recovery classifier behaving as it does today. This check
+# adds a signal; it removes none.
+#
+# Two absences are already accounted for and are absorbed to the triage log
+# rather than woken on: one after the worker reported a terminal outcome, and
+# one under a declared pause or captain hold, whose own bounded recheck cadence
+# already treats an exited agent as still waiting. endpoint_absence_expected
+# owns that pair.
+
+# 0 when this window's absence is already accounted for, so reporting it as a
+# fault would be wrong rather than merely noisy.
+endpoint_absence_expected() {  # <window>
+  local w=$1 task last
+  task=$(window_to_task "$w" "$STATE")
+  [ -n "$task" ] || return 1
+  last=$(last_status_line "$STATE/$task.status")
+  # The worker reported a terminal outcome: firstmate may already be tearing
+  # this endpoint down, and its disappearance is the expected next step.
+  status_is_terminal_verb "$last" && return 0
+  # A declared pause or captain hold already owns the exited-agent case on its
+  # own bounded recheck cadence (pause_state_class, PAUSE_RESURFACE_SECS), and
+  # deliberately treats a confidently-exited agent as still paused rather than
+  # as a wedge. Claiming it here would convert a chosen long wait into a fault
+  # report and change behavior this check is meant to leave alone.
+  status_is_paused_or_captain_held "$last"
+}
+
+# A trailing clause naming where a husk shell is sitting, when that is itself a
+# hazard. The primary checkout is called out by name because work started there
+# would not be isolated in a task worktree at all; any other drift off the
+# recorded worktree is reported more plainly. Silent when the backend cannot
+# resolve a cwd, or when the shell is where it belongs.
+endpoint_cwd_note() {  # <window>
+  local w=$1 task meta cwd worktree
+  cwd=$(fm_backend_current_path "$(window_backend "$w")" "$w" 2>/dev/null) || return 0
+  [ -n "$cwd" ] || return 0
+  if [ "$cwd" = "$FM_ROOT" ]; then
+    printf ', and its shell fell back to the primary checkout %s - anything started there would not be isolated in a task worktree' "$cwd"
+    return 0
+  fi
+  task=$(window_to_task "$w" "$STATE")
+  meta="$STATE/$task.meta"
+  worktree=$(grep '^worktree=' "$meta" 2>/dev/null | cut -d= -f2- || true)
+  [ -n "$worktree" ] && [ "$cwd" != "$worktree" ] &&
+    printf ', and its shell is at %s rather than the task worktree %s' "$cwd" "$worktree"
+  return 0
+}
+
+# Classify <window>'s endpoint and wake once per absence episode. Returns 0 when
+# this window's absence has been claimed - waking, or deliberately absorbed - so
+# the caller skips the wedge path that cannot describe it; 1 when the endpoint
+# is (or may still be) a working agent and normal triage should proceed.
+endpoint_absence_check() {  # <window>
+  local w=$1 verdict key seen prev count reason detail
+  verdict=$(fm_backend_agent_state "$(window_backend "$w")" "$w" 2>/dev/null) || verdict=
+  key=$(window_key "$w")
+  case "$verdict" in
+    missing|dead) ;;
+    *)
+      # Anything not confidently absent - working, ambiguous, unreadable, or a
+      # backend with no classifier - ends any absence episode and takes the
+      # unchanged path, so a relaunched worker that later goes absent wakes again.
+      rm -f "$STATE/.gone-seen-$key" "$STATE/.gone-$key"
+      return 1
+      ;;
+  esac
+  seen=$(cat "$STATE/.gone-seen-$key" 2>/dev/null || true)
+  prev=${seen%%:*}
+  count=${seen#*:}
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  if [ "$prev" = "$verdict" ]; then count=$((count + 1)); else count=1; fi
+  printf '%s:%s' "$verdict" "$count" > "$STATE/.gone-seen-$key"
+  [ "$count" -ge "$ENDPOINT_ABSENCE_CONFIRM_POLLS" ] || return 1
+  # One wake per episode: an absent endpoint does not come back on its own, and
+  # a fleet-wide kill would otherwise re-wake for every dead window every poll.
+  [ "$(cat "$STATE/.gone-$key" 2>/dev/null || true)" = "$verdict" ] && return 0
+  if endpoint_absence_expected "$w"; then
+    printf '%s' "$verdict" > "$STATE/.gone-$key"
+    triage_log "absorbed gone endpoint ($verdict; worker already reported a terminal outcome): $w"
+    return 0
+  fi
+  case "$verdict" in
+    missing)
+      reason="gone: $w (the worker's endpoint no longer exists - it was killed, which is NOT a quiet or wedged worker and will never clear on its own; its committed branch and any running validation usually survive, so inspect what landed and relaunch rather than assuming the work is lost)"
+      ;;
+    *)
+      detail=$(endpoint_cwd_note "$w")
+      reason="gone: $w (the endpoint is still there but its agent is not - a bare shell where a worker belongs${detail}; the worker died without reporting, so its turn is lost even though anything it committed survives)"
+      ;;
+  esac
+  fm_wake_append gone "$w" "$reason" || exit 1
+  printf '%s' "$verdict" > "$STATE/.gone-$key"
+  wake "$reason"
 }
 
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
@@ -1153,7 +1286,13 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
-    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
+    # A capture that fails is the loudest evidence an endpoint is gone, and used
+    # to be the quietest: this `continue` skipped the window with no wake at all,
+    # every poll, forever. Ask the backend what happened before dropping it.
+    if ! tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null); then
+      endpoint_absence_check "$w" || true
+      continue
+    fi
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(window_key "$w")
     hf="$STATE/.hash-$key"
@@ -1173,6 +1312,14 @@ EOF
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
       if [ "$n" -ge 2 ] && [ "$busy_now" -ne 0 ]; then
+        # A pane can hold a stable hash because its agent is gone rather than
+        # stuck - a killed endpoint whose backend still returns its last frame,
+        # or a husk shell left where an agent died. Both would otherwise age
+        # into a wedge alarm that describes neither. Asked here, on the narrow
+        # already-stale path, so a working fleet pays nothing for it.
+        if endpoint_absence_check "$w"; then
+          continue
+        fi
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
         if [ "$kind" = secondmate ]; then

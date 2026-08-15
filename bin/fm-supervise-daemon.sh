@@ -433,6 +433,13 @@ classify_unknown() {  # <reason>
   printf 'escalate|unknown wake: %s' "$1"
 }
 
+# A killed or agent-less endpoint always escalates. The daemon self-handles
+# waits that clear on their own; this one never does, and relaunching a worker
+# is a supervision decision the away-mode daemon has no authority to make.
+classify_gone() {  # <reason>
+  printf 'escalate|%s' "$1"
+}
+
 # --- stale marker + escalation buffer (stateful, but via explicit state dir) -
 # Marker:   state/.subsuper-stale-<key>   contains the epoch first seen idle.
 # Buffer:   state/.subsuper-escalations    one distilled line per escalation.
@@ -1235,6 +1242,8 @@ handle_wake() {  # <reason> <state>
                 *"$FM_CLASSIFY_WEDGE_REASON_SEGMENT"*)
                   decision="escalate|${reason#stale: }" ;;
               esac ;;
+    gone:*)   kind=gone; arg="${reason#gone: }"; arg="${arg%% \(*}"
+              decision=$(classify_gone "$reason") ;;
     check:*)  decision=$(classify_check "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;
