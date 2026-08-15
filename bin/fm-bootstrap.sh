@@ -13,6 +13,7 @@
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
+#                 "GH_BASE_REPO: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
@@ -76,11 +77,35 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          The GitHub base-repo check is read-only detection plus one local,
+#          idempotent repair. `gh`, and every gh-axi pr/issue subcommand through
+#          it, picks a base repository from the checkout's remotes and prefers
+#          `upstream` over `origin` while the clone carries no
+#          `remote.<name>.gh-resolved` setting, so in a fork every unpinned
+#          query - including the issue and pull-request figures the session-start
+#          banner prints beneath this repo's own name - answers about the parent
+#          project. A locked session pins the base repository to origin and
+#          reports BOOTSTRAP_INFO; a read-only session, or a failed pin, prints
+#          GH_BASE_REPO instead. Scoped to FM_ROOT: project clones are not
+#          firstmate's to write.
+#          When a `remote.<name>.gh-resolved` setting already exists it is a
+#          human's explicit choice and is never overwritten, in either mode. The
+#          effective base repository is then resolved from git config offline: a
+#          value of `base` means that remote's own repository, any other value
+#          names one. Resolving to origin's own repository is the correct state
+#          and stays silent; resolving anywhere else prints GH_BASE_REPO naming
+#          the repository that answers, the origin expected instead, and the
+#          `gh repo set-default` command that redirects it - silence there would
+#          leave the banner's figures reading as ours when they are not.
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
-#          x_mode_setup, fleet_sync) while still printing every read-only detect line
-#          above; the TANGLE line switches to advisory-only wording with no
-#          checkout command. Used by
+#          x_mode_setup, fleet_sync, gh_base_repo_pin) while still printing every
+#          read-only detect line above; the TANGLE line and the ambiguity-derived
+#          GH_BASE_REPO line switch to advisory-only wording with no repair
+#          command. The explicit-choice GH_BASE_REPO line is identical in either
+#          mode, its `gh repo set-default` included, because that setting is
+#          never firstmate's to rewrite and the captain runs or declines the
+#          redirect themselves. Used by
 #          fm-session-start.sh's read-only path when another live session holds
 #          the fleet lock, so a second concurrent session never race-mutates
 #          PR-check artifacts, secondmate homes, X-mode artifacts, project
@@ -112,6 +137,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-startup-memory-budget-lib.sh"
 # shellcheck source=bin/fm-x-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-x-lib.sh"
+# shellcheck source=bin/fm-gh-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-gh-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
 
@@ -492,6 +519,83 @@ secondmate_liveness_sweep() {
     esac
   done
   return 0
+}
+
+# Does any remote other than origin point at GitHub? That is the state in which
+# `gh` has a choice to make and makes the wrong one, preferring `upstream`.
+gh_base_repo_ambiguous() {  # <dir>
+  local dir=$1 name url
+  while read -r name url _; do
+    [ -n "$name" ] || continue
+    [ "$name" = origin ] && continue
+    fm_gh_repo_from_remote_url "$url" >/dev/null 2>&1 && return 0
+  done < <(git -C "$dir" remote -v 2>/dev/null | awk '$3 == "(fetch)"')
+  return 1
+}
+
+# The base repository `gh` already has an explicit answer for, read from git
+# config alone - offline, no network. A `remote.<R>.gh-resolved` of literally
+# `base` means R's own repository; any other value names the repository itself,
+# optionally host-qualified. Echoes one "<owner/repo|-> <setting>=<value>" line
+# per marker, with `-` where the value names nothing this can resolve, so the
+# caller can tell a choice it can name from one it can only quote back.
+gh_base_repo_markers() {  # <dir>
+  local dir=$1 key value remote url repo candidate
+  while read -r key value; do
+    [ -n "$key" ] || continue
+    remote=${key#remote.}
+    remote=${remote%.gh-resolved}
+    repo=
+    if [ "$value" = base ]; then
+      url=$(git -C "$dir" config --get "remote.$remote.url" 2>/dev/null) || url=
+      repo=$(fm_gh_repo_from_remote_url "$url" 2>/dev/null) || repo=
+    else
+      # A host-qualified value is only ours to shorten when the host is GitHub;
+      # stripping an unknown one would fabricate a match with our own origin.
+      case "$value" in
+        github.com/*) candidate=${value#github.com/} ;;
+        *) candidate=$value ;;
+      esac
+      fm_gh_owner_repo_valid "$candidate" && repo=$candidate
+    fi
+    printf '%s %s=%s\n' "${repo:--}" "$key" "$value"
+  done < <(git -C "$dir" config --get-regexp '^remote\..*\.gh-resolved$' 2>/dev/null)
+}
+
+# Pin FM_ROOT's GitHub base repository to its own origin, so no unpinned query
+# and no session-start banner figure is answered by the parent project. Silent
+# when the resolution already lands on origin or when nothing is ambiguous; see
+# this script's header for the full contract.
+gh_base_repo_pin() {
+  local origin_repo markers repo marker resolved='' setting=''
+  git -C "$FM_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  origin_repo=$(fm_gh_repo_from_remote "$FM_ROOT") || return 0
+  markers=$(gh_base_repo_markers "$FM_ROOT")
+  if [ -n "$markers" ]; then
+    # An explicit gh-resolved setting is a human's choice, so it is never
+    # overwritten - but a choice that answers for another repository is never
+    # left silent either, because the banner's figures are then a stranger's.
+    while read -r repo marker; do
+      [ "$repo" = "$origin_repo" ] && return 0
+      if [ -z "$resolved" ]; then
+        setting=$marker
+        if [ "$repo" = - ]; then resolved="another repository"; else resolved=$repo; fi
+      fi
+    done <<< "$markers"
+    echo "GH_BASE_REPO: an explicit gh base-repository choice ($setting) points GitHub pull-request and issue queries in $FM_ROOT at $resolved, not at this checkout's origin $origin_repo - the session-start banner's issue and pull-request figures belong to $resolved and are NOT this repository's; firstmate never overwrites that choice, so redirect it yourself with: (cd $FM_ROOT && gh repo set-default $origin_repo)"
+    return 0
+  fi
+  gh_base_repo_ambiguous "$FM_ROOT" || return 0
+  if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" = 1 ]; then
+    echo "GH_BASE_REPO: GitHub pull-request and issue queries in $FM_ROOT answer for another repository, not $origin_repo - the startup banner's issue and PR numbers are that other repository's; read-only session must leave the repair to the session holding the fleet lock"
+    return 0
+  fi
+  if command -v gh >/dev/null 2>&1 \
+    && (cd "$FM_ROOT" && gh repo set-default "$origin_repo" >/dev/null 2>&1); then
+    echo "BOOTSTRAP_INFO: pinned GitHub pull-request and issue queries in $FM_ROOT to $origin_repo"
+    return 0
+  fi
+  echo "GH_BASE_REPO: GitHub pull-request and issue queries in $FM_ROOT answer for another repository, not $origin_repo - the startup banner's issue and PR numbers are that other repository's; pin them with: (cd $FM_ROOT && gh repo set-default $origin_repo)"
 }
 
 install_cmd() {
@@ -894,6 +998,7 @@ if [ -n "$tangle_branch" ]; then
     echo "TANGLE: primary checkout on feature branch '$tangle_branch' (expected '$tangle_default'); the work is safe on that ref - restore the primary with: git -C $FM_ROOT checkout $tangle_default, then re-validate the branch in a proper worktree"
   fi
 fi
+gh_base_repo_pin
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != "default" ]; then

@@ -38,6 +38,10 @@
 # rules on rule 2: a worktree isolates files only, while the process table, /tmp,
 # and X display numbers stay machine-wide. The process rule states its own reason
 # inline because a worker cannot otherwise know its brief is in its argv.
+# Rule 3 carries the repository-pinning rule for GitHub pull-request and issue
+# commands, with its reason inline for the same kind of reason: an unpinned query
+# inside a fork answers about the parent project and reads exactly like a correct
+# answer. bin/fm-gh-lib.sh is the matching defense for firstmate's own queries.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
@@ -281,6 +285,27 @@ IFS= read -r -d '' SHARED_MACHINE <<'EOF' || true
 EOF
 SHARED_MACHINE=${SHARED_MACHINE%$'\n'}
 
+# One owner for the repository-pinning rule, interpolated into rule 3 of both
+# scaffolds (ship and scout) so the two copies can never drift. The reason is
+# stated inline because this failure is not detectable by the worker: `gh` and
+# `gh-axi` infer the repository from the checkout's remotes and prefer
+# `upstream`, so inside a fork a bare `pr view <n>` answers about the parent
+# project's pull request of that number - green checks and all - and reads
+# exactly like the right answer. bin/fm-gh-lib.sh defends firstmate's own
+# queries; a crewmate works in a project worktree and pins the repository itself.
+# Quoted heredoc: the backticks and prose must reach the brief verbatim.
+IFS= read -r -d '' GH_REPO_RULE <<'EOF' || true
+   Always name the repository on pull-request and issue commands - `gh-axi pr view <n> --repo <owner>/<name>` -
+   or address the pull request by its full `https://github.com/<owner>/<name>/pull/<n>` URL, which names it too.
+   Without one of those the tool infers the repository from the checkout's remotes and prefers
+   `upstream` over `origin`: in a fork that answers about the PARENT project's pull request of the
+   same number, with its own author, state, and green checks, and nothing in the answer says it came
+   from a different repository. Verifying your own pull request is exactly when this bites, so treat
+   any pull-request or issue fact you did not pin to a repository as unverified. The same applies
+   when you CREATE a pull request: unpinned, it can be opened against the parent project.
+EOF
+GH_REPO_RULE=${GH_REPO_RULE%$'\n'}
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -301,6 +326,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 2. Stay inside this worktree; the only files you may write outside it are the report, the status file below, and your task temp root under \`/tmp/fm-<task-id>\`.
 $SHARED_MACHINE
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+$GH_REPO_RULE
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
@@ -347,7 +373,7 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, naming the repository explicitly as rule 3 requires, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
     ;;
@@ -419,6 +445,7 @@ $RULE1
 2. Stay inside this worktree; modify nothing outside it except the status file below and your task temp root under \`/tmp/fm-<task-id>\`.
 $SHARED_MACHINE
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+$GH_REPO_RULE
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.

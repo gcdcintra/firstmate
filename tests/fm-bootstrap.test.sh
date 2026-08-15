@@ -760,6 +760,183 @@ test_routine_bootstrap_contract_runs_under_system_bash() {
   pass "bootstrap routine contract runs under system /bin/bash"
 }
 
+# The session-start banner prints issue and pull-request numbers straight from
+# `gh-axi`, so whatever base repository `gh` resolves is what the captain reads
+# under this repo's own name. In a fork with an upstream remote and no
+# gh-resolved setting that is the parent project's numbers. Pinning the base
+# repository to origin is local and idempotent, and it corrects every consumer -
+# banner, gh, and gh-axi - at once.
+#
+# An existing `remote.<name>.gh-resolved` setting is a human's own choice of
+# base repository, which bootstrap must never overwrite - and must never leave
+# silent either when it answers for someone else's repository, since the banner
+# figures are then a stranger's under our name. Cases carry those settings as
+# "config:<key>=<value>" specs.
+#
+# Args: case_name [--detect-only] [remote-spec|config-spec...]
+#       remote spec: "<name>=<url>"   config spec: "config:<key>=<value>"
+run_gh_base_repo_fixture() {
+  local case_name=$1 detect_only=0 case_dir fakebin pair remote url setting
+  shift
+  if [ "${1:-}" = --detect-only ]; then detect_only=1; shift; fi
+  case_dir="$TMP_ROOT/$case_name"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  # A gh that records `repo set-default` so a test can prove whether the pin was
+  # attempted, and applies it the way the real one does.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = repo ] && [ "${2:-}" = set-default ]; then
+  printf '%s\n' "$3" >> "$FM_TEST_SET_DEFAULT_LOG"
+  git config remote.origin.gh-resolved base
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/gh"
+  git init -q "$case_dir/home"
+  for pair in "$@"; do
+    case "$pair" in config:*) continue ;; esac
+    remote=${pair%%=*}
+    url=${pair#*=}
+    git -C "$case_dir/home" remote add "$remote" "$url"
+  done
+  # Settings land after the remotes they qualify, so a case can pin a
+  # gh-resolved marker on a remote it just declared.
+  for pair in "$@"; do
+    case "$pair" in config:*) setting=${pair#config:} ;; *) continue ;; esac
+    git -C "$case_dir/home" config "${setting%%=*}" "${setting#*=}"
+  done
+  : > "$case_dir/set-default.log"
+  if [ "$detect_only" -eq 1 ]; then
+    PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_TEST_SET_DEFAULT_LOG="$case_dir/set-default.log" FM_BOOTSTRAP_DETECT_ONLY=1 \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null
+  else
+    PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+      FM_TEST_SET_DEFAULT_LOG="$case_dir/set-default.log" \
+      FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null
+  fi
+}
+
+test_gh_base_repo_is_pinned_to_origin() {
+  local out case_dir
+  out=$(run_gh_base_repo_fixture gh-base-pin \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-pin"
+  assert_contains "$out" "BOOTSTRAP_INFO: pinned GitHub pull-request and issue queries" \
+    "bootstrap did not report pinning the base repository"
+  assert_grep "gcdcintra/firstmate" "$case_dir/set-default.log" \
+    "bootstrap did not pin the base repository to origin"
+  [ "$(git -C "$case_dir/home" config --get remote.origin.gh-resolved)" = base ] \
+    || fail "the base repository pin was not recorded in the checkout"
+
+  # Idempotent: a second run has nothing left to do and says nothing.
+  : > "$case_dir/set-default.log"
+  out=$(PATH="$(fm_fakebin "$case_dir"):$BASE_PATH" FM_HOME="$case_dir/home" \
+    FM_ROOT_OVERRIDE="$case_dir/home" FM_TEST_SET_DEFAULT_LOG="$case_dir/set-default.log" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_not_contains "$out" "GH_BASE_REPO" "an already-pinned checkout still reported a problem"
+  assert_not_contains "$out" "BOOTSTRAP_INFO: pinned" "an already-pinned checkout pinned again"
+  [ ! -s "$case_dir/set-default.log" ] || fail "an already-pinned checkout re-ran the pin"
+  pass "bootstrap pins the GitHub base repository to origin, once"
+}
+
+test_gh_base_repo_read_only_session_reports_without_writing() {
+  local out case_dir
+  out=$(run_gh_base_repo_fixture gh-base-detect --detect-only \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-detect"
+  assert_contains "$out" "GH_BASE_REPO:" "a read-only session did not report the wrong base repository"
+  assert_contains "$out" "gcdcintra/firstmate" "the report did not name the repository that should answer"
+  assert_contains "$out" "read-only session" "the read-only report did not say why it stopped short"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a read-only session wrote to the checkout"
+  [ -z "$(git -C "$case_dir/home" config --get remote.origin.gh-resolved || true)" ] \
+    || fail "a read-only session changed the checkout's git config"
+  pass "a read-only session reports the wrong base repository without writing to the checkout"
+}
+
+test_gh_base_repo_leaves_unambiguous_checkouts_alone() {
+  local out case_dir
+  # A single GitHub remote gives `gh` no choice to get wrong, and a non-GitHub
+  # origin is not this check's business. Neither should be touched.
+  out=$(run_gh_base_repo_fixture gh-base-single "origin=https://github.com/gcdcintra/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-single"
+  [ -z "$out" ] || fail "a single-remote checkout was not left silent, got: $out"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a single-remote checkout was pinned needlessly"
+
+  out=$(run_gh_base_repo_fixture gh-base-nongithub \
+    "origin=https://gitlab.com/group/project.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git")
+  case_dir="$TMP_ROOT/gh-base-nongithub"
+  [ -z "$out" ] || fail "a non-GitHub origin was not left silent, got: $out"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a non-GitHub origin was pinned to something"
+  pass "bootstrap leaves unambiguous and non-GitHub checkouts untouched"
+}
+
+# `gh repo set-default`, or an interactive gh prompt answered once, writes
+# remote.<name>.gh-resolved. Pointed at upstream it is the exact state that
+# hands the captain the parent project's issue and pull-request figures under
+# this repo's name. It is a human's choice, so bootstrap must not overwrite it -
+# and must not stay quiet about it either, in either session mode.
+assert_explicit_gh_base_repo_report() {  # <output> <case-dir> <label>
+  local out=$1 case_dir=$2 label=$3
+  assert_contains "$out" "GH_BASE_REPO:" "$label did not report the explicit base-repository choice"
+  assert_contains "$out" "remote.upstream.gh-resolved=base" \
+    "$label did not name the setting that made the choice"
+  assert_contains "$out" "at kunchenguid/firstmate" \
+    "$label did not name the repository the queries answer for"
+  assert_contains "$out" "origin gcdcintra/firstmate" \
+    "$label did not name the origin repository expected instead"
+  assert_contains "$out" "figures belong to kunchenguid/firstmate and are NOT this repository's" \
+    "$label did not say the banner figures are the other repository's"
+  assert_contains "$out" "(cd $case_dir/home && gh repo set-default gcdcintra/firstmate)" \
+    "$label did not carry the exact command that redirects the choice"
+  [ ! -s "$case_dir/set-default.log" ] || fail "$label overwrote an explicit base-repository choice"
+  [ -z "$(git -C "$case_dir/home" config --get remote.origin.gh-resolved || true)" ] \
+    || fail "$label wrote remote.origin.gh-resolved over an explicit choice"
+}
+
+test_gh_base_repo_reports_an_explicit_choice_of_another_repository() {
+  local out
+  out=$(run_gh_base_repo_fixture gh-base-explicit \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git" \
+    "config:remote.upstream.gh-resolved=base")
+  assert_explicit_gh_base_repo_report "$out" "$TMP_ROOT/gh-base-explicit" "a locked session"
+
+  # A read-only session reports the same thing: neither mode writes here, so
+  # neither may defer the report to the other.
+  out=$(run_gh_base_repo_fixture gh-base-explicit-detect --detect-only \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git" \
+    "config:remote.upstream.gh-resolved=base")
+  assert_explicit_gh_base_repo_report "$out" "$TMP_ROOT/gh-base-explicit-detect" "a read-only session"
+  pass "bootstrap reports an explicit base-repository choice of another repository without overwriting it"
+}
+
+test_gh_base_repo_is_silent_when_the_explicit_choice_is_origin() {
+  local out case_dir
+  out=$(run_gh_base_repo_fixture gh-base-explicit-origin \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git" \
+    "config:remote.origin.gh-resolved=base")
+  case_dir="$TMP_ROOT/gh-base-explicit-origin"
+  [ -z "$out" ] || fail "a checkout already resolving to its own origin was not left silent, got: $out"
+  [ ! -s "$case_dir/set-default.log" ] || fail "a checkout already resolving to origin was pinned again"
+
+  # The same choice spelled as an owner/name value rather than `base`.
+  out=$(run_gh_base_repo_fixture gh-base-explicit-origin-named \
+    "origin=https://github.com/gcdcintra/firstmate.git" \
+    "upstream=https://github.com/kunchenguid/firstmate.git" \
+    "config:remote.upstream.gh-resolved=gcdcintra/firstmate")
+  [ -z "$out" ] || fail "an explicit choice naming origin's own repository was not left silent, got: $out"
+  pass "bootstrap stays silent when the explicit base-repository choice is this checkout's origin"
+}
+
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info() {
   local case_dir fakebin out expect
   case_dir="$TMP_ROOT/dispatch-active"
@@ -851,5 +1028,10 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_routine_bootstrap_confirmations_are_silent
 test_routine_bootstrap_contract_runs_under_system_bash
+test_gh_base_repo_is_pinned_to_origin
+test_gh_base_repo_read_only_session_reports_without_writing
+test_gh_base_repo_leaves_unambiguous_checkouts_alone
+test_gh_base_repo_reports_an_explicit_choice_of_another_repository
+test_gh_base_repo_is_silent_when_the_explicit_choice_is_origin
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
 test_crew_dispatch_validation

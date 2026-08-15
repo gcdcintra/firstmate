@@ -365,6 +365,59 @@ test_shared_machine_namespace_rules() {
 # escape or expansion would corrupt the rule the worker reads. It must also not
 # shift the numbered rules: the no-mistakes Definition of done cross-references
 # "rule 6" by number, so an inserted rule would silently misdirect escalation.
+# Rule 3 used to say only "use gh-axi for GitHub operations". Unpinned, that
+# instruction is worse than nothing for pull-request work: `gh` and `gh-axi`
+# infer the repository from the checkout's remotes and prefer `upstream`, so a
+# crewmate verifying its own PR inside a fork can be handed the parent project's
+# pull request of the same number - merged, green, and someone else's. The
+# worker cannot detect that, so the reason travels with the rule, exactly as the
+# shared-machine argv reason does.
+assert_gh_repo_rule() {
+  local brief=$1 label=$2
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep 'Always name the repository on pull-request and issue commands' "$brief" \
+    "$label: brief lost the repository-pinning instruction"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+  assert_grep '`gh-axi pr view <n> --repo <owner>/<name>`' "$brief" \
+    "$label: brief lost the concrete pinned-command example"
+  assert_grep 'https://github.com/<owner>/<name>/pull/<n>' "$brief" \
+    "$label: brief lost the full-URL alternative"
+  assert_grep 'prefers' "$brief" \
+    "$label: brief lost the reason the repository must be named"
+  assert_grep "PARENT project's pull request" "$brief" \
+    "$label: brief lost what an unpinned query actually returns"
+  assert_grep 'as unverified' "$brief" \
+    "$label: brief lost the instruction to distrust unpinned PR facts"
+  assert_grep 'when you CREATE a pull request' "$brief" \
+    "$label: brief lost the warning that creation can target the parent project"
+}
+
+test_gh_repository_pinning_rule() {
+  local home id proj brief
+  home="$TMP_ROOT/gh-repo-rule-home"
+  write_registry "$home"
+
+  for id_proj in "brief-ghrepo-nm-f1:no-registry-proj" "brief-ghrepo-dpr-f2:direct-proj" "brief-ghrepo-lo-f3:local-proj"; do
+    id=${id_proj%%:*}
+    proj=${id_proj##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1 \
+      || fail "$id: ship scaffold exited non-zero"
+    assert_gh_repo_rule "$home/data/$id/brief.md" "ship $proj"
+  done
+
+  id="brief-ghrepo-scout-f4"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" no-registry-proj --scout >/dev/null 2>&1 \
+    || fail "$id: scout scaffold exited non-zero"
+  assert_gh_repo_rule "$home/data/$id/brief.md" "scout"
+
+  # direct-PR is the mode whose worker opens the PR itself, so its definition of
+  # done must carry the pin too rather than leaving it to a rule read earlier.
+  brief="$home/data/brief-ghrepo-dpr-f2/brief.md"
+  assert_grep 'naming the repository explicitly as rule 3 requires' "$brief" \
+    "direct-PR: the PR-opening step did not require an explicit repository"
+  pass "fm-brief.sh: ship and scout briefs require an explicit repository on GitHub PR and issue commands"
+}
+
 test_shared_machine_rules_render_verbatim_without_renumbering() {
   local home id brief block
   home="$TMP_ROOT/shared-machine-render-home"
@@ -779,6 +832,7 @@ test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
 test_shared_machine_namespace_rules
+test_gh_repository_pinning_rule
 test_shared_machine_rules_render_verbatim_without_renumbering
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
