@@ -164,12 +164,15 @@ fi
 pass "agent prose resembling the vendor sentence is not classified as a quota kill"
 
 # The vendor sentence is just text, so an agent reviewing this very feature can
-# write the same bytes the vendor does. What an agent cannot write is the
-# harness's own exit line, so a quoted sentence with ordinary output between it
-# and the exit line is prose, not a kill - the step really did fail on its own.
+# write the same bytes the vendor does. This pins exactly what adjacency buys: a
+# quotation with ordinary agent output between it and the harness exit line is
+# prose, not a kill - the step really did fail on its own. A quotation that is
+# the agent's LAST line still matches, because the real exit line supplies the
+# adjacency; that residual is recorded in
+# docs/verification/quota-kill-classification.md rather than asserted here.
 if printf 'claude started pid=1\nThe recognizer matches "You'"'"'ve reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model." verbatim.\nassertion failed: want 3 got 2\nclaude exited pid=1 error=claude exited: exit status 1: \n' \
   | fm_quota_kill_scan --agent-episode; then
-  fail "an agent QUOTING the vendor sentence must not excuse the genuine failure that ended the step"
+  fail "a quoted vendor sentence followed by further agent output must not excuse the genuine failure that ended the step"
 fi
 pass "a quoted vendor sentence with no adjacent harness exit line never excuses a genuine failure"
 

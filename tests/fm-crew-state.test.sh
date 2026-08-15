@@ -82,7 +82,7 @@ case "${1:-}" in
         shift
         step=
         while [ $# -gt 0 ]; do
-          case "$1" in --step) step=${2:-}; shift 2 ;; *) shift ;; esac
+          case "$1" in --step) step=${2:-}; shift; shift ;; *) shift ;; esac
         done
         if [ "$step" = ci ]; then printf '%s\n' "${FM_FAKE_CI_LOGS:-}"
         else printf '%s\n' "${FM_FAKE_STEP_LOGS:-}"; fi ;;
