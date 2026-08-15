@@ -172,7 +172,7 @@ const metadata = [tool.description, tool.promptSnippet, ...(tool.promptGuideline
 if (metadata.includes("Always use this tool")) throw new Error(`broad tool-selection metadata remained visible: ${metadata}`);
 if (!tool.description.includes("first required Pi watcher cycle")) throw new Error(`tool description omitted the first-cycle condition: ${tool.description}`);
 if (!tool.promptSnippet.includes("ordinary re-arming is automatic")) throw new Error(`tool snippet omitted automatic continuation: ${tool.promptSnippet}`);
-if (!tool.promptGuidelines.some((guideline) => guideline.includes("ordinary signal, stale, check, or heartbeat handling"))) {
+if (!tool.promptGuidelines.some((guideline) => guideline.includes("ordinary signal, stale, gone, check, or heartbeat handling"))) {
   throw new Error(`tool guidelines omitted ordinary-notification prevention: ${tool.promptGuidelines}`);
 }
 const result = await tool.execute("tool-call-1", {}, undefined, undefined, {});

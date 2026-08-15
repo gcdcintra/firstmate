@@ -149,9 +149,11 @@ function markLoaded(): void {
 }
 
 // The wake-reason prefix set. bin/fm-classify-lib.sh's FM_WAKE_REASON_PREFIX_RE
-// is its one owner; this is the single unavoidable second copy, because an
-// extension loaded into Pi's process cannot source a bash library. A kind
-// missing here is not silence but a false alarm: an unrecognized close is
+// is its one owner; this is one of the two copies that cannot read it, because
+// they are loaded into a harness process and cannot source a bash library. The
+// other is .opencode/plugins/fm-primary-watch-arm.js, and a new wake kind has
+// to be added here AND there. A kind missing here is not silence but a false
+// alarm: an unrecognized close is
 // classified below as "watcher: FAILED", which would send a supervisor hunting
 // a broken watcher instead of the dead worker the watcher actually reported.
 // tests/fm-pi-watch-extension.test.sh pins every kind to delivery by behavior.
@@ -483,7 +485,7 @@ export default function (pi: ExtensionAPI) {
     description: "Start the first required Pi watcher cycle, or repair one only after a notification says the cycle is missing, failed, or unhealthy. Do not call after ordinary work or ordinary notifications; the Pi extension re-arms automatically. Never run bin/fm-watch-arm.sh through bash.",
     promptSnippet: "Start the first required Pi watcher cycle or repair a cycle reported missing, failed, or unhealthy; ordinary re-arming is automatic.",
     promptGuidelines: [
-      "Call fm_watch_arm_pi only for the first required cycle or after a notification says the cycle is missing, failed, or unhealthy. Do not call it after ordinary work, turn completion, or ordinary signal, stale, check, or heartbeat handling because the Pi extension owns re-arming. Never run bin/fm-watch-arm.sh through bash.",
+      "Call fm_watch_arm_pi only for the first required cycle or after a notification says the cycle is missing, failed, or unhealthy. Do not call it after ordinary work, turn completion, or ordinary signal, stale, gone, check, or heartbeat handling because the Pi extension owns re-arming. Never run bin/fm-watch-arm.sh through bash.",
     ],
     parameters: Type.Object({}),
     renderShell: "self",

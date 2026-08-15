@@ -130,8 +130,10 @@ async function sessionOwnsLock(paths) {
 }
 
 // The wake-reason prefix set. bin/fm-classify-lib.sh's FM_WAKE_REASON_PREFIX_RE
-// is its one owner; this is a copy only because a plugin loaded into OpenCode's
-// process cannot source a bash library. A kind missing here is not silence but a
+// is its one owner; this is one of the two copies that cannot read it, because
+// they are loaded into a harness process and cannot source a bash library. The
+// other is .pi/extensions/fm-primary-pi-watch.ts, and a new wake kind has to be
+// added here AND there. A kind missing here is not silence but a
 // false alarm: an unrecognized reason is classified below as "watcher: FAILED",
 // which would send a supervisor hunting a broken watcher instead of the dead
 // worker the watcher actually reported. Stated once for both readers in this

@@ -92,9 +92,15 @@ FM_CLASSIFY_WEDGE_REASON_SEGMENT=', possible wedge, escalation '
 # and bin/fm-supervise-daemon.sh's is_wake_reason (away mode). All read this
 # ONE definition rather than hardcoding the alternation, so adding a wake kind
 # to bin/fm-wake-lib.sh's queue vocabulary cannot half-land with the kind
-# queued but undeliverable. The one unavoidable second copy is
-# .pi/extensions/fm-primary-pi-watch.ts, which cannot source bash; its test
-# suite pins it to this set by behavior.
+# queued but undeliverable. TWO recognizers cannot read this constant, because
+# they are loaded into a harness process and cannot source bash, so a new kind
+# must be added to BOTH of them by hand as well:
+# .pi/extensions/fm-primary-pi-watch.ts and
+# .opencode/plugins/fm-primary-watch-arm.js. Missing either one is worse than
+# silence there - both classify an unrecognized reason as a watcher failure, so
+# a dead worker would surface as a broken watcher.
+# tests/fm-pi-watch-extension.test.sh pins each of them to this set by
+# behavior, but over a hardcoded kind list, so that list needs the new kind too.
 #
 # Anchored and complete so a consumer can use it as its whole pattern. Anything
 # else on watcher stdout - "watcher: already running" on a singleton-lock

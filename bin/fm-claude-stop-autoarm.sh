@@ -30,7 +30,7 @@
 #     this hook-owned process tree (never shell &); Claude owns the process
 #     group, so its timeout/session teardown kills arm and watcher together.
 #   - Translation: while supervision is still needed and AFK remains inactive,
-#     an actionable arm close (signal:/stale:/check:/heartbeat) prints one
+#     an actionable arm close (signal:/stale:/gone:/check:/heartbeat) prints one
 #     rewake banner to stderr and exits 2, which wakes Claude even while idle
 #     ("Stop hook feedback"). A close that reports no actionable reason is
 #     benign when a live identity-matched watcher still has a fresh beacon.
