@@ -154,6 +154,8 @@ The CLI matrix was checked directly:
 All destructive verification used `bin/fm-herdr-lab.sh` with a non-default `fm-lab-` name and a byte-identical default-session tripwire.
 No ambient `herdr server stop` command is a supported test operation.
 
+The adapter's worker-pid resolver, which reads `pane process-info`'s `foreground_process_group_id` for the watcher's CPU-progress wedge check, was exercised against live panes; [supervision.md](supervision.md#worker-cpu-progress) owns that evidence.
+
 ### Busy-queued submit confirmation
 
 Checked 2026-08-10 with Herdr 0.8.0 on Linux x86_64 against a live Claude Code 2.1.226 agent pane held mid-turn, using only read and send calls on an existing pane.

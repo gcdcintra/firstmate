@@ -164,6 +164,8 @@ Classify each wake this way:
   Nonterminal progress remains transient even when its prose contains a legacy free-text token or its seen-status marker already matches, so record a marker and self-handle.
   If the pane is still idle past `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a possible wedge.
   This bounds wedge-detection latency to the threshold plus a tick: a delay, never a loss.
+  The watcher defers its own wedge escalation only while it measures the worker process still burning CPU, bounded by `FM_CPU_PROGRESS_MAX_DEFER_SECS`, which lengthens that delay without making it lossy.
+  A wedge escalation the watcher prints carries the shared possible-wedge reason segment (`FM_CLASSIFY_WEDGE_REASON_SEGMENT`, owned by `bin/fm-classify-lib.sh`) and is force-escalated ahead of the absorption above, because housekeeping's recheck drops a stale marker for a pane that still looks busy and a worker wedged mid-turn would otherwise never reach you.
   Healthy crewmates are autonomous and do not wait on firstmate mid-task.
 - `heartbeat` -> self-handle. The daemon runs its own cheap bash fleet scan
   every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a

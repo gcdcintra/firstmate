@@ -147,10 +147,12 @@ Deterministic entry points:
 ```sh
 tests/fm-cpu-progress.test.sh
 tests/fm-watch-triage.test.sh
+tests/fm-daemon.test.sh
 ```
 
 `tests/fm-cpu-progress.test.sh` drives real processes rather than canned `/proc` fixtures, since the guarantee is about the counter the kernel maintains.
 A live worker is not a usable stand-in for a wedged one: a quiet agent can resume mid-sample and then correctly reads as progressing, which is why the flat-counter cases use processes the test controls or a pane whose agent has actually exited.
+The escalation reason carrying that reading is also a contract with the away-mode daemon's force-escalate matcher, so `tests/fm-daemon.test.sh` pins both ends together: it feeds a real `bin/fm-watch.sh` wedge escalation through the daemon's own wake handling and fails if either side's wording drifts off the shared segment.
 
 ## Turn-end guard
 

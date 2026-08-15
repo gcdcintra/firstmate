@@ -41,10 +41,14 @@
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
 #   - Bounded wedge latency: a stale pane without a declared external wait is
-#     escalated only after it has been idle for STALE_ESCALATE_SECS
+#     escalated only after it has gone STALE_ESCALATE_SECS without pane output
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
-#     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
-#     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
+#     within STALE_ESCALATE_SECS + a tick, never lost - except while the watcher
+#     measures the worker process itself still burning CPU, which defers that
+#     escalation by the bounded budget bin/fm-watch.sh owns
+#     (FM_CPU_PROGRESS_MAX_DEFER_SECS): a longer delay, still not a loss.
+#     A declared pause instead gets its own longer PAUSE_RESURFACE_SECS
+#     recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
@@ -86,8 +90,9 @@
 #                                   disables. Use sparingly: it overrides the
 #                                   captain-relevant escalation for matching
 #                                   kinds.
-#          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
-#                                   as a possible wedge (default 240)
+#          FM_STALE_ESCALATE_SECS   seconds without pane output before a stale
+#                                   pane escalates as a possible wedge
+#                                   (default 240)
 #          FM_PAUSE_RESURFACE_SECS  idle seconds before a declared external wait
 #                                   re-surfaces as a recheck (default 3600)
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
