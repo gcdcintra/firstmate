@@ -177,6 +177,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-busy-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-worktree-owner-lib.sh
+. "$SCRIPT_DIR/fm-worktree-owner-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -330,6 +332,7 @@ spawn_abort_cleanup() {
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
             echo "backend=orca"
+            [ -z "${WORKTREE_OWNER_TOKEN:-}" ] || echo "worktree_owner=${WORKTREE_OWNER_TOKEN}"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
           } > "$STATE/$ID.meta" 2>/dev/null || true
@@ -1342,6 +1345,25 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   validate_spawn_worktree "treehouse get" "$T"
 fi
 
+# Claim the worktree for this task before anything else uses the path. A pooled
+# treehouse worktree is not reserved by the shell in it, so a task whose pane
+# disappears can have its slot handed to a newer task while its own meta still
+# names that path; this record is what lets teardown tell the two apart instead
+# of acting inside the newer task's live work. Secondmate homes are excluded:
+# they are leased (`treehouse get --lease`), so treehouse itself records their
+# holder. bin/fm-worktree-owner-lib.sh owns the contract and its limits.
+WORKTREE_OWNER_TOKEN=
+if [ "$KIND" != secondmate ] && [ -n "$WT" ] && [ -d "$WT" ]; then
+  WORKTREE_OWNER_TOKEN=$(fm_worktree_owner_mint) || {
+    echo "error: could not mint a worktree ownership token for $ID" >&2
+    exit 1
+  }
+  fm_worktree_owner_write "$WT" "$WORKTREE_OWNER_TOKEN" "$ID" "$FM_HOME" || {
+    echo "error: could not record ownership of worktree $WT for $ID" >&2
+    exit 1
+  }
+fi
+
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
 # Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside
@@ -1616,6 +1638,10 @@ META_WINDOW=$T
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  # The half of the ownership proof that lives in metadata; the other half is the
+  # marker written into the worktree above. Both must agree before teardown or any
+  # other destructive consumer may touch that path.
+  [ -z "${WORKTREE_OWNER_TOKEN:-}" ] || echo "worktree_owner=$WORKTREE_OWNER_TOKEN"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;

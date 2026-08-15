@@ -2,10 +2,12 @@
 # Behavior tests for the no-mistakes GATE-agent fleet-lifecycle refusal.
 #
 # A confused no-mistakes gate agent runs inside a firstmate checkout, adopts the
-# captain identity from AGENTS.md, and reaches for fm-spawn/fm-send/fm-teardown.
-# bin/fm-gate-refuse-lib.sh is the firstmate capability-removal half: sourced at
-# the top of those three entrypoints and called before any fleet mutation, it
-# fails closed on either of two independent signals:
+# captain identity from AGENTS.md, and reaches for fm-spawn.sh, fm-send.sh,
+# fm-teardown.sh, and fm-worktree-owner.sh (its record-writing `claim`, not its
+# read-only `show`). bin/fm-gate-refuse-lib.sh is the firstmate
+# capability-removal half: sourced at the top of those entrypoints and called
+# before any fleet mutation, it fails closed on either of two independent
+# signals:
 #   1. NO_MISTAKES_GATE set in the environment (the marker no-mistakes stamps);
 #   2. the current worktree's git-common-dir resolves under a no-mistakes gate
 #      repo (.../.no-mistakes/repos/*.git) - the unspoofable backstop, which
@@ -34,6 +36,7 @@ GATE_LIB="$ROOT/bin/fm-gate-refuse-lib.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
+WORKTREE_OWNER="$ROOT/bin/fm-worktree-owner.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
@@ -361,6 +364,68 @@ test_teardown_refuses_and_admits() {
   pass "fm-teardown: refuses on marker and gate-worktree backstop; a normal teardown is unaffected"
 }
 
+# A task whose ownership record was lost (a crewmate's own `git clean -fdx`), so
+# `claim` has exactly one thing to do: write back the record that authorizes a
+# later destructive teardown of that path.
+make_worktree_owner_case() {  # <name>
+  local name=$1 case_dir
+  case_dir="$TMP/$name"
+  mkdir -p "$case_dir/state"
+  fm_git_init_commit "$case_dir/project"
+  git -C "$case_dir/project" worktree add -q -b fm/task-x1 "$case_dir/wt"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" "endpoint_task_id=task-x1" \
+    "worktree=$case_dir/wt" "project=$case_dir/project" \
+    "kind=ship" "mode=local-only" \
+    "worktree_owner=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  printf '%s\n' "$case_dir"
+}
+
+# run_worktree_owner <cwd> <case_dir> <action> [ASSIGN...] -> combined output
+run_worktree_owner() {
+  local cwd=$1 case_dir=$2 action=$3; shift 3
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_STATE_OVERRIDE=$case_dir/state" "$@" \
+      "$WORKTREE_OWNER" "$action" task-x1 ) 2>&1
+}
+
+# `claim` writes the record a later teardown reads as permission to terminate
+# processes in that worktree and return it to the pool, so it is a fleet mutation
+# and refuses from a gate context like its sibling entrypoints. Read-only `show`
+# is a diagnostic and deliberately stays available.
+test_worktree_owner_claim_refuses_and_admits() {
+  local case_dir out rc marker=.fm-worktree-owner
+
+  # env-marker refuse: no record is written.
+  case_dir=$(make_worktree_owner_case owner-envmark)
+  out=$(run_worktree_owner "$NORMAL_CWD" "$case_dir" claim NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "worktree-owner claim: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "worktree-owner claim: env-marker refusal message"
+  assert_absent "$case_dir/wt/$marker" "worktree-owner claim: a refused claim must write no ownership record"
+
+  # path-backstop refuse (marker UNSET).
+  case_dir=$(make_worktree_owner_case owner-backstop)
+  out=$(run_worktree_owner "$GATE_WT" "$case_dir" claim); rc=$?
+  expect_code 3 "$rc" "worktree-owner claim: gate-worktree cwd must refuse with the marker unset"
+  assert_contains "$out" "$PATH_MSG" "worktree-owner claim: path-backstop refusal message"
+  assert_absent "$case_dir/wt/$marker" "worktree-owner claim: a refused backstop claim must write no ownership record"
+
+  # The read-only diagnostic still answers under the same marker, and changes nothing.
+  out=$(run_worktree_owner "$NORMAL_CWD" "$case_dir" show NO_MISTAKES_GATE=1); rc=$?
+  expect_code 0 "$rc" "worktree-owner show: the read-only diagnostic must stay available"
+  assert_contains "$out" "verdict=absent" "worktree-owner show: diagnostic did not report the missing record"
+  assert_absent "$case_dir/wt/$marker" "worktree-owner show: the diagnostic must write nothing"
+
+  # no-regression: a normal session restores the record.
+  case_dir=$(make_worktree_owner_case owner-ok)
+  out=$(run_worktree_owner "$NORMAL_CWD" "$case_dir" claim); rc=$?
+  expect_code 0 "$rc" "worktree-owner claim: a normal session must still restore the record"
+  assert_not_contains "$out" "$ENV_MSG" "worktree-owner claim: normal claim must not print the gate refusal"
+  assert_not_contains "$out" "$PATH_MSG" "worktree-owner claim: normal claim must not print the backstop refusal"
+  assert_present "$case_dir/wt/$marker" "worktree-owner claim: a normal claim did not write the record"
+  pass "fm-worktree-owner claim: refuses on marker and gate-worktree backstop; show and a normal claim are unaffected"
+}
+
 test_helper_env_marker_refuses
 test_helper_empty_env_marker_refuses
 test_helper_path_backstop_refuses
@@ -368,3 +433,4 @@ test_helper_normal_is_noop
 test_spawn_refuses_and_admits
 test_send_refuses_and_admits
 test_teardown_refuses_and_admits
+test_worktree_owner_claim_refuses_and_admits

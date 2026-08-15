@@ -641,8 +641,19 @@ fi
 TOOLS="$BACKEND_TOOLS $COMMON_TOOLS"
 NO_MISTAKES_MIN=1.31.2
 
+# The treehouse capability floor firstmate's worktree ownership rests on, probed
+# by capability rather than version so a vendored build is judged on what it can
+# actually do. Both halves are load-bearing: `get --lease` takes a secondmate home
+# durably, and `return --if-lease-holder` is the precondition that releases such a
+# home only while the lease is still ours. bin/fm-teardown.sh and
+# bin/fm-home-seed.sh treat the guarded return as a hard requirement and abort
+# rather than degrade to an unguarded one, so a treehouse offering only the first
+# would pass a lease-only probe here and then strand every leased home at
+# retirement with its lease never released. treehouse v2.0.1 is exactly that
+# shape; v2.1.1 carries both (docs/verification/worktree-ownership.md).
 treehouse_supports_lease() {
-  treehouse get --help 2>&1 | grep -Eq '(^|[^[:alnum:]_-])--lease([^[:alnum:]_-]|$)'
+  treehouse get --help 2>&1 | grep -Eq '(^|[^[:alnum:]_-])--lease([^[:alnum:]_-]|$)' || return 1
+  treehouse return --help 2>&1 | grep -Eq '(^|[^[:alnum:]_-])--if-lease-holder([^[:alnum:]_-]|$)'
 }
 
 # Shared semantic-version floor for the tool gates below. A version string that

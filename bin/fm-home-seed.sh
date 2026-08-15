@@ -519,6 +519,7 @@ SEED_ROLLBACK_ACTIVE=0
 SEED_COMMITTED=0
 SEED_HOME=
 SEED_HOME_ACQUIRED=0
+SEED_HOME_LEASE_HOLDER=
 SEED_HOME_CREATED=0
 SEED_HOME_BACKED_UP=0
 SEED_BACKUP_DIR=
@@ -580,6 +581,16 @@ seed_return_treehouse_home() {
   abs_home=$(seed_rollback_target "$home" "treehouse-acquired home") || return 0
   if ! command -v treehouse >/dev/null 2>&1; then
     echo "warning: failed to return treehouse-acquired home $abs_home during seed rollback; treehouse command not found" >&2
+    return 0
+  fi
+  # Return only the lease this seed took. --if-lease-holder is checked by treehouse
+  # atomically with the return, so a rollback can never release a slot that now
+  # belongs to someone else.
+  if [ -n "${SEED_HOME_LEASE_HOLDER:-}" ]; then
+    ( cd "$FM_ROOT" && treehouse return --force --if-lease-holder "$SEED_HOME_LEASE_HOLDER" "$abs_home" >/dev/null ) || {
+      echo "warning: failed to return treehouse-acquired home $abs_home during seed rollback; it is no longer leased to $SEED_HOME_LEASE_HOLDER or the return failed, so it was left in place" >&2
+      return 0
+    }
     return 0
   fi
   ( cd "$FM_ROOT" && treehouse return --force "$abs_home" >/dev/null ) || {
@@ -852,6 +863,7 @@ seed_home() {
 
   if [ "$requested_home" = "-" ]; then
     SEED_HOME_ACQUIRED=1
+    SEED_HOME_LEASE_HOLDER=$id
     home=$(acquire_treehouse_home "$id")
     SEED_HOME="$home"
     home=$(verify_firstmate_home "$home")

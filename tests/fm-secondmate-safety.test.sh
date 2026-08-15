@@ -316,8 +316,10 @@ test_home_seed_returns_treehouse_acquired_home_on_assignment_failure() {
     fail "seed reused an acquired home marked for another secondmate"
   fi
   grep -F 'already marked for other' "$err" >/dev/null || fail "seed did not explain acquired marked-home rejection"
-  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
-    || fail "failed acquired seed did not return the home through treehouse"
+  # Guarded by the lease this seed took, so a rollback can never release a slot
+  # that now belongs to someone else (treehouse checks it atomically).
+  grep -F "treehouse return --force --if-lease-holder dash $acquired_abs" "$log" >/dev/null \
+    || fail "failed acquired seed did not return the home through treehouse under its own lease holder"
   if [ -f "$home/data/secondmates.md" ] && grep -F -- '- dash ' "$home/data/secondmates.md" >/dev/null; then
     fail "failed acquired seed left a registry route"
   fi
@@ -350,8 +352,8 @@ test_home_seed_warns_when_acquired_home_return_fails() {
   grep -F "warning: failed to return treehouse-acquired home $acquired_abs during seed rollback" "$err" >/dev/null \
     || fail "seed rollback did not warn when treehouse return failed"
   [ -f "$lease" ] || fail "failed rollback return did not preserve lease evidence"
-  grep -F "treehouse return --force $acquired_abs" "$log" >/dev/null \
-    || fail "failed rollback did not attempt to return the acquired home"
+  grep -F "treehouse return --force --if-lease-holder dash $acquired_abs" "$log" >/dev/null \
+    || fail "failed rollback did not attempt to return the acquired home under its own lease holder"
   pass "home seed rollback warns when treehouse-acquired return fails"
 }
 
@@ -1488,7 +1490,7 @@ EOF
     FM_FAKE_TREEHOUSE_LEASE_FILE="$lease" \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>/dev/null \
     || fail "teardown failed for empty secondmate home"
-  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null || fail "teardown did not release the secondmate home lease via treehouse return"
+  grep -F "treehouse return --force --if-lease-holder domain $subhome_abs" "$log" >/dev/null || fail "teardown did not release the secondmate home lease under its own lease holder"
   [ ! -e "$lease" ] || fail "teardown left the secondmate home lease held after retirement"
   [ ! -d "$subhome" ] || fail "teardown did not remove the retired secondmate home"
   [ ! -e "$home/state/domain.meta" ] || fail "teardown did not clear parent meta"
@@ -1769,7 +1771,7 @@ EOF
   set -e
 
   [ "$rc" -ne 0 ] || fail "teardown succeeded despite failed treehouse return"
-  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null || fail "teardown did not try to return the leased home"
+  grep -F "treehouse return --force --if-lease-holder domain $subhome_abs" "$log" >/dev/null || fail "teardown did not try to return the leased home under its own lease holder"
   grep -F 'treehouse return failed for secondmate home' "$err" >/dev/null || fail "teardown did not report failed leased home return"
   [ -d "$subhome" ] || fail "teardown removed a leased home after return failed"
   [ -e "$subhome/state/procevent/source.source" ] || fail "failed leased-home return did not restore the source registration"
@@ -1820,7 +1822,7 @@ EOF
     FM_FAKE_TREEHOUSE_RETURN_FAIL=1 \
     "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>/dev/null \
     || fail "teardown failed for plain-clone secondmate home"
-  grep -F "treehouse return --force $subhome_abs" "$log" >/dev/null && fail "teardown tried to return a plain-clone home through treehouse"
+  grep -F "treehouse return" "$log" | grep -F "$subhome_abs" >/dev/null && fail "teardown tried to return a plain-clone home through treehouse"
   [ ! -d "$subhome" ] || fail "teardown did not remove the plain-clone secondmate home"
   [ ! -e "$home/state/domain.meta" ] || fail "teardown did not clear parent meta for plain-clone home"
   grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null && fail "teardown did not remove plain-clone registry route"
@@ -2424,6 +2426,408 @@ EOF
   pass "force teardown refuses unregistered child worktree paths"
 }
 
+# A secondmate's child worktrees come from the same pool as any other task's and
+# go stale the same way. Forced retirement discards THAT secondmate's work; it
+# must never remove a pooled worktree the pool has since handed to another task.
+test_secondmate_force_teardown_refuses_reassigned_child_worktree() {
+  local home subhome childproj childwt fakebin err log
+  home="$TMP_ROOT/reassigned-child-home"
+  subhome="$TMP_ROOT/reassigned-child-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/reassigned-child-worktree"
+  err="$TMP_ROOT/reassigned-child.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$subhome/projects"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  # A genuine, registered worktree of the child project, so the ONLY thing wrong
+  # is who owns it now.
+  fm_git_init_commit "$childproj"
+  git -C "$childproj" worktree add --quiet -b fm/child "$childwt"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+worktree_owner=cccccccccccccccccccccccccccccccc
+EOF
+  # The pool reassigned that path: it now carries a different task's record.
+  printf 'token=dddddddddddddddddddddddddddddddd\ntask=other-task\nhome=/elsewhere\n' \
+    > "$childwt/.fm-worktree-owner"
+
+  fakebin=$(make_fake_tmux "$TMP_ROOT/reassigned-child-fake")
+  log="$TMP_ROOT/reassigned-child-fake/tmux.log"
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/reassigned-child-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"; then
+    fail "force teardown removed a child worktree another task now holds"
+  fi
+  [ -d "$childwt" ] || fail "force teardown removed the reassigned child worktree"
+  grep -F 'task=other-task' "$childwt/.fm-worktree-owner" >/dev/null \
+    || fail "force teardown disturbed the new holder's ownership record"
+  [ -d "$subhome" ] || fail "force teardown removed subhome after reassigned child refusal"
+  [ -e "$home/state/domain.meta" ] || fail "force teardown cleared parent meta after reassigned child refusal"
+  [ -e "$subhome/state/child.meta" ] || fail "force teardown cleared child meta after reassigned child refusal"
+  grep -F 'kill-window' "$log" >/dev/null && fail "force teardown killed windows before reassigned child refusal"
+  grep -F 'no longer provably held by child' "$err" >/dev/null \
+    || fail "force teardown did not explain the reassigned child rejection: $(cat "$err")"
+  grep -F 'held by task other-task' "$err" >/dev/null \
+    || fail "force teardown did not name the task now holding the child worktree"
+  pass "force teardown refuses a child worktree the pool has reassigned to another task"
+}
+
+# The pool can reassign a child's slot while teardown waits out a stale git lock,
+# after the pre-return checks already passed. The recheck after each wait must
+# re-prove the child's ownership before the retried return, or the return resets
+# the NEW holder's worktree. The fake keeps the record intact until the LAST
+# locked attempt, so the reassignment lands in the one window only the
+# post-stale-lock recheck can close; the refused return must then fail the
+# retirement with every child record retained, never report success.
+test_secondmate_force_teardown_rechecks_child_ownership_after_stale_lock() {
+  local home subhome childproj childwt fakebin log err rc lock
+  home="$TMP_ROOT/stale-lock-reassign-home"
+  subhome="$TMP_ROOT/stale-lock-reassign-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/stale-lock-reassign-child-worktree"
+  err="$TMP_ROOT/stale-lock-reassign.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  fm_git_worktree "$childproj" "$childwt" stale-lock-reassign-child
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+worktree_owner=cccccccccccccccccccccccccccccccc
+EOF
+  printf 'token=cccccccccccccccccccccccccccccccc\ntask=child\nhome=%s\n' "$subhome" \
+    > "$childwt/.fm-worktree-owner"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/stale-lock-reassign-fake")
+  log="$TMP_ROOT/stale-lock-reassign-fake/tmux.log"
+  # A return that keeps failing on the child's index.lock, hands the slot to
+  # another task on its final locked attempt (after the last in-loop recheck ran),
+  # and would succeed once the lock is gone.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
+case "${1:-}" in
+  return)
+    shift
+    target=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --force) ;;
+        *) target=$1 ;;
+      esac
+      shift
+    done
+    lock=$(git -C "$target" rev-parse --git-path index.lock 2>/dev/null || true)
+    if [ -n "$lock" ] && [ -e "$lock" ]; then
+      count_file="${TREEHOUSE_ATTEMPT_FILE:?}"
+      count=0
+      if [ -f "$count_file" ]; then
+        count=$(cat "$count_file")
+      fi
+      count=$(( count + 1 ))
+      printf '%s\n' "$count" > "$count_file"
+      if [ "$count" -ge 2 ]; then
+        printf 'token=dddddddddddddddddddddddddddddddd\ntask=other-task\nhome=/elsewhere\n' \
+          > "$target/.fm-worktree-owner"
+      fi
+      echo "fatal: Unable to create '$lock': File exists." >&2
+      exit 128
+    fi
+    [ -n "$target" ] && rm -rf -- "$target"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  cat > "$fakebin/lsof" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/treehouse" "$fakebin/lsof"
+  lock=$(git -C "$childwt" rev-parse --git-path index.lock)
+  mkdir -p "$(dirname "$lock")"
+  : > "$lock"
+  touch -t 200001010000 "$lock"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/stale-lock-reassign-fake/pane.txt" \
+    TREEHOUSE_ATTEMPT_FILE="$TMP_ROOT/stale-lock-reassign-attempts" \
+    FM_TREEHOUSE_RETURN_LOCK_RETRIES=1 \
+    FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS=0 FM_STALE_WORKTREE_LOCK_AGE_SECS=1 \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "force teardown reported success after refusing the child's return"
+  [ -d "$childwt" ] || fail "force teardown destroyed a child worktree reassigned during the stale-lock wait"
+  grep -F 'task=other-task' "$childwt/.fm-worktree-owner" >/dev/null \
+    || fail "force teardown disturbed the new holder's ownership record"
+  grep -F 'no longer provably held by child' "$err" >/dev/null \
+    || fail "force teardown did not re-prove child ownership after the stale-lock wait: $(cat "$err")"
+  grep -F 'aborted after stale-lock cleanup' "$err" >/dev/null \
+    || fail "force teardown did not abort the child return after the failed recheck: $(cat "$err")"
+  grep -F "retaining that child's records and stopping forced cleanup" "$err" >/dev/null \
+    || fail "the refused child removal did not propagate out of the cleanup loop: $(cat "$err")"
+  [ -e "$subhome/state/child.meta" ] || fail "force teardown erased the child's records despite the refused return"
+  [ -e "$home/state/domain.meta" ] || fail "force teardown cleared the parent record despite the refused return"
+  [ -d "$subhome" ] || fail "force teardown removed the home despite the refused return"
+  pass "force teardown re-proves child ownership after a stale-lock wait and fails loudly on the refusal"
+}
+
+# A refusal nobody can resolve becomes its own trap: --force is already in
+# effect, --disown-worktree is refused for a secondmate at preflight, and the
+# top-level claim/disown resolutions operate on the current home's state, not on
+# a subhome child's. The refusal must therefore name a way forward that satisfies
+# the check, and that stated path - disowning the child inside its own home -
+# must actually unblock the retirement while the reassigned worktree stays
+# untouched.
+test_secondmate_reassigned_child_refusal_names_a_working_resolution() {
+  local home subhome childproj childwt fakebin err err2 err3 log rc
+  home="$TMP_ROOT/child-resolution-home"
+  subhome="$TMP_ROOT/child-resolution-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/child-resolution-child-worktree"
+  err="$TMP_ROOT/child-resolution.err"
+  err2="$TMP_ROOT/child-resolution-disown.err"
+  err3="$TMP_ROOT/child-resolution-rerun.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state" "$subhome/projects"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  fm_git_init_commit "$childproj"
+  git -C "$childproj" worktree add --quiet -b fm/child "$childwt"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=local-only
+yolo=off
+worktree_owner=cccccccccccccccccccccccccccccccc
+EOF
+  printf 'token=dddddddddddddddddddddddddddddddd\ntask=other-task\nhome=/elsewhere\n' \
+    > "$childwt/.fm-worktree-owner"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/child-resolution-fake")
+  log="$TMP_ROOT/child-resolution-fake/tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-resolution-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "forced retirement should refuse while the child's worktree is another task's"
+  grep -F "FM_HOME=$subhome bin/fm-teardown.sh child --disown-worktree" "$err" >/dev/null \
+    || fail "the child refusal did not name the resolution path: $(cat "$err")"
+
+  # The stated path is not a force flag: it satisfies the check by disowning the
+  # child inside its own home, touching nothing under the reassigned path.
+  PATH="$fakebin:$PATH" FM_HOME="$subhome" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-resolution-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" child --disown-worktree >/dev/null 2>"$err2" \
+    || fail "the refusal's stated resolution path failed: $(cat "$err2")"
+  [ ! -e "$subhome/state/child.meta" ] || fail "child disown did not clear the child's record"
+  [ -d "$childwt" ] || fail "child disown removed the reassigned worktree"
+  grep -F 'task=other-task' "$childwt/.fm-worktree-owner" >/dev/null \
+    || fail "child disown disturbed the new holder's ownership record"
+
+  # And the retirement it was blocking now completes.
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/child-resolution-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force >/dev/null 2>"$err3" \
+    || fail "forced retirement still refused after the stated resolution: $(cat "$err3")"
+  [ ! -d "$subhome" ] || fail "retirement did not remove the retired home"
+  [ ! -e "$home/state/domain.meta" ] || fail "retirement did not clear the parent record"
+  if grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null; then
+    fail "retirement did not remove the registry route"
+  fi
+  [ -d "$childwt" ] || fail "retirement touched the reassigned worktree"
+  pass "a reassigned child's refusal names a resolution that satisfies the check and unblocks retirement"
+}
+
+# The lease-holder guard must never silently degrade: a guarded return failure
+# that is neither treehouse's "lease holder does not match" nor its "is not
+# leased" signature - an older treehouse rejecting the flag, any genuine error -
+# fails the teardown loudly instead of falling back to a return with no holder
+# precondition.
+test_secondmate_teardown_never_degrades_guarded_return_to_unguarded() {
+  local home subhome subhome_abs fmroot fakebin log err rc
+  home="$TMP_ROOT/guarded-degrade-home"
+  subhome="$TMP_ROOT/guarded-degrade-subhome"
+  fmroot="$TMP_ROOT/guarded-degrade-fmroot"
+  err="$TMP_ROOT/guarded-degrade.err"
+  make_firstmate_git_root "$fmroot"
+  git -C "$fmroot" worktree add --quiet --detach "$subhome" HEAD
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  subhome_abs=$(cd "$subhome" && pwd -P)
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/guarded-degrade-fake")
+  log="$TMP_ROOT/guarded-degrade-fake/tmux.log"
+  # An older treehouse that does not know the guard flag: the guarded return
+  # fails with a usage error matching neither refusal signature, while an
+  # unguarded return would destroy the target.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'treehouse %s\n' "$*" >> "${FM_FAKE_TMUX_LOG:-/dev/null}"
+case "${1:-}" in
+  return)
+    case " $* " in
+      *' --if-lease-holder '*)
+        echo "error: unknown option --if-lease-holder" >&2
+        exit 2
+        ;;
+    esac
+    shift
+    target=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --force) ;;
+        *) target=$1 ;;
+      esac
+      shift
+    done
+    [ -n "$target" ] && rm -rf -- "$target"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_ROOT_OVERRIDE="$fmroot" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/guarded-degrade-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain >/dev/null 2>"$err"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "teardown succeeded through a guarded return that could not be verified"
+  [ -d "$subhome" ] || fail "an unverifiable guarded return still released the home"
+  grep -F "treehouse return --force --if-lease-holder domain $subhome_abs" "$log" >/dev/null \
+    || fail "teardown did not attempt the guarded return"
+  if grep -F 'treehouse return' "$log" | grep -Fv -- '--if-lease-holder' | grep -q .; then
+    fail "guarded return failure degraded to an unguarded return: $(cat "$log")"
+  fi
+  [ -e "$home/state/domain.meta" ] || fail "teardown cleared meta after an unverifiable guarded return"
+  grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null \
+    || fail "teardown removed the registry route after an unverifiable guarded return"
+  pass "a guarded home return never degrades to an unguarded one on an unrecognized failure"
+}
+
+# An invalid flag combination must refuse before any destructive work:
+# --disown-worktree never applies to a secondmate, and saying so must come
+# before forced child cleanup can kill windows or remove child worktrees.
+test_secondmate_force_disown_refuses_before_child_cleanup() {
+  local home subhome childproj childwt fakebin log err rc
+  home="$TMP_ROOT/disown-secondmate-home"
+  subhome="$TMP_ROOT/disown-secondmate-subhome"
+  childproj="$subhome/projects/alpha"
+  childwt="$TMP_ROOT/disown-secondmate-child-worktree"
+  err="$TMP_ROOT/disown-secondmate.err"
+  mkdir -p "$home/state" "$home/data" "$subhome/state"
+  fm_git_worktree "$childproj" "$childwt" disown-secondmate-child
+  printf 'domain\n' > "$subhome/.fm-secondmate-home"
+  cat > "$home/state/domain.meta" <<EOF
+window=firstmate:fm-domain
+worktree=$subhome
+project=$subhome
+harness=echo
+kind=secondmate
+mode=secondmate
+yolo=off
+home=$subhome
+projects=alpha
+EOF
+  printf '%s\n' '- domain - design domain (home: '"$subhome"'; scope: design domain; projects: alpha; added 2026-06-22)' > "$home/data/secondmates.md"
+  cat > "$subhome/state/child.meta" <<EOF
+window=firstmate:fm-child
+worktree=$childwt
+project=$childproj
+harness=echo
+kind=ship
+mode=no-mistakes
+yolo=off
+EOF
+  fakebin=$(make_fake_tmux "$TMP_ROOT/disown-secondmate-fake")
+  log="$TMP_ROOT/disown-secondmate-fake/tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/disown-secondmate-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" domain --force --disown-worktree >/dev/null 2>"$err"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "teardown accepted --disown-worktree for a secondmate"
+  grep -F -- '--disown-worktree does not apply to secondmate domain' "$err" >/dev/null \
+    || fail "teardown did not explain the secondmate disown refusal: $(cat "$err")"
+  [ -d "$childwt" ] || fail "secondmate disown refusal destroyed a child worktree first"
+  [ -d "$subhome" ] || fail "secondmate disown refusal removed the home first"
+  [ -e "$subhome/state/child.meta" ] || fail "secondmate disown refusal cleared child records first"
+  [ -e "$home/state/domain.meta" ] || fail "secondmate disown refusal cleared the parent record first"
+  grep -F 'kill-window' "$log" >/dev/null && fail "secondmate disown refusal killed windows first"
+  grep -F -- '- domain ' "$home/data/secondmates.md" >/dev/null \
+    || fail "secondmate disown refusal removed the registry route first"
+  pass "--force --disown-worktree on a secondmate refuses before any child cleanup"
+}
+
 test_secondmate_idle_pane_is_not_stale() {
   local home fakebin out pid window
   home="$TMP_ROOT/watch-home"
@@ -2664,6 +3068,11 @@ test_secondmate_force_teardown_prevalidates_before_child_cleanup
 test_secondmate_force_teardown_refuses_child_active_home_descendant
 test_secondmate_force_teardown_refuses_child_repo_descendant
 test_secondmate_force_teardown_refuses_unregistered_child_worktree
+test_secondmate_force_teardown_refuses_reassigned_child_worktree
+test_secondmate_force_teardown_rechecks_child_ownership_after_stale_lock
+test_secondmate_reassigned_child_refusal_names_a_working_resolution
+test_secondmate_teardown_never_degrades_guarded_return_to_unguarded
+test_secondmate_force_disown_refuses_before_child_cleanup
 test_secondmate_teardown_path_boundary_matrix
 test_secondmate_idle_pane_is_not_stale
 test_secondmate_charter_brief_is_idle_by_default

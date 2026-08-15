@@ -13,8 +13,8 @@
 # instructions and stamps NO_MISTAKES_GATE into the gate agent's environment).
 # THIS is the firstmate capability-removal half: an enforceable script refusal,
 # not a prose rule the neutralized agent would never read. It is sourced at the
-# top of the three fleet-lifecycle entrypoints and called before any fleet
-# mutation, so a gate agent that still reaches for the fleet is stopped cold.
+# top of the fleet-lifecycle entrypoints and called before any fleet mutation, so
+# a gate agent that still reaches for the fleet is stopped cold.
 #
 # Two independent signals, either of which refuses (fail closed):
 #
@@ -38,7 +38,7 @@
 # HEAD-continuity guard, which remains the adversarial/residual backstop.
 #
 # TEST-HARNESS ESCAPE HATCH (FM_GATE_REFUSE_BYPASS=1): firstmate's own test suite
-# must exercise the REAL fm-spawn/fm-send/fm-teardown, but the no-mistakes gate
+# must exercise the REAL fleet-lifecycle entrypoints, but the no-mistakes gate
 # runs that suite FROM a gate worktree (cwd git-common-dir under
 # .no-mistakes/repos/*.git, and possibly NO_MISTAKES_GATE set) - the exact
 # environment this guard refuses. So both signals would fire during firstmate's
@@ -54,7 +54,9 @@
 # tests/fm-gate-refuse.test.sh strips the bypass so it still verifies real refusal.
 #
 # Sourced by bin/fm-spawn.sh, bin/fm-send.sh, bin/fm-teardown.sh,
-# bin/fm-sessionstart-nudge.sh, and the tests.
+# bin/fm-worktree-owner.sh, bin/fm-sessionstart-nudge.sh, and the tests. In
+# bin/fm-worktree-owner.sh only the record-writing `claim` calls the refusal; its
+# read-only `show` diagnostic mutates nothing and stays available.
 # No side effects on source. set -u / set -e safe. The refusal is a hard exit,
 # not a return, because there is no safe way to continue a fleet mutation from a
 # gate context.
