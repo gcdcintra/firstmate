@@ -33,6 +33,17 @@
 #     caller bounds total deferral rather than deferring forever.
 #   - An agent blocked waiting on ONE long-running child shows flat own-CPU
 #     until that child is reaped, so it escalates. Unchanged from before.
+#   - An agent IDLE AT ITS PROMPT cannot be told apart from a working one here:
+#     a prompt animation measured 0.58-3.82 ticks/s, straddling the floor. This
+#     library cannot close that overlap, so the caller does not ask it to - only
+#     the busy-turn path may defer, and a pane with no turn in progress
+#     escalates on its ordinary cadence whatever this returns.
+#   - A turn that OPENS but never closes is the residual of that arrangement: a
+#     pane keeps an exact busy verdict until a turn-close event arrives, so a
+#     harness whose turn end can go unreported would stay deferrable. Claude
+#     covers this with its StopFailure hook; a harness without an equivalent
+#     does not, and its unreported turn end is a gap in the busy contract
+#     (bin/fm-busy-lib.sh), not something this measure can detect.
 #
 # Measure: fields 14-17 of /proc/<pid>/stat - utime+stime (the agent's own CPU)
 # plus cutime+cstime (CPU of children it has REAPED). The children term is the

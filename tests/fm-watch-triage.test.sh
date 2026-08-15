@@ -1809,6 +1809,186 @@ test_cpu_progress_deferral_is_bounded() {
   pass "CPU-progress deferral is bounded, and the escalation past the cap names the spin loop it cannot see"
 }
 
+# --- CPU deferral is scoped to the busy-turn path ---------------------------
+#
+# The deferral above exists for a worker inside ONE long tool-driven turn. An
+# agent sitting at its prompt is not in a turn at all, and its prompt animation
+# measured 0.58-3.82 ticks/s against the 2.0 floor - so on the three non-busy
+# wedge paths the same reading would excuse a worker that had simply STOPPED.
+# Live case behind this: a worker cut off by a connection error sat idle at its
+# prompt with no status line and was caught by a stale alarm nine minutes later.
+# Deferring that for the full budget would have hidden it for hours.
+
+test_idle_at_prompt_stale_is_never_deferred() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  dir=$(make_case cpu-idle-at-prompt); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  window="test:fm-cpu-idle"
+  printf 'idle at prompt' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet.meta"
+  printf 'working: still compiling\n' > "$state/quiet.status"
+  sig=$(seen_sig "$state/quiet.status"); printf '%s' "$sig" > "$state/.seen-quiet_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle at prompt")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Already absorbed as a provably-working stale, so every poll below takes the
+  # repeat-poll wedge branch. Without this the first polls run through the
+  # not-yet-stale reset, which clears the CPU anchor this case depends on.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  date +%s > "$state/.stale-since-$key"
+  # No busy record is written, so this pane reaches the NON-busy wedge path.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · ci running'
+  # Bind the pane to a process that really is burning CPU: without this the
+  # test would pass on a flat counter and prove nothing about the restriction.
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  # Phase A: mature the sampling window and confirm the measure really does
+  # read this worker as progressing.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 80; then
+    cpu_reap_kids; reap "$pid"; unset FM_FAKE_CREW_STATE
+    fail "the idle-at-prompt fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; unset FM_FAKE_CREW_STATE
+         fail "the watcher did not measure the fixture as progressing, so this case would not test the restriction: $(cat "$state/.cpu-$key")"; }
+
+  # Phase B: past the threshold. A progressing reading must NOT hold this back.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_for_exit "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; unset FM_FAKE_CREW_STATE
+    fail "a worker idle at its prompt was deferred instead of escalated: $(cat "$out")"
+  fi
+  cpu_reap_kids
+  grep -F "possible wedge" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the idle-at-prompt escalation did not flag a possible wedge: $(cat "$out")"; }
+  grep -F "no turn in progress" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the escalation did not say why the CPU reading was not allowed to defer: $(cat "$out")"; }
+  [ ! -e "$state/.cpu-defer-since-$key" ] \
+    || { unset FM_FAKE_CREW_STATE; fail "a non-busy pane opened a deferral episode"; }
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "drain after the idle-at-prompt escalation failed"; }
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "the idle-at-prompt escalation was not queued"; }
+  unset FM_FAKE_CREW_STATE
+  pass "a worker idle at its prompt is never deferred on a non-busy wedge path, however much CPU it reads"
+}
+
+# The busy verdict is what gates deferral, so a turn that legitimately runs for
+# hours must keep it. The busy record carries a ts but nothing ages it out - if
+# that ever changed, the long-turn reproduction this whole predicate exists for
+# would start escalating again the moment the record went stale.
+test_long_turn_keeps_its_busy_verdict_and_still_defers() {
+  local dir state fakebin out window key pid busyf
+  window="test:fm-cpu-longturn"
+  dir=$(cpu_wedge_case cpu-progress-long-turn "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # Same id the fixture derives from the window name.
+  busyf="$state/${window#*:fm-}.busy-state"
+  [ -f "$busyf" ] || fail "fixture wrote no busy record at $busyf"
+  # Age the record by four hours, well past any plausible turn length.
+  sed -i "s/ts=[0-9]*/ts=$(( $(date +%s) - 14400 ))/" "$busyf"
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  # Phase A: mature the sampling window, as the other CPU cases do - a first
+  # poll with no window yet reads `unknown` and would escalate for that reason
+  # rather than for anything to do with the turn's age.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 80; then
+    cpu_reap_kids; reap "$pid"
+    fail "the four-hour-old turn fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the fixture as progressing: $(cat "$state/.cpu-$key")"; }
+
+  # Phase B: past the threshold. The busy verdict is four hours old; if it had
+  # aged out, this pane would drop to a non-busy path and escalate.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"
+    fail "a four-hour-old turn lost its busy verdict and was escalated: $(cat "$out")"
+  fi
+  reap "$pid"
+  [ ! -s "$out" ] || { cpu_reap_kids; fail "a long productive turn printed a wake reason: $(cat "$out")"; }
+  [ -s "$state/.cpu-defer-since-$key" ] \
+    || { cpu_reap_kids; fail "a four-hour-old turn did not defer, so the busy verdict did not survive the turn length"; }
+  cpu_reap_kids
+  pass "a turn hours old keeps its busy verdict, so the long-turn reproduction still defers"
+}
+
+# The deferral epoch records when the episode OPENED and is never refreshed -
+# that is exactly what lets the budget latch. The operator-facing text must not
+# turn that into a claim that the pane is still being suppressed.
+test_spent_budget_reason_does_not_claim_ongoing_suppression() {
+  local dir state fakebin out window key pid
+  window="test:fm-cpu-spent-text"
+  dir=$(cpu_wedge_case cpu-progress-spent-text "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  # Phase A: mature the sampling window, so the escalation below is decided by
+  # the spent budget rather than by an unmeasurable one.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 80; then
+    cpu_reap_kids; reap "$pid"; fail "the spent-budget fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the fixture as progressing: $(cat "$state/.cpu-$key")"; }
+
+  # Phase B: budget opened 4000s ago and the cap is 3600s, so it is spent. The
+  # wedge timer's own age (500s) stays far below the cap, so nothing BUT the
+  # spent budget can end the deferral here.
+  echo $(( $(date +%s) - 4000 )) > "$state/.cpu-defer-since-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_CPU_PROGRESS_MAX_DEFER_SECS=3600 FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 45 \
+    || { cpu_reap_kids; reap "$pid"; fail "a spent deferral budget did not return the pane to the normal cadence: $(cat "$out")"; }
+  cpu_reap_kids
+  grep -F "budget is spent" "$out" >/dev/null \
+    || fail "the escalation did not say the deferral budget was spent: $(cat "$out")"
+  grep -F "suppression ended at the cap" "$out" >/dev/null \
+    || fail "the escalation did not distinguish the episode's age from how long it actually suppressed: $(cat "$out")"
+  pass "past its budget the pane escalates again, and the reason reports the episode age without claiming it is still being suppressed"
+}
+
 test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
   local dir state fakebin out capture_file window key pane_hash sig pid since
   dir=$(make_case nonterminal-stale-timer-repair); state="$dir/state"; fakebin="$dir/fakebin"
@@ -2370,6 +2550,9 @@ test_hung_worker_still_escalates_with_its_evidence
 test_unmeasurable_worker_still_escalates
 test_cpu_progress_deferral_is_bounded
 test_spent_deferral_budget_escalates_on_the_normal_cadence
+test_idle_at_prompt_stale_is_never_deferred
+test_long_turn_keeps_its_busy_verdict_and_still_defers
+test_spent_budget_reason_does_not_claim_ongoing_suppression
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces

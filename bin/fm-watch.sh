@@ -49,15 +49,21 @@
 #                          count, and demand-deep-inspection marker, for human
 #                          inspection only - never an automatic interrupt,
 #                          signal, or restart of the worker or its tool process.
-#                          Every wedge escalation, from either path, first
-#                          consults the worker process's own CPU counter
-#                          (bin/fm-cpu-progress-lib.sh) and defers while that is
-#                          measurably progressing, up to
-#                          FM_CPU_PROGRESS_MAX_DEFER_SECS. Only a `progressing`
-#                          verdict defers; a flat counter (a hung agent, or one
-#                          blocked on a stuck TCP send queue) and every
-#                          unmeasurable case escalate as before, and every
-#                          escalation carries the CPU evidence it observed.
+#                          Every wedge escalation carries the worker process's
+#                          own CPU reading (bin/fm-cpu-progress-lib.sh), but
+#                          ONLY the busy-turn path may DEFER on it, up to
+#                          FM_CPU_PROGRESS_MAX_DEFER_SECS - that pane holds an
+#                          exact busy verdict with no completed turn, the one
+#                          state in which a worker cannot speak for itself. The
+#                          three non-busy wedge paths have no turn in progress,
+#                          so their measured process is an agent at its prompt,
+#                          whose idle animation overlaps a working reading; they
+#                          escalate on their ordinary cadence whatever the CPU
+#                          says, so a worker that simply STOPPED is still caught
+#                          within minutes. Only a `progressing` verdict ever
+#                          defers; a flat counter (a hung agent, or one blocked
+#                          on a stuck TCP send queue) and every unmeasurable
+#                          case escalate as before.
 #                          That deferral allowance is a per-pane budget spent
 #                          once: past it the pane escalates on the ordinary
 #                          STALE_ESCALATE_SECS cadence - reaching
@@ -315,13 +321,19 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # FM_WEDGE_DEMAND_INSPECT_COUNT - until it goes genuinely active again.
 CPU_PROGRESS_MAX_DEFER_SECS=${FM_CPU_PROGRESS_MAX_DEFER_SECS:-7200}
 
+# The ONE spelling of a window's marker-key transform, so the key contract that
+# fm-supervise-daemon.sh's _stale_key must stay in sync with is stated once.
+window_key() {  # <window>
+  printf '%s' "$1" | tr ':/.' '___'
+}
+
 # cpu_progress_for_window: "<class> <evidence>" for the worker process behind
 # <window>, keyed by the same window key as the other watcher markers.
 # bin/fm-cpu-progress-lib.sh owns the measure, the record, and the rule that
 # every failure mode returns `unknown` rather than a false `progressing`.
 cpu_progress_for_window() {  # <window>
   local w=$1 key
-  key=$(printf '%s' "$w" | tr ':/.' '___')
+  key=$(window_key "$w")
   fm_cpu_progress_check "$STATE/.cpu-$key" "$(window_backend "$w")" "$w"
 }
 
@@ -335,7 +347,7 @@ cpu_progress_for_window() {  # <window>
 # deferral budget.
 clear_wedge_tracking() {  # <window>
   local win=$1 key
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(window_key "$win")
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" \
     "$STATE/.cpu-$key" "$STATE/.cpu-defer-since-$key"
 }
@@ -348,8 +360,19 @@ clear_wedge_tracking() {  # <window>
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+#
+# <cpu-deferral-allowed> is 1 ONLY on the busy-turn call sites, where the pane
+# holds an exact busy verdict with no completed turn - the one state in which a
+# worker is structurally unable to speak for itself. Everywhere else it is 0:
+# those panes have no turn in progress, so the measured process is an agent
+# sitting at its prompt, and an idle prompt animation reads 0.58-3.82 ticks/s
+# against a 2.0 floor. Deferring on that would delay a worker that simply
+# STOPPED - the shape a stale alarm catches within minutes today. The parameter
+# is explicit rather than inferred from <triage-label>, and it defaults to 0, so
+# a future call site that forgets it escalates rather than silently deferring.
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <cpu-deferral-allowed>
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 cpu_deferral=${5:-0}
+  local since age n reason
   local cpu cpu_class cpu_detail defer_file defer_since deferred_for may_defer now
   local budget_spent budget_detail
   # Sample on EVERY poll of an aging pane, not only when an escalation is due:
@@ -360,7 +383,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
   cpu=$(cpu_progress_for_window "$win")
   cpu_class=${cpu%% *}
   cpu_detail=${cpu#* }
-  defer_file="$STATE/.cpu-defer-since-$(printf '%s' "$win" | tr ':/.' '___')"
+  defer_file="$STATE/.cpu-defer-since-$(window_key "$win")"
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -399,11 +422,17 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
               budget_detail="the clock stepped backwards since it was recorded"
             elif [ "$deferred_for" -ge "$CPU_PROGRESS_MAX_DEFER_SECS" ]; then
               budget_spent=1
-              budget_detail="already deferred for ${deferred_for}s"
+              # The epoch records when the episode OPENED and is deliberately
+              # never refreshed - refreshing it would reset this comparison and
+              # the budget could never latch at all. Report the episode age as
+              # exactly that, so a supervisor reading it on the twentieth
+              # post-budget escalation is not told the pane is still being
+              # suppressed when suppression ended at the cap.
+              budget_detail="this deferral episode opened ${deferred_for}s ago and its suppression ended at the cap"
             fi ;;
         esac
         may_defer=0
-        if [ "$cpu_class" = progressing ] && [ "$budget_spent" -eq 0 ] && [ "$age" -lt "$CPU_PROGRESS_MAX_DEFER_SECS" ]; then
+        if [ "$cpu_deferral" -eq 1 ] && [ "$cpu_class" = progressing ] && [ "$budget_spent" -eq 0 ] && [ "$age" -lt "$CPU_PROGRESS_MAX_DEFER_SECS" ]; then
           may_defer=1
         fi
         if [ "$may_defer" -eq 1 ]; then
@@ -423,7 +452,9 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         # A supervisor must be able to tell "deferred because it is progressing"
         # from "was deferred, its budget is spent, escalating anyway", so the
         # reason names which of the two it is and the reading behind it.
-        if [ "$cpu_class" = progressing ] && [ "$budget_spent" -eq 1 ]; then
+        if [ "$cpu_deferral" -eq 0 ]; then
+          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and this pane has no turn in progress, so a CPU reading never defers here - a worker stopped at its prompt reads much like a working one)"
+        elif [ "$cpu_class" = progressing ] && [ "$budget_spent" -eq 1 ]; then
           reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, but this pane's ${CPU_PROGRESS_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - $budget_detail - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent)"
         elif [ "$cpu_class" = progressing ]; then
           reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent)"
@@ -1170,7 +1201,7 @@ EOF
             # wedge timer is running for it) - keep treating it that way
             # without re-reading the crew state every poll, and without
             # letting the still-captain-relevant log line re-surface it.
-            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf" 0
           fi
           # else: already surfaced as genuinely terminal on a prior poll of
           # this same hash - nothing left to do (matches the original,
@@ -1213,12 +1244,12 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
-                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
+                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" 0
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;
               esac
             else
-              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
+              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" 0
             fi
           fi
         fi
@@ -1227,7 +1258,7 @@ EOF
         # unless a genuinely busy pane has gone too long with no completed turn -
         # then route it through the same wedge timer instead of erasing it.
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
-          wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
+          wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf" 1
         else
           clear_wedge_tracking "$w"
         fi
@@ -1239,7 +1270,7 @@ EOF
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
-        wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
+        wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf" 1
       else
         clear_wedge_tracking "$w"
       fi
