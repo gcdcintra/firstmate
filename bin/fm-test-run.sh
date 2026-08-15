@@ -890,8 +890,21 @@ families_for_changed_path() {
       ;;
     bin/fm-session-start.sh|bin/fm-bootstrap.sh|bin/fm-fleet-sync.sh|\
     bin/fm-sessionstart-nudge.sh|bin/fm-tangle*|bin/fm-update.sh|\
-    bin/fm-gate-refuse*|bin/fm-lock*|bin/fm-quota-axi-lib.sh)
+    bin/fm-gate-refuse*|bin/fm-lock*)
       printf '%s\n' session-bootstrap
+      ;;
+    bin/fm-quota-axi-lib.sh)
+      # Two consumers in different families: bin/fm-bootstrap.sh reads the
+      # version floor, and bin/fm-quota-advice.sh runs every quota-axi call
+      # through this file's bounding ladder.
+      printf '%s\n' session-bootstrap
+      printf '%s\n' pure-contract-unit
+      ;;
+    bin/fm-quota-kill-lib.sh)
+      # Two consumers in different families: bin/fm-crew-state.sh names a failed
+      # run's cause, and bin/fm-push-transition-lib.sh names a blocked pane's.
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' watcher-wake-lock
       ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
