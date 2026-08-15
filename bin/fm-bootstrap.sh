@@ -100,8 +100,12 @@
 #          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync, gh_base_repo_pin) while still printing every
-#          read-only detect line above; the TANGLE and GH_BASE_REPO lines switch
-#          to advisory-only wording with no repair command. Used by
+#          read-only detect line above; the TANGLE line and the ambiguity-derived
+#          GH_BASE_REPO line switch to advisory-only wording with no repair
+#          command. The explicit-choice GH_BASE_REPO line is identical in either
+#          mode, its `gh repo set-default` included, because that setting is
+#          never firstmate's to rewrite and the captain runs or declines the
+#          redirect themselves. Used by
 #          fm-session-start.sh's read-only path when another live session holds
 #          the fleet lock, so a second concurrent session never race-mutates
 #          PR-check artifacts, secondmate homes, X-mode artifacts, project
