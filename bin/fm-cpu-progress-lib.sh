@@ -36,8 +36,16 @@
 #   - An agent IDLE AT ITS PROMPT cannot be told apart from a working one here:
 #     a prompt animation measured 0.58-3.82 ticks/s, straddling the floor. This
 #     library cannot close that overlap, so the caller does not ask it to - only
-#     the busy-turn path may defer, and a pane with no turn in progress
+#     the busy-turn path may defer, and a pane without an exact busy verdict
 #     escalates on its ordinary cadence whatever this returns.
+#   - A pane only becomes deferrable on an EXACT busy verdict, and Codex tasks
+#     (`unknown codex-unverified`) and standalone Kimi (`unknown
+#     kimi-unverified`) never produce one. A worker on those harnesses inside
+#     one long tool-driven turn is therefore never deferred and keeps
+#     escalating on the ordinary cadence - the original false-alarm loop,
+#     unchanged for them. This measure cannot see that case: it reads the CPU
+#     it is handed and never decides whether a turn is open, so closing it
+#     belongs to the busy-state contract (bin/fm-busy-lib.sh), not here.
 #   - A turn that OPENS but never closes is the residual of that arrangement: a
 #     pane keeps an exact busy verdict until a turn-close event arrives, so a
 #     harness whose turn end can go unreported would stay deferrable. Claude

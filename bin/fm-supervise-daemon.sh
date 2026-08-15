@@ -48,8 +48,8 @@
 #     pane still inside a turn - busy with no completed turn - may have that
 #     escalation DEFERRED, by the bounded budget bin/fm-watch.sh owns
 #     (FM_CPU_PROGRESS_MAX_DEFER_SECS): a longer delay on that one path, still
-#     not a loss. A stale pane has no turn in progress, so it escalates on the
-#     cadence above whatever its CPU reads.
+#     not a loss. A stale pane holds no exact busy verdict, so it escalates on
+#     the cadence above whatever its CPU reads.
 #     A declared pause instead gets its own longer PAUSE_RESURFACE_SECS
 #     recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a

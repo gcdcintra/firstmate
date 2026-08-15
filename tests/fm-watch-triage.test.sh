@@ -1875,7 +1875,7 @@ test_idle_at_prompt_stale_is_never_deferred() {
   cpu_reap_kids
   grep -F "possible wedge" "$out" >/dev/null \
     || { unset FM_FAKE_CREW_STATE; fail "the idle-at-prompt escalation did not flag a possible wedge: $(cat "$out")"; }
-  grep -F "no turn in progress" "$out" >/dev/null \
+  grep -F "no exact busy verdict" "$out" >/dev/null \
     || { unset FM_FAKE_CREW_STATE; fail "the escalation did not say why the CPU reading was not allowed to defer: $(cat "$out")"; }
   [ ! -e "$state/.cpu-defer-since-$key" ] \
     || { unset FM_FAKE_CREW_STATE; fail "a non-busy pane opened a deferral episode"; }

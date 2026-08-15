@@ -51,15 +51,23 @@
 #                          FM_CPU_PROGRESS_MAX_DEFER_SECS - that pane holds an
 #                          exact busy verdict with no completed turn, the one
 #                          state in which a worker cannot speak for itself. The
-#                          three non-busy wedge paths have no turn in progress,
-#                          so their measured process is an agent at its prompt,
-#                          whose idle animation overlaps a working reading; they
-#                          escalate on their ordinary cadence whatever the CPU
-#                          says, so a worker that simply STOPPED is still caught
-#                          within minutes. Only a `progressing` verdict ever
-#                          defers; a flat counter (a hung agent, or one blocked
-#                          on a stuck TCP send queue) and every unmeasurable
-#                          case escalate as before.
+#                          three non-busy wedge paths hold no exact busy
+#                          verdict, so their measured process may be an agent
+#                          at its prompt, whose idle animation overlaps a
+#                          working reading; they escalate on their ordinary
+#                          cadence whatever the CPU says, so a worker that
+#                          simply STOPPED is still caught within minutes. A
+#                          harness that never produces an exact busy verdict -
+#                          Codex (`unknown codex-unverified`) and standalone
+#                          Kimi (`unknown kimi-unverified`) - is therefore
+#                          never deferred even inside one long turn; that gap
+#                          belongs to the busy-state contract in
+#                          bin/fm-busy-lib.sh, and bin/fm-cpu-progress-lib.sh's
+#                          limits list owns the full statement of it. Only a
+#                          `progressing` verdict ever defers; a flat counter (a
+#                          hung agent, or one blocked on a stuck TCP send
+#                          queue) and every unmeasurable case escalate as
+#                          before.
 #                          That deferral allowance is a per-pane budget spent
 #                          once: past it the pane escalates on the ordinary
 #                          STALE_ESCALATE_SECS cadence - reaching
@@ -91,6 +99,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 mkdir -p "$STATE"
 
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 # The native event fast-path and only its true dependencies have one narrow
 # production owner. The Herdr event-wait smoke test consumes this same owner
 # without sourcing the entire watcher graph.
@@ -110,8 +120,10 @@ mkdir -p "$STATE"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
 # Worker-CPU progress, the one evidence source that can tell a worker inside a
-# long tool-driven turn from a wedged one. Consulted only where an escalation
-# is already due; its `progressing` verdict is the ONLY outcome that suppresses.
+# long tool-driven turn from a wedged one. Sampled on EVERY poll of an aging
+# pane, so the rolling anchor is mature by the time a wedge timer first crosses
+# its threshold; only a `progressing` verdict ever suppresses, and only on the
+# busy-turn path.
 # shellcheck source=bin/fm-cpu-progress-lib.sh
 . "$SCRIPT_DIR/fm-cpu-progress-lib.sh"
 
@@ -360,8 +372,8 @@ clear_wedge_tracking() {  # <window>
 # <cpu-deferral-allowed> is 1 ONLY on the busy-turn call sites, where the pane
 # holds an exact busy verdict with no completed turn - the one state in which a
 # worker is structurally unable to speak for itself. Everywhere else it is 0:
-# those panes have no turn in progress, so the measured process is an agent
-# sitting at its prompt, and an idle prompt animation reads 0.58-3.82 ticks/s
+# those panes hold no exact busy verdict, so the measured process may be an
+# agent sitting at its prompt, and an idle prompt animation reads 0.58-3.82 ticks/s
 # against a 2.0 floor. Deferring on that would delay a worker that simply
 # STOPPED - the shape a stale alarm catches within minutes today. The parameter
 # is explicit rather than inferred from <triage-label>, and it defaults to 0, so
@@ -449,7 +461,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         # from "was deferred, its budget is spent, escalating anyway", so the
         # reason names which of the two it is and the reading behind it.
         if [ "$cpu_deferral" -eq 0 ]; then
-          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and this pane has no turn in progress, so a CPU reading never defers here - a worker stopped at its prompt reads much like a working one)"
+          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and this pane holds no exact busy verdict, so a CPU reading never defers here - the reading alone cannot tell a working agent from one stopped at its prompt)"
         elif [ "$cpu_class" = progressing ] && [ "$budget_spent" -eq 1 ]; then
           reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, but this pane's ${CPU_PROGRESS_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - $budget_detail - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent)"
         elif [ "$cpu_class" = progressing ]; then
