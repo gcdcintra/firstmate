@@ -171,12 +171,17 @@ note: advisory only - firstmate owns the dispatch decision; this reports quota a
 
 The three window ids, the `effective:` scopes, and `boundedBy`/`limitingWindowIds` are the producer fields the renderer depends on; `dispatch-auth.md` owns the full `quota-axi` shape.
 
-It exits 0 on every path, including a missing, under-floor, failing or malformed `quota-axi`.
+It exits 0 on every path, including a missing, under-floor, failing, malformed or shapeless-but-valid `quota-axi`.
 That is a deliberate structural property, not a convenience: it must never become a check that can withhold a spawn, because wave size is the captain's decision and firstmate owns dispatch under `AGENTS.md` section 7.
+
+Exiting 0 is only half of that property, because a report that never returns withholds a spawn just as effectively as one that refuses.
+So every `quota-axi` call runs under a bound, and `bin/fm-quota-axi-lib.sh` owns the `timeout` then `gtimeout` then `perl` ladder that supplies it for both the version probe and the `--json` read.
+A host carrying none of those three reports `quota-advice: unavailable` naming the missing bound, rather than reading `quota-axi` unbounded.
+This matters on a stock macOS, where `timeout` does not exist: a caller that checked for that one command would fall through to an unbounded provider read on exactly the platform the ladder exists for, immediately before a validation dispatch.
 
 ## Regression coverage
 
 - `tests/fm-quota-kill.test.sh` - both vendor families, dotted model names, the glued-prose line shape, pane text with no episode structure, a live pane dialog with no exit line anywhere (the direct guard on the blocked-worker path), the evidence bound, and the failed-step read; plus the cases that must not regress: a genuine death, agent prose resembling the vendor sentence, a retried-past kill ahead of a genuine failure, an agent quoting the vendor sentence with no adjacent exit line, and the `Docs note:` line that carries both anchors.
 - `tests/fm-crew-state.test.sh` - a failed run killed by the usage limit names that cause with its window; a failed run from a genuine agent death stays a plain failure with no quota clause.
 - `tests/fm-supervision-events.test.sh` - a blocked pane showing the limit wakes with it named; an unrecognized dialog and an unreadable pane both keep the pre-existing generic reason.
-- `tests/fm-quota-advice.test.sh` - every window reported with the binding one named, an exhausted per-model window headlined under a healthy-looking session window, valid JSON carrying no provider/window shape reported as unavailable rather than as a healthy account, and exit 0 preserved across every degraded read.
+- `tests/fm-quota-advice.test.sh` - every window reported with the binding one named, an exhausted per-model window headlined under a healthy-looking session window, valid JSON carrying no provider/window shape reported as unavailable rather than as a healthy account, a stalled `--json` read bounded on a host with no `timeout`, a host that cannot bound at all reporting rather than reading loose, and exit 0 preserved across every degraded read.

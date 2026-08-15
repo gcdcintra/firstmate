@@ -71,7 +71,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inherited local-material propagation and config-reread delivery |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
-| `fm-quota-axi-lib.sh`    | Shared `quota-axi` compatibility floor for the bootstrap diagnostic                  |
+| `fm-quota-axi-lib.sh`    | Shared `quota-axi` compatibility floor, and the one bounding ladder every `quota-axi` call runs under |
 | `fm-quota-kill-lib.sh`   | Single owner of the vendor usage-limit recognizer that separates a quota kill from a genuine agent failure |
 | `fm-quota-advice.sh`     | Report every quota window and the one that binds before an expensive validation run; advisory only, never withholds a spawn |
 | `fm-vendor-auth-probe.sh`| Run one hard-bounded, non-destructive authentication probe of a named vendor CLI and report the fact |

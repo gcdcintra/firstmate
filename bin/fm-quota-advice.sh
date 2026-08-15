@@ -24,6 +24,12 @@
 # refuse a spawn and must never be turned into something that can: firstmate owns
 # the dispatch decision under AGENTS.md section 7, and a script that quietly
 # shrank the fleet would be answering a question the captain already answered.
+#
+# Exiting 0 is only half of that promise; the other half is answering at all.
+# Every quota-axi call here is bounded through bin/fm-quota-axi-lib.sh, and a host
+# with no way to bound one reports unavailable instead of reading it loose. This
+# runs immediately before a validation dispatch, so a stalled provider endpoint
+# would otherwise hang the very moment the report exists to keep moving.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,14 +43,15 @@ unavailable() {
 }
 
 command -v jq >/dev/null 2>&1 || unavailable "jq is not installed"
+# Checked before the version probe, because that probe is itself a bounded call:
+# without this the unboundable host would be reported as a missing or under-floor
+# quota-axi, which is a false reason for a binary that is present and current.
+fm_quota_axi_can_bound \
+  || unavailable "no timeout, gtimeout or perl on PATH to bound the read (bin/fm-quota-axi-lib.sh owns the ladder)"
 fm_quota_axi_compatible 10 \
   || unavailable "quota-axi is missing or older than $FM_QUOTA_AXI_MIN (bin/fm-quota-axi-lib.sh owns the floor)"
 
-if command -v timeout >/dev/null 2>&1; then
-  RAW=$(timeout 20 quota-axi --json 2>/dev/null </dev/null) || RAW=
-else
-  RAW=$(quota-axi --json 2>/dev/null </dev/null) || RAW=
-fi
+RAW=$(fm_quota_axi_run "${FM_QUOTA_ADVICE_TIMEOUT:-20}" --json) || RAW=
 [ -n "$RAW" ] || unavailable "quota-axi returned nothing"
 printf '%s' "$RAW" | jq -e . >/dev/null 2>&1 || unavailable "quota-axi output is not valid JSON"
 
