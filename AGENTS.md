@@ -337,7 +337,7 @@ For any custom `state/<id>.check.sh` you write yourself, keep it an ordinary sin
 
 Tear down a ship task only after landing is confirmed.
 A teardown refusal for uncommitted or unlanded work, or because the recorded worktree is no longer provably that task's, is a stop-and-investigate result, never an obstacle to bypass.
-Forcing never resolves an ownership refusal, because it would destroy another task's live work rather than discard this task's; `bin/fm-teardown.sh`'s help owns the two non-forcing resolutions.
+Forcing never resolves an ownership refusal, because it would destroy another task's live work rather than discard this task's; each refusal names the non-forcing way forward, and `bin/fm-teardown.sh`'s header owns them.
 Never force teardown without explicit discard authority.
 After successful teardown, record completion, retain only the configured recent Done history, and re-evaluate queued work whose blockers and time gates have cleared.
 

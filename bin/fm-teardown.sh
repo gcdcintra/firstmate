@@ -85,24 +85,30 @@
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
 #   when the captain has explicitly said to discard the work.
 #   --disown-worktree cleans up a task whose worktree is no longer provably its
-#   own, so an unresolvable ownership refusal never becomes its own trap. It
-#   requires that the worktree is NOT provably this task's, and then touches
-#   nothing under that path: no process is killed there, no branch is deleted, no
-#   worktree is returned to the pool. Only this task's own records and its own
-#   recorded endpoint are cleared, so it destroys no work anywhere and is not a
-#   way around the landed-work checks. When ownership is merely unprovable
-#   (absent or unreadable rather than another task's record), the worktree may
-#   still be this task's, so disowning runs that worktree's ordinary uncommitted
-#   and unlanded-work checks first and REFUSES while any of that work is there
-#   rather than orphaning it in a path no task claims; the refusal names what it
-#   found and says the state needs a human decision.
-#   The run's own clone refresh skips branch
-#   pruning (FM_FLEET_PRUNE=0), so this run cannot delete the branch it just
-#   released; a later routine sync can still prune a pushed branch whose remote
-#   branch is gone once no worktree holds it, and the disown output says so.
-#   The reverse case - the record was lost but
-#   the worktree IS still this task's - is restored with
-#   bin/fm-worktree-owner.sh claim <task-id>, not with --force.
+#   own, so an unresolvable ownership refusal never becomes its own trap. It does
+#   not apply to kind=secondmate, whose leased home treehouse itself records a
+#   holder for; that combination is refused at preflight, before the forced child
+#   cleanup could destroy anything. It requires that the worktree is NOT provably
+#   this task's, and then touches nothing under that path: no process is killed
+#   there, no branch is deleted, no worktree is returned to the pool. Only this
+#   task's own records and its own recorded endpoint are cleared, so it destroys
+#   no work anywhere and is not a way around the landed-work checks. When
+#   ownership is merely unprovable (absent or unreadable rather than another
+#   task's record), the worktree may still be this task's, so disowning runs that
+#   worktree's ordinary uncommitted and unlanded-work checks first and REFUSES
+#   while any of that work is there rather than orphaning it in a path no task
+#   claims; the refusal names what it found and says the state needs a human
+#   decision. That unlanded-work refusal is the one refusal on this path --force
+#   does resolve, because the work it puts at risk is this task's own - exactly
+#   what forcing authorizes discarding. --force still never resolves the
+#   ownership refusal itself, and never makes a disown touch the worktree.
+#   The run's own clone refresh skips branch pruning (FM_FLEET_PRUNE=0), so this
+#   run cannot delete the branch it just released; a later routine sync can still
+#   prune a pushed branch whose remote branch is gone once no worktree holds it,
+#   and the disown output says so.
+#   The reverse case - the record was lost but the worktree IS still this
+#   task's - is restored with bin/fm-worktree-owner.sh claim <task-id>, not with
+#   --force.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
