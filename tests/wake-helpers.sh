@@ -289,8 +289,18 @@ SH
 # which is what makes the bound hold whatever the child's own handlers do, or
 # fail to do. Kills are by exact pid, never by pattern: the process table is
 # shared with every other worker on the machine.
+#
+# The grace must EXCEED the child's poll interval. bin/fm-watch.sh waits in
+# `sleep "$POLL"` as a foreground child, and bash defers a trapped signal until
+# that child finishes, so a watcher's TERM latency is bounded below by its poll.
+# A grace that expired first would SIGKILL a HEALTHY watcher and skip its EXIT
+# trap (watcher_cleanup), leaving .watch.lock unreleased inside the very suites
+# that assert lock behavior. The default below clears the FM_POLL=5 these suites
+# use by a wide margin; a caller running a watcher on a longer poll must pass a
+# larger grace explicitly. Raising it costs nothing on a healthy stop: the loop
+# exits as soon as the child is gone.
 fm_wake_terminate() {
-  local pid=$1 grace=${2:-50} i=0
+  local pid=$1 grace=${2:-150} i=0
   kill "$pid" 2>/dev/null || true
   while [ "$i" -lt "$grace" ] && is_live_non_zombie "$pid"; do
     sleep 0.1
