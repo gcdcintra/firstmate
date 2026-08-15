@@ -51,9 +51,8 @@ test_singleton_start() {
     i=$((i + 1))
   done
   grep -h 'watcher: already running pid ' "$out1" "$out2" >/dev/null || fail "second watcher did not report existing singleton"
-  kill "$pid1" "$pid2" 2>/dev/null || true
-  wait "$pid1" 2>/dev/null || true
-  wait "$pid2" 2>/dev/null || true
+  fm_wake_terminate "$pid1"
+  fm_wake_terminate "$pid2"
   pass "simultaneous watcher starts leave exactly one live process"
 }
 
@@ -84,8 +83,7 @@ test_stale_watch_lock_reclaimed() {
   done
   [ "$live" -eq 1 ] || fail "watcher did not reclaim stale lock and stay alive"
   [ "$lock_pid" != "$dead_pid" ] || fail "stale watch lock pid was not replaced"
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  fm_wake_terminate "$pid"
   pass "killed watcher stale lock is reclaimed"
 }
 
@@ -576,8 +574,7 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "arm disturbed the healthy watcher's lock"
   is_live_non_zombie "$armpid" || fail "arm exited while the seed watcher was still healthy"
   # After the seed dies without a successor, the attached arm must fail loudly.
-  kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
+  fm_wake_terminate "$wpid"
   wait_for_exit "$armpid" 80
   status=$?
   [ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "attached arm did not fail after seed died (status $status)"
@@ -617,8 +614,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   grep -q "arm_pid=$armpid.*watcher_pid=$wpid.*origin=attached.*exit_code=143.*signal=TERM.*reason=arm-interrupted" "$state/.watch-cycle-exits.log" \
     || fail "attached arm signal was not recorded in the lifecycle ledger"
   is_live_non_zombie "$wpid" || fail "signaling an attached arm terminated the peer watcher"
-  kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
+  fm_wake_terminate "$wpid"
   pass "attached arm signals record a classified lifecycle entry"
 }
 
