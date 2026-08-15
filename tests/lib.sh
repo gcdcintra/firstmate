@@ -18,8 +18,8 @@
 
 # Idempotent guard: behavior-area helper files (secondmate-helpers.sh,
 # wake-helpers.sh) source this library for ROOT/fail/pass, and the test that
-# includes them may also source it directly. Re-sourcing must not wipe the
-# registered-cleanup array or reset state.
+# includes them may also source it directly. Re-sourcing must not point the
+# registry at a fresh empty file, re-arm the EXIT trap, or reset state.
 if [ -n "${FM_TEST_LIB_SOURCED:-}" ]; then
   return 0
 fi
@@ -65,7 +65,7 @@ pass() {
 #      writes `TMP_ROOT=$(fm_test_tmproot ...)` - which runs the body in a
 #      command-substitution subshell, where an installed trap dies with the
 #      subshell. Registering lazily left the real shell with no trap at all.
-#   2. Registrations go to a FILE, not only to a shell array, for the same
+#   2. Registrations go to a FILE rather than to a shell array, for the same
 #      reason: a subshell's array append is invisible to its parent, while an
 #      append to the registry file is not.
 #
@@ -78,8 +78,6 @@ pass() {
 # background jobs BEFORE removing directories, by exact pid from `jobs -p`: the
 # process table is shared with every other worker on the machine, so it must
 # never pattern-match a process name.
-
-FM_TEST_CLEANUP_DIRS=()
 
 # Deliberately NOT exported. A subshell inherits it, which is the whole point,
 # while a separate test process that sources this library gets its own registry
@@ -108,9 +106,6 @@ fm_test_cleanup() {
       wait "$p" 2>/dev/null || true
     done
   fi
-  for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
-    [ -n "$d" ] && rm -rf "$d"
-  done
   if [ -f "$FM_TEST_CLEANUP_REGISTRY" ]; then
     while IFS= read -r d; do
       [ -n "$d" ] && rm -rf "$d"

@@ -1764,8 +1764,8 @@ test_procevent_surface_serializes_with_drain() {
   wait_live "$drain_pid" 10 || fail "a concurrent drain split the surfacing transition"
   [ -s "$state/.wake-queue" ] || fail "the concurrent drain consumed the record before marker commit"
   touch "$release"
-  wait "$pid" || fail "the paused watcher did not finish surfacing"
-  wait "$drain_pid" || fail "the concurrent drain failed after surfacing committed"
+  wait_for_exit "$pid" 100 || fail "the paused watcher did not finish surfacing"
+  wait_for_exit "$drain_pid" 100 || fail "the concurrent drain failed after surfacing committed"
   grep -F "procevent:drain-race:1" "$drain_out" >/dev/null \
     || fail "the serialized drain lost the process-event record"
   pass "queue revalidation, proactive output, and marker commit serialize with drain"
