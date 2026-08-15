@@ -2014,7 +2014,7 @@ set -u
 bash -c 'trap "" TERM; while :; do sleep 0.2; done' &
 child=\$!
 printf '%s\n' "\$child" > "$dir/child.pid"
-wait_for_exit "\$child" 4
+wait_for_exit "\$child" 4 10
 printf 'wait_for_exit returned %s\n' "\$?" > "$dir/rc.txt"
 kill -0 "\$child" 2>/dev/null && printf 'child still alive\n' >> "$dir/rc.txt"
 SH
@@ -2029,9 +2029,12 @@ SH
     kill -9 "$child" 2>/dev/null || true
     [ "$rc" -eq 124 ] || fail "wait_for_exit returned but left a SIGTERM-proof child running"
   fi
-  [ "$rc" -ne 124 ] \
-    || fail "wait_for_exit blocked on a child that ignored SIGTERM; a suite doing this wedges its whole CI lane with no verdict"
   reported=$(cat "$dir/rc.txt" 2>/dev/null || true)
+  if [ "$rc" -eq 124 ]; then
+    [ -z "$reported" ] \
+      || fail "the escalation bound held ($reported) but this run outlasted the fixture's own timeout; that is a slow runner, not a blocked helper"
+    fail "wait_for_exit blocked on a child that ignored SIGTERM; a suite doing this wedges its whole CI lane with no verdict"
+  fi
   [ -n "$reported" ] || fail "the fixture never recorded a wait_for_exit result: $(cat "$out")"
   case "$reported" in
     *"child still alive"*)

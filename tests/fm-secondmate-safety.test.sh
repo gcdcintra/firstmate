@@ -2448,8 +2448,10 @@ EOF
     grep -F "stale: $window" "$out" >/dev/null && fail "idle secondmate pane triggered stale wake"
     fail "watcher exited unexpectedly while supervising idle secondmate"
   fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  # tests/wake-helpers.sh is deliberately NOT sourced here: its source-time side
+  # effects (an exported FM_ROOT_OVERRIDE, the wedge-recorder dir) would change
+  # what this suite's own guards observe. The stop contract lives in lib.sh.
+  fm_wake_terminate "$pid"
   grep -F "stale: $window" "$out" >/dev/null && fail "idle secondmate pane triggered stale wake"
   pass "idle kind=secondmate pane is healthy and not stale"
 }
