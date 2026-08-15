@@ -31,6 +31,17 @@
 #   - A wedge that KEEPS BURNING CPU - an internal retry or spin loop - looks
 #     exactly like productive work here and is suppressed. That is why the
 #     caller bounds total deferral rather than deferring forever.
+#   - That bound covers about three hours of ONE turn: the one-hour limit on a
+#     busy pane with no completed turn, plus the two-hour deferral budget. The
+#     longest productive turn on record ran five hours at 5.6 ticks/s
+#     (docs/verification/supervision.md), so its final two hours escalate on the
+#     ordinary cadence. That is the design, not an oversight: bounding deferral
+#     is what keeps a wedge that goes on burning CPU from hiding behind a
+#     progressing reading, and those tail alarms are not bare - each carries the
+#     CPU reading and says the budget latched and why, so a supervisor dismisses
+#     one at a glance. Buying the last two hours of quiet would trade that
+#     visible, self-explaining alarm for a longer window in which a spinning
+#     worker consumes quota unobserved.
 #   - An agent blocked waiting on ONE long-running child shows flat own-CPU
 #     until that child is reaped, so it escalates. Unchanged from before.
 #   - An agent IDLE AT ITS PROMPT cannot be told apart from a working one here:

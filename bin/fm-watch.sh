@@ -329,9 +329,9 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # FM_WEDGE_DEMAND_INSPECT_COUNT - until it goes genuinely active again.
 CPU_PROGRESS_MAX_DEFER_SECS=${FM_CPU_PROGRESS_MAX_DEFER_SECS:-7200}
 
-# The wedge-marker key spelling, stated once for the sites routed through it,
-# so the key contract that fm-supervise-daemon.sh's _stale_key must stay in
-# sync with has one owner here.
+# The ONE spelling of a window's marker-key transform, used by every marker
+# site in this watcher, so the key contract that fm-supervise-daemon.sh's
+# _stale_key must stay in sync with is stated once.
 window_key() {  # <window>
   printf '%s' "$1" | tr ':/.' '___'
 }
@@ -507,7 +507,7 @@ busy_turn_over_age() {  # <task>
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
 handle_paused_stale() {  # <window> <task> <hash>
   local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(window_key "$win")
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   clear_wedge_tracking "$win"
@@ -528,17 +528,13 @@ handle_paused_stale() {  # <window> <task> <hash>
 
 clear_pause_state() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(window_key "$win")
   rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
 }
 
 clear_pause_tracking() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(window_key "$win")
   clear_pause_state "$win"
   rm -f "$STATE/.stale-$key"
   clear_wedge_tracking "$win"
@@ -549,9 +545,7 @@ clear_pause_tracking() {  # <window>
 # fm-crew-state has fallen back to stopped or unknown.
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file class agent_alive
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(window_key "$win")
   last=$(last_status_line "$STATE/$task.status")
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused_or_captain_held "$last"; then
@@ -612,7 +606,7 @@ pause_state_class() {  # <window> <task>
 # handle_paused_stale.
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(window_key "$win")
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
   if status_is_paused_or_captain_held "$last"; then
@@ -1134,9 +1128,7 @@ EOF
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
-    key=${w//:/_}
-    key=${key//\//_}
-    key=${key//./_}
+    key=$(window_key "$w")
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
@@ -1146,7 +1138,7 @@ EOF
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
+    key=$(window_key "$w")
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
     sf="$STATE/.stale-$key"

@@ -351,9 +351,11 @@ list_portable_serial() {
 }
 
 # Measured portable-serial script durations in milliseconds, from the CI timing
-# artifact recorded in docs/fm-test-portable-shards.md. These are balance hints
-# only: the shard partition stays complete and disjoint whatever they say, so a
-# stale hint costs balance rather than coverage. That doc owns the refresh
+# artifact recorded in docs/fm-test-portable-shards.md - except the two
+# watcher-CPU suites, measured on a host calibrated against that artifact and
+# dominated by real-time settles that cost the same anywhere. These are balance
+# hints only: the shard partition stays complete and disjoint whatever they say,
+# so a stale hint costs balance rather than coverage. That doc owns the refresh
 # procedure.
 portable_serial_weight_hints() {
   cat <<'EOF'
@@ -378,6 +380,7 @@ tests/fm-calm-pi-extension.test.sh 203
 tests/fm-claude-stop-autoarm-live-e2e.test.sh 19
 tests/fm-claude-stop-autoarm.test.sh 60521
 tests/fm-codex-continuity-live-e2e.test.sh 19
+tests/fm-cpu-progress.test.sh 79501
 tests/fm-daemon.test.sh 15140
 tests/fm-documentation-audiences.test.sh 572
 tests/fm-fleet-snapshot-view.test.sh 5902
@@ -424,7 +427,7 @@ tests/fm-vendor-auth-probe.test.sh 42796
 tests/fm-wake-daemon-lifecycle-e2e.test.sh 4284
 tests/fm-wake-queue.test.sh 22787
 tests/fm-watch-checkpoint.test.sh 3943
-tests/fm-watch-triage.test.sh 113051
+tests/fm-watch-triage.test.sh 234787
 tests/fm-watcher-lock.test.sh 98342
 tests/fm-worktree-owner.test.sh 5043
 EOF
