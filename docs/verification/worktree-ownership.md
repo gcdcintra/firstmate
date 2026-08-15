@@ -80,6 +80,35 @@ failed to return worktree: lease precondition failed: worktree ... is not leased
 Both refusals exit 1 and leave the lease untouched, and the two messages are distinguishable.
 `bin/fm-teardown.sh` and `bin/fm-home-seed.sh` therefore pass `--if-lease-holder` only where a lease is expected, treat the holder mismatch as a refusal, and fall back to an unguarded return on the "is not leased" signature so a home predating the lease is not stranded.
 
+## The capability floor: v2.0.1 leases but cannot guard the return
+
+Verified 2026-08-15 against the official v2.0.1 and v2.1.1 release archives.
+
+Because the guarded return is a hard requirement rather than a best effort - every other guarded failure aborts instead of degrading to an unguarded return - a treehouse without `--if-lease-holder` cannot retire a leased secondmate home at all.
+The dangerous shape is a build that offers the lease but not its precondition, since a lease-only capability probe passes it and the failure only surfaces at retirement, with the home retained and its lease never released.
+v2.0.1 is exactly that shape:
+
+```
+$ ./treehouse --version
+v2.0.1
+$ ./treehouse get --help
+Flags:
+  -h, --help                  help for get
+      --lease                 Durably lease a worktree without opening a subshell; print only its path to stdout
+      --lease-holder string   Optional label recorded as the lease holder (defaults to $TREEHOUSE_LEASE_HOLDER)
+$ ./treehouse return --help
+Flags:
+      --force   Clean, reset, and return without prompting
+  -h, --help    help for return
+```
+
+v2.1.1's `return --help` advertises both `--if-lease-holder` and `--if-lease-id`.
+
+So the floor is enforced in two places rather than assumed.
+`bin/fm-install-treehouse.sh` pins v2.1.1, with each platform archive's SHA-256 taken from the release's `checksums.txt` and independently recomputed from the downloaded archive, and each verified to hold a single `treehouse` binary at the archive root.
+`bin/fm-bootstrap.sh`'s `treehouse_supports_lease` probes `return --help` for `--if-lease-holder` as well as `get --help` for `--lease`, so a local install below the floor is reported as `MISSING: treehouse` at bootstrap instead of at retirement.
+
 ## Regression coverage
 
 `tests/fm-worktree-owner.test.sh` covers the behavior these facts support, including the observed shape: one task's metadata naming a worktree another task now holds.
+`tests/fm-bootstrap.test.sh` covers the capability floor, driving bootstrap against a treehouse that advertises the lease but not the guarded return.

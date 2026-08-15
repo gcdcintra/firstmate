@@ -35,6 +35,9 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
 
 # A fake toolchain where every required tool is present and gh is authenticated.
 # treehouse's `get --help` advertises --lease only when FM_FAKE_TREEHOUSE_LEASE_HELP=1.
+# Its `return --help` advertises --if-lease-holder unless
+# FM_FAKE_TREEHOUSE_RETURN_GUARD_HELP=0, which stands in for a treehouse that can
+# lease a home but cannot guard its release (the real v2.0.1 shape).
 make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -54,6 +57,14 @@ if [ "${1:-}" = get ] && [ "${2:-}" = --help ]; then
     printf '%s\n' 'Usage: treehouse get [--lease] [--lease-holder <holder>]'
   else
     printf '%s\n' 'Usage: treehouse get'
+  fi
+  exit 0
+fi
+if [ "${1:-}" = return ] && [ "${2:-}" = --help ]; then
+  if [ "${FM_FAKE_TREEHOUSE_RETURN_GUARD_HELP:-1}" = 1 ]; then
+    printf '%s\n' 'Usage: treehouse return [--force] [--if-lease-holder <holder>]'
+  else
+    printf '%s\n' 'Usage: treehouse return [--force]'
   fi
   exit 0
 fi
@@ -593,6 +604,37 @@ test_treehouse_lease_check_follows_resolved_backend() {
   pass "bootstrap: the treehouse lease check follows the resolved backend's worktree provider"
 }
 
+# Leasing a home and being able to release only that lease are two capabilities,
+# and firstmate needs both. bin/fm-teardown.sh and bin/fm-home-seed.sh release a
+# leased secondmate home with `treehouse return --if-lease-holder <id>` and abort
+# rather than degrade to an unguarded return, so a treehouse that leases but
+# cannot guard the release passes a lease-only probe and then strands every leased
+# home at retirement with its lease never released. Bootstrap must name that as an
+# upgrade instead of reporting clean.
+test_treehouse_floor_requires_the_guarded_return() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/herdr-unguarded-return-treehouse"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' herdr > "$case_dir/home/config/backend"
+  fakebin=$(make_fake_toolchain_no_tmux "$case_dir" herdr)
+
+  # Advertises `get --lease` but no `return --if-lease-holder`: the real v2.0.1 shape.
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_TREEHOUSE_RETURN_GUARD_HELP=0 \
+    "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING: treehouse" \
+    "a treehouse that leases but cannot guard the return must be reported as an upgrade"
+
+  # Both halves present: silent, so the floor never nags a treehouse that meets it.
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 \
+    "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" "MISSING: treehouse" \
+    "a treehouse carrying both lease halves must not be reported as missing"
+  pass "bootstrap: the treehouse floor requires the guarded return, not just the lease"
+}
+
 test_fleet_sync_timeout_scales_with_origin_backed_project_count() {
   local case_dir home fakebin fake_root out
   case_dir="$TMP_ROOT/fleet-timeout-scaled"
@@ -1021,6 +1063,7 @@ test_cmux_bundled_cli_satisfies_dependency
 test_unknown_backend_reports_invalid_configuration
 test_json_backends_require_jq_not_tmux
 test_treehouse_lease_check_follows_resolved_backend
+test_treehouse_floor_requires_the_guarded_return
 test_fleet_sync_timeout_scales_with_origin_backed_project_count
 test_fleet_sync_timeout_floor_preserves_small_fleets
 test_fleet_sync_timeout_explicit_override_wins

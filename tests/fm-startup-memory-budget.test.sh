@@ -32,6 +32,9 @@ SH
 if [ "${1:-}" = get ] && [ "${2:-}" = --help ]; then
   printf '%s\n' 'Usage: treehouse get [--lease]'
 fi
+if [ "${1:-}" = return ] && [ "${2:-}" = --help ]; then
+  printf '%s\n' 'Usage: treehouse return [--force] [--if-lease-holder <holder>]'
+fi
 SH
   cat > "$fakebin/no-mistakes" <<'SH'
 #!/usr/bin/env bash

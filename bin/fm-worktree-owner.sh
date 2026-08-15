@@ -31,6 +31,12 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-worktree-owner-lib.sh
 . "$SCRIPT_DIR/fm-worktree-owner-lib.sh"
+# `claim` writes the record that authorizes a later destructive teardown, so it is
+# a fleet mutation and carries the same fail-closed guard as fm-spawn.sh,
+# fm-send.sh and fm-teardown.sh (see bin/fm-gate-refuse-lib.sh). Read-only `show`
+# stays available: it is a diagnostic and changes nothing.
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 
 usage() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -64,6 +70,7 @@ case "$ACTION" in
     fi
     ;;
   claim)
+    fm_refuse_if_gate_agent
     if [ -z "$EXPECTED" ]; then
       echo "REFUSED: task $ID has no worktree_owner= to restore." >&2
       echo "It predates worktree ownership records, so there is no recorded identity to reinstate and teardown already treats it as unchecked." >&2

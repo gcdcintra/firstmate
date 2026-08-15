@@ -90,7 +90,13 @@
 #   nothing under that path: no process is killed there, no branch is deleted, no
 #   worktree is returned to the pool. Only this task's own records and its own
 #   recorded endpoint are cleared, so it destroys no work anywhere and is not a
-#   way around the landed-work checks. The run's own clone refresh skips branch
+#   way around the landed-work checks. When ownership is merely unprovable
+#   (absent or unreadable rather than another task's record), the worktree may
+#   still be this task's, so disowning runs that worktree's ordinary uncommitted
+#   and unlanded-work checks first and REFUSES while any of that work is there
+#   rather than orphaning it in a path no task claims; the refusal names what it
+#   found and says the state needs a human decision.
+#   The run's own clone refresh skips branch
 #   pruning (FM_FLEET_PRUNE=0), so this run cannot delete the branch it just
 #   released; a later routine sync can still prune a pushed branch whose remote
 #   branch is gone once no worktree holds it, and the disown output says so.
@@ -981,7 +987,7 @@ require_worktree_ownership() {
       echo "REFUSED: cannot prove worktree $WT still belongs to task $ID; its ownership record is ${FM_WORKTREE_OWNER_VERDICT} (expected token $WT_OWNER_EXPECTED)." >&2
       echo "A returned or reclaimed worktree, or a crewmate's 'git clean -fdx', leaves this state, and proceeding could act inside another task's work, so nothing was changed." >&2
       echo "If you confirm that path is still task $ID's, restore the record with bin/fm-worktree-owner.sh claim $ID and rerun." >&2
-      echo "If it was reclaimed, clean up without touching it: bin/fm-teardown.sh $ID --disown-worktree" >&2
+      echo "If it was reclaimed, bin/fm-teardown.sh $ID --disown-worktree cleans up without touching that path - it runs this same worktree's uncommitted and unlanded-work checks first and refuses while any of that work is still there." >&2
       return 1
       ;;
   esac
@@ -992,7 +998,18 @@ require_worktree_ownership() {
 # go through ordinary cleanup so its landed-work checks apply, which is what keeps
 # this from becoming a way around them. kind=secondmate never reaches this: it is
 # refused at preflight, before the forced child cleanup can destroy anything.
+#
+# `absent` and `unreadable` are not proof of a reclaim - they are the absence of
+# proof either way, and a crewmate's own `git clean -fdx` reaches them with the
+# worktree still this task's and its work still in it. So those two run the same
+# unlanded-work test ordinary teardown runs, against that same worktree, and
+# refuse while it finds anything: releasing the record there would leave real work
+# in a path no task claims, and the pool skips a dirty slot for both `get` and
+# prune, so nothing would ever come back for it. `other` keeps today's behaviour,
+# because a worktree provably held by a sibling cannot hold OUR unlanded work and
+# inspecting it for ours would be meaningless.
 require_disownable_worktree() {
+  local safety_rc
   if [ -z "$WT_OWNER_EXPECTED" ]; then
     echo "REFUSED: task $ID has no ownership record to disown; it predates worktree ownership records." >&2
     echo "Ordinary cleanup already applies to it: bin/fm-teardown.sh $ID" >&2
@@ -1000,11 +1017,31 @@ require_disownable_worktree() {
   fi
   if [ -n "$WT" ] && [ -d "$WT" ]; then
     fm_worktree_owner_verdict "$WT" "$WT_OWNER_EXPECTED"
-    if [ "$FM_WORKTREE_OWNER_VERDICT" = ours ]; then
-      echo "REFUSED: worktree $WT is still task $ID's own, so there is nothing to disown." >&2
-      echo "Clean it up the ordinary way so its uncommitted and unlanded work is checked first: bin/fm-teardown.sh $ID" >&2
-      return 1
-    fi
+    case "$FM_WORKTREE_OWNER_VERDICT" in
+      ours)
+        echo "REFUSED: worktree $WT is still task $ID's own, so there is nothing to disown." >&2
+        echo "Clean it up the ordinary way so its uncommitted and unlanded work is checked first: bin/fm-teardown.sh $ID" >&2
+        return 1
+        ;;
+      other) ;;
+      *)
+        if validate_worktree_teardown_safety; then
+          :
+        else
+          safety_rc=$?
+          if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
+            echo "REFUSED: cannot inspect worktree $WT for unlanded work; a git lock is present, and disowning must not touch that path to clear it." >&2
+          else
+            echo "REFUSED: worktree $WT still holds work that has not landed, and task $ID cannot prove that path is its own." >&2
+          fi
+          echo "Disowning would drop task $ID's records while that work sits in a worktree no task claims, and the pool passes over a dirty slot, so nothing was changed." >&2
+          echo "This state needs a human decision: confirm by hand whose worktree $WT is." >&2
+          echo "If it is still task $ID's, land that work (commit and push, or merge it), restore the record with bin/fm-worktree-owner.sh claim $ID, and clean up the ordinary way: bin/fm-teardown.sh $ID" >&2
+          echo "If another task has taken that path, its own record belongs there; leave the worktree to it and rerun this once the record says so." >&2
+          return 1
+        fi
+        ;;
+    esac
   fi
   return 0
 }
@@ -1190,7 +1227,11 @@ require_child_worktree_ownership() {  # <child-worktree> <child-meta> <child-id>
   if [ "$FM_WORKTREE_OWNER_VERDICT" != other ]; then
     echo "If that path is still $child_id's own, restore its record: FM_HOME=$child_home bin/fm-worktree-owner.sh claim $child_id" >&2
   fi
-  echo "If the pool reclaimed it, clean the child up without touching it: FM_HOME=$child_home bin/fm-teardown.sh $child_id --disown-worktree" >&2
+  if [ "$FM_WORKTREE_OWNER_VERDICT" = other ]; then
+    echo "If the pool reclaimed it, clean the child up without touching it: FM_HOME=$child_home bin/fm-teardown.sh $child_id --disown-worktree" >&2
+  else
+    echo "If the pool reclaimed it, FM_HOME=$child_home bin/fm-teardown.sh $child_id --disown-worktree cleans the child up without touching that path - it runs that worktree's uncommitted and unlanded-work checks first and refuses while any of that work is still there." >&2
+  fi
   return 1
 }
 
@@ -1816,9 +1857,13 @@ if [ "$DISOWN_WORKTREE" != 1 ] && [ "$BACKEND" = orca ] && [ "$KIND" != scout ] 
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
-# Disowning inspects nothing under the worktree and destroys nothing there, so the
-# landed-work checks have no subject; they are skipped, not bypassed. The work
-# itself is left exactly where it is, on its branch in the shared repository.
+# Disowning destroys nothing under the worktree, so the checks here have no
+# subject: they guard a hard reset, a process kill, and a pool return that a
+# disown never performs. They are not bypassed either. require_disownable_worktree
+# above has already run this same unlanded-work test against that path for the
+# ambiguous absent/unreadable states, where the worktree may still be this task's.
+# The work itself is left exactly where it is, on its branch in the shared
+# repository.
 if [ "$DISOWN_WORKTREE" != 1 ] && [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   if validate_worktree_teardown_safety; then
     :
@@ -1893,6 +1938,11 @@ elif [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+  # The herdr preflight above spins on the presentation session lock, and that is
+  # a wait like any other: the pool can reassign this slot while teardown waits.
+  # Re-prove ownership (and safety) here, before the branch deletion and hook
+  # removal that precede the return's own post-wait rechecks.
+  revalidate_worktree_before_return || exit 1
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then

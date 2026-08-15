@@ -38,6 +38,17 @@
 #                                                             the return
 #   (o) slot reassigned during the safety-check lock wait  -> REFUSE before branch
 #                                                             deletion and the return
+#   (p) --disown-worktree on an unprovable record whose
+#       worktree still holds unlanded work                 -> REFUSE, naming what it
+#                                                             found (never orphan it)
+#   (q) --disown-worktree on an unprovable record with no
+#       unlanded work at stake                             -> ALLOW (that cleanup
+#                                                             must stay non-trapping)
+#   (r) --force --disown-worktree on (p)                   -> ALLOW, the explicit
+#                                                             override, touching nothing
+#   (s) slot reassigned during the herdr presentation-lock
+#       preflight wait                                     -> REFUSE before branch
+#                                                             deletion and the return
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -182,6 +193,65 @@ fi
 exec "$real" "${args[@]}"
 SH
   chmod +x "$case_dir/fakebin/git"
+}
+
+# Give <case-dir>'s task-a a flat Herdr endpoint whose fake socket path is
+# case-local, so the derived presentation lock never collides with another test or
+# a real fleet session. When FM_TEST_REASSIGN_MARKER is set, the fake hands the
+# slot to another task at the moment teardown resolves the presentation session
+# lock - inside the preflight that then spins on it, which is after the first
+# ownership proof and before anything destructive.
+configure_reassigning_herdr_endpoint() {  # <case_dir>
+  local case_dir=$1
+  sed -i.bak 's/^window=.*/window=default:wG:pQ/' "$case_dir/state/task-a.meta"
+  rm -f "$case_dir/state/task-a.meta.bak"
+  printf '%s\n' \
+    'backend=herdr' \
+    'herdr_session=default' \
+    'herdr_workspace_id=wG' \
+    'herdr_tab_id=wG:tQ' \
+    'herdr_pane_id=wG:pQ' >> "$case_dir/state/task-a.meta"
+  cat > "$case_dir/fakebin/herdr" <<SH
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "\$*" >> "\${FM_FAKE_HERDR_LOG:?}"
+case "\${1:-} \${2:-}" in
+  "workspace list")
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"wG","active_tab_id":"wG:tQ","focused":true}]}}'
+    ;;
+  "tab list")
+    printf '%s\n' '{"result":{"tabs":[{"tab_id":"wG:tQ","workspace_id":"wG"}]}}'
+    ;;
+  "pane list")
+    printf '%s\n' '{"result":{"panes":[{"pane_id":"wG:pQ","tab_id":"wG:tQ"}]}}'
+    ;;
+  "status --json")
+    printf '%s\n' '{"server":{"running":true}}'
+    ;;
+  "session list")
+    if [ -n "\${FM_TEST_REASSIGN_MARKER:-}" ]; then
+      printf 'token=%s\ntask=%s\nhome=/fake/home\n' \
+        "\${FM_TEST_REASSIGN_TOKEN:?}" "\${FM_TEST_REASSIGN_TASK:?}" > "\$FM_TEST_REASSIGN_MARKER"
+    fi
+    printf '%s\n' '{"sessions":[{"name":"default","running":true,"socket_path":"$case_dir/herdr.sock"}]}'
+    ;;
+  "pane close")
+    : > "\${FM_FAKE_HERDR_CLOSED:?}"
+    ;;
+  "pane get")
+    if [ -e "\${FM_FAKE_HERDR_CLOSED:?}" ]; then
+      printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"result":{"pane":{"pane_id":"wG:pQ","tab_id":"wG:tQ","workspace_id":"wG"}}}'
+    ;;
+  "agent get")
+    printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$case_dir/fakebin/herdr"
 }
 
 add_lsof_no_holder() {  # <case_dir>
@@ -359,6 +429,75 @@ test_disown_refuses_while_the_worktree_is_still_ours() {
     || fail "disown-still-ours: refusal did not say the worktree is still ours: $(cat "$case_dir/stderr")"
   assert_present "$case_dir/state/task-a.meta" "disown-still-ours: cleaned up despite refusing"
   pass "--disown-worktree refuses while the worktree is still the task's own"
+}
+
+# (p) `absent` and `unreadable` are not proof of a reclaim - they are the absence
+# of proof either way, and a crewmate's own `git clean -fdx` reaches them with the
+# worktree still this task's and its work still in it. Disowning there would drop
+# the records and leave that work in a path no task claims, which the pool then
+# passes over for both `get` and prune, so it refuses and names what it found.
+test_disown_refuses_unlanded_work_when_ownership_is_unprovable() {
+  local case_dir rc
+  case_dir=$(make_case disown-unprovable-dirty)
+  # No record at all: removed, not replaced by a sibling's.
+  write_meta "$case_dir" task-a "$case_dir/wt-a" "$TOKEN_A"
+  printf 'work in progress\n' > "$case_dir/wt-a/scratch.txt"
+
+  set +e
+  run_teardown "$case_dir" task-a --disown-worktree > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "disown-unprovable-dirty: disowning should refuse while unlanded work is in that worktree"
+  grep -q "uncommitted changes" "$case_dir/stderr" \
+    || fail "disown-unprovable-dirty: the refusal did not name what it found: $(cat "$case_dir/stderr")"
+  grep -q "needs a human decision" "$case_dir/stderr" \
+    || fail "disown-unprovable-dirty: the refusal did not say this state needs a human decision"
+  assert_present "$case_dir/state/task-a.meta" "disown-unprovable-dirty: records were dropped despite refusing"
+  assert_present "$case_dir/wt-a/scratch.txt" "disown-unprovable-dirty: the uncommitted work was disturbed"
+  ! treehouse_was_called "$case_dir" || fail "disown-unprovable-dirty: touched the pool despite refusing"
+  pass "--disown-worktree refuses unlanded work when ownership is merely unprovable"
+}
+
+# (q) The other half of that, so criterion 3 does not become its own trap: with
+# nothing unlanded at stake, an unprovable record still has the stated
+# non-forcing way out.
+test_disown_proceeds_when_an_unprovable_worktree_holds_no_unlanded_work() {
+  local case_dir rc
+  case_dir=$(make_case disown-unprovable-clean)
+  write_meta "$case_dir" task-a "$case_dir/wt-a" "$TOKEN_A"
+
+  set +e
+  run_teardown "$case_dir" task-a --disown-worktree > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "disown-unprovable-clean: cleanup should still succeed: $(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-a.meta" "disown-unprovable-clean: task record was not cleaned up"
+  ! treehouse_was_called "$case_dir" || fail "disown-unprovable-clean: returned a worktree it cannot prove is its own"
+  assert_present "$case_dir/wt-a" "disown-unprovable-clean: removed a worktree it does not own"
+  pass "--disown-worktree still resolves an unprovable record when no unlanded work is at stake"
+}
+
+# (r) The way past (p) stays the ordinary explicit one - the captain's --force,
+# which authorizes giving up THIS task's own work - and it still touches nothing
+# under the path.
+test_forced_disown_overrides_the_unlanded_work_refusal() {
+  local case_dir rc
+  case_dir=$(make_case disown-unprovable-forced)
+  write_meta "$case_dir" task-a "$case_dir/wt-a" "$TOKEN_A"
+  printf 'work in progress\n' > "$case_dir/wt-a/scratch.txt"
+
+  set +e
+  run_teardown "$case_dir" task-a --force --disown-worktree > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "disown-unprovable-forced: --force should authorize the disown: $(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-a.meta" "disown-unprovable-forced: task record was not cleaned up"
+  ! treehouse_was_called "$case_dir" || fail "disown-unprovable-forced: returned a worktree it cannot prove is its own"
+  assert_present "$case_dir/wt-a/scratch.txt" "disown-unprovable-forced: disowning touched the worktree"
+  pass "--force --disown-worktree is the explicit override for that refusal and still touches nothing"
 }
 
 # (k) The unlanded-work protections are untouched: this adds a check, removes none.
@@ -663,6 +802,44 @@ test_safety_lock_wait_reproves_ownership_before_branch_deletion() {
   pass "ownership is re-proved after the safety-check lock wait, before branch deletion"
 }
 
+# (s) The herdr preflight spins on the presentation session lock for up to five
+# seconds, and that spin sits between the first ownership proof and the block that
+# deletes the branch, removes the hook files, and returns the worktree. A slot the
+# pool reassigns while teardown waits there has to be refused like any other.
+test_herdr_preflight_wait_reproves_ownership_before_branch_deletion() {
+  local case_dir rc
+  case_dir=$(make_case herdr-preflight-reassign)
+  claim_for "$case_dir/wt-a" "$TOKEN_A" task-a
+  write_meta "$case_dir" task-a "$case_dir/wt-a" "$TOKEN_A"
+  configure_reassigning_herdr_endpoint "$case_dir"
+
+  set +e
+  FM_FAKE_HERDR_LOG="$case_dir/herdr.log" \
+  FM_FAKE_HERDR_CLOSED="$case_dir/herdr-closed" \
+  FM_TEST_REASSIGN_MARKER="$case_dir/wt-a/$MARKER" \
+  FM_TEST_REASSIGN_TOKEN="$TOKEN_B" \
+  FM_TEST_REASSIGN_TASK=task-b \
+    run_teardown "$case_dir" task-a > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "herdr-preflight-reassign: teardown should refuse a slot reassigned during the preflight"
+  grep -q "held by task task-b" "$case_dir/stderr" \
+    || fail "herdr-preflight-reassign: no ownership refusal: $(cat "$case_dir/stderr")"
+  # The reassignment is served from inside the preflight, so reaching it at all
+  # proves the first proof passed and the refusal came from the re-proof after it.
+  grep -q "^session list" "$case_dir/herdr.log" \
+    || fail "herdr-preflight-reassign: the preflight never ran, so its wait was never exercised"
+  ! treehouse_was_called "$case_dir" || fail "herdr-preflight-reassign: returned a worktree another task holds"
+  git -C "$case_dir/project" rev-parse --verify -q fm/task-a >/dev/null \
+    || fail "herdr-preflight-reassign: deleted the branch despite refusing"
+  grep -q "task=task-b" "$case_dir/wt-a/$MARKER" \
+    || fail "herdr-preflight-reassign: disturbed the new holder's ownership record"
+  assert_present "$case_dir/state/task-a.meta" \
+    "herdr-preflight-reassign: durable task record was removed despite refusing"
+  pass "ownership is re-proved after the herdr presentation-lock wait, before branch deletion"
+}
+
 # The no-argument help is the header contract: whole sentences from the first
 # one on, comment prefixes stripped, like every other bin script's usage.
 test_usage_prints_the_header_from_its_first_sentence() {
@@ -689,9 +866,13 @@ test_task_without_ownership_record_is_unchecked
 test_missing_ownership_record_refuses
 test_disown_cleans_up_without_touching_the_worktree
 test_disown_refuses_while_the_worktree_is_still_ours
+test_disown_refuses_unlanded_work_when_ownership_is_unprovable
+test_disown_proceeds_when_an_unprovable_worktree_holds_no_unlanded_work
+test_forced_disown_overrides_the_unlanded_work_refusal
 test_disown_run_never_prunes_the_released_branch
 test_return_lock_retry_reproves_ownership_before_retrying
 test_safety_lock_wait_reproves_ownership_before_branch_deletion
+test_herdr_preflight_wait_reproves_ownership_before_branch_deletion
 test_uncommitted_work_still_refuses_with_a_valid_record
 test_ownership_record_alone_is_not_uncommitted_work
 test_claim_restores_a_missing_record
