@@ -31,28 +31,60 @@
 #              vendor sentence can share one line - the harness streams both -
 #              so the match is a substring, never a whole-line compare.
 #
-# With --agent-episode the match must also belong to the FINAL agent episode in
-# the text: no "started pid=" line may follow it. A pipeline step log can hold
-# several episodes, and only a kill in the last one is the reason the step ended
-# the way it did. Text with no episode structure at all (a pane capture) is
-# scanned without the flag.
+# With --agent-episode the match must clear TWO further requirements, because a
+# step log is read to explain why a step ended:
+#
+#   1. It must belong to the FINAL agent episode: no "started pid=" line may
+#      follow it. A step log can hold several episodes, and a kill the pipeline
+#      already retried past is not why the step ended the way it did.
+#   2. The first non-blank line after it must be the harness's OWN exit line
+#      ("exited pid=<digits> error="). The vendor sentence is text, so an agent
+#      that QUOTES it - reviewing this very feature, say - writes the same bytes
+#      the vendor does. Only the harness writes the exit line, so requiring it
+#      adjacent separates the vendor speaking from an agent quoting the vendor.
+#      Lines that are empty once surrounding whitespace and double quotes are
+#      stripped are skipped, because `no-mistakes axi logs` renders the log as
+#      TOON, which blanks to "" and quotes some lines; the raw log file and that
+#      rendering are both real inputs.
+#
+# Requirement 2 is deliberately NOT applied without the flag. A pane capture of a
+# worker sitting on a live usage-limit dialog has no exit line by definition -
+# the agent has not exited, which is the entire point of waking a supervisor for
+# it - so adding adjacency there would blind the blocked-worker path. Pane text
+# has no episode structure either, so it is scanned without the flag.
 fm_quota_kill_scan() {  # [--agent-episode]
   local episode=0
   [ "${1:-}" = --agent-episode ] && episode=1
   awk -v episode="$episode" '
+    function commit() { win = pend_win; ev = pend_ev; hit = pend_hit; pending = 0 }
     /started pid=/ { laststart = NR }
     {
+      # Resolve a match still awaiting its adjacent exit line BEFORE looking for
+      # a new one, so a second vendor line correctly rejects the first.
+      if (pending) {
+        probe = $0
+        gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", probe)
+        if (probe != "") {
+          if (match($0, /exited pid=[0-9]+ error=/)) commit(); else pending = 0
+        }
+      }
       if (match($0, /You.?.?.?ve hit your session limit/)) {
-        win = "session"; ev = substr($0, RSTART); hit = NR
-      } else if (match($0, /You.?.?.?ve reached your [^.]+ limit\./) && index($0, "/usage-credits") > 0) {
+        pend_win = "session"; pend_ev = substr($0, RSTART); pend_hit = NR; pending = 1
+      } else if (match($0, /You.?.?.?ve reached your [A-Za-z0-9]+([.][0-9]+|[ -][A-Za-z0-9]+)* limit\./) && index($0, "/usage-credits") > 0) {
         # The action link is required as a second anchor: "reached your X limit"
         # alone is ordinary enough prose that a review agent quoting a diff could
         # produce it, and a false quota verdict would excuse a real failure.
+        #
+        # The name bound admits a dot only between digits, so a version like
+        # "Haiku 4.5" is a name while a sentence end is not. A freely dotted name
+        # would let ordinary prose ("...reached your quota. See the docs. Then
+        # run /usage-credits to check your limit.") satisfy both anchors at once.
         m = substr($0, RSTART, RLENGTH)
         sub(/^You.?.?.?ve reached your /, "", m)
         sub(/ limit\.$/, "", m)
-        win = "model:" m; ev = substr($0, RSTART); hit = NR
+        pend_win = "model:" m; pend_ev = substr($0, RSTART); pend_hit = NR; pending = 1
       }
+      if (pending && !episode) commit()
     }
     END {
       if (!hit) exit 1

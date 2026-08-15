@@ -30,6 +30,12 @@ WAKE_LOG="$TMP/wakes"
 SLEEP_LOG="$TMP/sleeps"
 wake() { printf '%s\n' "$1" >> "$WAKE_LOG"; return 0; }
 sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
+# The blocked path reads the crew's pane to name its cause. Every case owns its
+# own pane text; this deterministic unreadable default is installed BEFORE the
+# first one so no case can fall through to a real backend on a machine that has
+# one. The suite is hermetic by contract - no real herdr, ever.
+# shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
+fm_backend_capture() { return 1; }
 
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
@@ -101,9 +107,8 @@ grep -qF "$GENERIC" "$WAKE_LOG" \
   || fail "an unreadable pane must still produce today's wake, never swallow it: $(cat "$WAKE_LOG")"
 pass "handle_push_transition: an unreadable pane still escalates, with the pre-existing generic reason"
 
-# Every case below this point predates the enrichment and must stay hermetic, so
-# the pane read keeps a deterministic unreadable default rather than falling
-# through to a real backend on a machine that has one.
+# Every case below this point predates the enrichment, so restore the file-wide
+# unreadable default that the three cases above replaced with their own text.
 # shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
 fm_backend_capture() { return 1; }
 

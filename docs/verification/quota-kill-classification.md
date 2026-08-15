@@ -84,8 +84,42 @@ Both observed in the field; the recognizer matches these and nothing else.
 The model family requires the vendor's `/usage-credits` action link as a second anchor.
 `reached your … limit` on its own is ordinary enough prose that a review agent quoting a diff can emit it, and a false quota verdict would excuse a real failure.
 
+The model name is bound by `[A-Za-z0-9]+([.][0-9]+|[ -][A-Za-z0-9]+)*`, which admits a dot only between digits.
+That is what a version looks like (`Haiku 4.5`, `Opus 4.1`), and it is not what a sentence end looks like.
+A freely dotted name is unsafe even behind the action-link anchor, because this line satisfies both anchors at once:
+
+```
+Docs note: You've reached your quota. See the docs. Then run /usage-credits to check your limit.
+```
+
+Under a freely dotted name that reports the model as `quota. See the docs. Then run /usage-credits to check your`.
+It is ordinary prose a review agent could emit while discussing this very feature, so the bound is load-bearing rather than cosmetic; `tests/fm-quota-kill.test.sh` pins that exact line as a must-not-match.
+
 Classification is never taken from the exit shape.
 `exit status 1` and `signal: killed` both occur for quota kills and for genuine deaths, which is exactly why the message is the only admissible evidence.
+
+## Why a log match must also carry the harness's own exit line
+
+The vendor sentence is just text, so an agent that QUOTES it writes the same bytes the vendor does.
+This is not hypothetical: committing both wordings verbatim into this repository made the recognizer match its own documentation and its own test file, a live false positive in tracked material.
+
+So in `--agent-episode` (log) mode a match must additionally be followed, on the first non-blank line, by the harness's own exit line matching `exited pid=<digits> error=`.
+Only the harness writes that line, so requiring it adjacent separates the vendor speaking from an agent quoting the vendor.
+Lines that are empty once surrounding whitespace and double quotes are stripped are skipped, because `axi logs` renders the log as TOON, which blanks to `""` and quotes some lines; both the raw log file and that rendering are real inputs.
+
+**This requirement is scoped to log mode and must stay that way.**
+A worker sitting on a live usage-limit dialog has not exited, which is the entire reason a supervisor is woken for it, so its pane carries no exit line by definition.
+Adding adjacency to the plain (pane) mode would blind the blocked-worker path completely.
+
+The cost of the requirement is that attribution can degrade to a plain failure, and that direction was chosen deliberately.
+A false quota verdict excusing a genuine failure tells a supervisor to wait out an external condition that is never coming.
+An unrecognized kill reporting as a plain failure is merely today's behavior and costs nothing that is not already being paid.
+The second is recoverable by a human reading the log; the first actively misdirects one.
+A later reader should not mistake this for an oversight and widen it back.
+
+Measured over every log under `~/.no-mistakes/logs` carrying a vendor sentence, 30 logs: 27 keep their attribution and 3 do not.
+All 3 are earlier-episode rejections that already existed before this change, not new losses.
+The adjacency requirement itself costs zero attribution in that corpus: across all 42 vendor-line occurrences in it, the first non-blank line after the vendor line is the harness exit line in 42 of 42.
 
 ## Proof against real recorded runs
 
@@ -110,6 +144,8 @@ A pane capture has no episode structure and is scanned without the flag.
 ## What this still cannot see
 
 - **A new vendor wording.** The recognizer matches the two sentences above. A reworded limit message is not recognized, which reports as a plain failure - today's behavior - never as an excused one.
+- **A verbatim quotation of a COMPLETE log block.** Adjacency narrows the quotation false positive; it does not eliminate it. Text reproducing the vendor sentence *together with* its adjacent harness exit line still matches in log mode, because at that point it is byte-identical to the thing it quotes. The `axi logs` excerpt in this record is exactly such a block, and it does match when scanned on its own. Scanning this whole record happens not to match, but only incidentally - its later prose mentions the `started pid=` marker, which trips the final-episode rule - so that is a coincidence of this file, not a property to rely on.
+- **Any vendor sentence at all, in pane mode.** Plain mode carries no adjacency requirement by design, so tracked text quoting either wording still matches it, including this record and `tests/fm-quota-kill.test.sh`. The blocked-pane consumer is enrichment only: a false match renames a wake that was already being raised and never suppresses one, which is why this exposure is accepted rather than closed by narrowing the mode that acceptance criterion 2 depends on.
 - **A kill before any output.** An agent killed before writing its first line leaves no message to match.
 - **Non-`claude` harnesses.** Only the `claude` wordings are established. `codex`, `opencode`, `pi`, `grok` and `kimi` limit messages have not been observed here.
 - **The pane dialog's own wording.** The blocked-pane enrichment matches the same two vendor sentences. If the interactive dialog words its limit differently, the enrichment does not fire and the wake keeps its existing generic reason - it is never suppressed.
@@ -140,7 +176,7 @@ That is a deliberate structural property, not a convenience: it must never becom
 
 ## Regression coverage
 
-- `tests/fm-quota-kill.test.sh` - both vendor families, the glued-prose line shape, pane text with no episode structure, the evidence bound, and the failed-step read; plus the three cases that must not regress: a genuine death, agent prose resembling the vendor sentence, and a retried-past kill ahead of a genuine failure.
+- `tests/fm-quota-kill.test.sh` - both vendor families, dotted model names, the glued-prose line shape, pane text with no episode structure, a live pane dialog with no exit line anywhere (the direct guard on the blocked-worker path), the evidence bound, and the failed-step read; plus the cases that must not regress: a genuine death, agent prose resembling the vendor sentence, a retried-past kill ahead of a genuine failure, an agent quoting the vendor sentence with no adjacent exit line, and the `Docs note:` line that carries both anchors.
 - `tests/fm-crew-state.test.sh` - a failed run killed by the usage limit names that cause with its window; a failed run from a genuine agent death stays a plain failure with no quota clause.
 - `tests/fm-supervision-events.test.sh` - a blocked pane showing the limit wakes with it named; an unrecognized dialog and an unreadable pane both keep the pre-existing generic reason.
-- `tests/fm-quota-advice.test.sh` - every window reported with the binding one named, an exhausted per-model window headlined under a healthy-looking session window, and exit 0 preserved across every degraded read.
+- `tests/fm-quota-advice.test.sh` - every window reported with the binding one named, an exhausted per-model window headlined under a healthy-looking session window, valid JSON carrying no provider/window shape reported as unavailable rather than as a healthy account, and exit 0 preserved across every degraded read.

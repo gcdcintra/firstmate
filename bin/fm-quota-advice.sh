@@ -48,6 +48,15 @@ fi
 [ -n "$RAW" ] || unavailable "quota-axi returned nothing"
 printf '%s' "$RAW" | jq -e . >/dev/null 2>&1 || unavailable "quota-axi output is not valid JSON"
 
+# Valid JSON is not yet an answer. An error object, or a providers array that is
+# empty because the account is unauthenticated or a provider probe failed, parses
+# fine and would render as "no window is exhausted" - a healthy account is the
+# one thing an unreadable one must never be reported as. The renderer below walks
+# the shape with `[]?`, which yields nothing rather than failing, so the absence
+# has to be caught here instead.
+printf '%s' "$RAW" | jq -e '[.providers[]?.windows[]?] | length > 0' >/dev/null 2>&1 \
+  || unavailable "quota-axi output carried no provider/window shape (unauthenticated account, or a provider probe failed)"
+
 # One jq pass renders the whole report. Every number and label is quota-axi's
 # own; the only thing computed here is which windows read as exhausted, which is
 # a plain zero test rather than a policy threshold.

@@ -115,6 +115,21 @@ out=$(run_advice); rc=$?
 assert_contains "$out" "quota-advice: unavailable" "malformed output must report unavailable"
 pass "malformed quota output reports unavailable rather than a partial answer"
 
+# Valid JSON carrying no windows is the degraded read that looks least like one:
+# an unauthenticated account or a failed provider probe parses cleanly, so the
+# renderer would walk it to completion and headline a healthy account with no
+# window lines under it to contradict the claim.
+for shapeless in '{}' '{"providers":[]}' '{"error":"not authenticated"}'; do
+  FM_FAKE_QUOTA_JSON="$shapeless"
+  out=$(run_advice); rc=$?
+  [ "$rc" = 0 ] || fail "shapeless quota output must still exit 0 (advisory, never a refusal), got $rc for $shapeless"
+  assert_contains "$out" "quota-advice: unavailable" \
+    "valid JSON with no provider/window shape must report unavailable, got: $out"
+  assert_not_contains "$out" "no window is exhausted" \
+    "an account whose windows could not be read must NEVER be reported as a healthy one ($shapeless)"
+done
+pass "valid JSON carrying no provider/window shape reports unavailable, never a healthy account"
+
 FM_FAKE_QUOTA_VERSION="quota-axi 0.1.2"
 FM_FAKE_QUOTA_JSON=$(healthy_json)
 out=$(run_advice); rc=$?
