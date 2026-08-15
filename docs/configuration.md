@@ -287,6 +287,9 @@ An absent or too-old `quota-axi` reports `MISSING: quota-axi (install: npm insta
 That floor exists because it is the first build reporting per-credential auth sources, without which a candidate cannot be judged against the authentication surface it actually uses.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
+A locked session also pins the GitHub base repository of `FM_ROOT` itself to its own `origin`, so `gh` pull-request and issue queries, and the issue and pull-request figures in the startup banner, answer for this checkout instead of a fork parent's; a completed pin reports `BOOTSTRAP_INFO:`, and one that could not be made reports `GH_BASE_REPO:` with the `gh repo set-default` command to run.
+In a read-only session that line is advisory and leaves the repair to the session holding the fleet lock, except when an explicit `remote.<name>.gh-resolved` setting is what points elsewhere: firstmate never overwrites that human choice, so the line carries its redirect command in both modes.
+Bootstrap stays silent when the base repository already resolves to `origin`, and it pins only `FM_ROOT`, never a project clone under `projects/`.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
 It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
 Normal completed runs keep local-only and no-origin skips silent.

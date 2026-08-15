@@ -567,7 +567,7 @@ gh_base_repo_markers() {  # <dir>
 # when the resolution already lands on origin or when nothing is ambiguous; see
 # this script's header for the full contract.
 gh_base_repo_pin() {
-  local origin_repo markers repo marker resolved= setting=
+  local origin_repo markers repo marker resolved='' setting=''
   git -C "$FM_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
   origin_repo=$(fm_gh_repo_from_remote "$FM_ROOT") || return 0
   markers=$(gh_base_repo_markers "$FM_ROOT")
