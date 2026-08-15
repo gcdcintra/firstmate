@@ -14,6 +14,10 @@
 # and is refused otherwise. Comment lines are ignored. The allowlist below
 # carries the only exemptions, each with the reason it is safe.
 #
+# A scan that matched no scripts proves nothing, so it exits 2 rather than
+# reporting success: a --root pointed one level off must fail like the argument
+# error it is, not read as a clean bin/.
+#
 # Usage:
 #   bin/fm-gh-repo-guard.sh              guard this repository's bin/
 #   bin/fm-gh-repo-guard.sh --root <dir> guard another checkout's bin/
@@ -28,7 +32,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --help|-h)
-      sed -n '2,20{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"
+      sed -n '2,23{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *) printf 'fm-gh-repo-guard: unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -77,6 +81,12 @@ for path in "$ROOT"/bin/*.sh "$ROOT"/bin/backends/*.sh; do
   done < "$path"
 done
 
+if [ "$scanned" -eq 0 ]; then
+  printf 'fm-gh-repo-guard: no scripts to scan under %s/bin - nothing was checked, so nothing is proven.\n' \
+    "$ROOT" >&2
+  printf 'Point --root at the root of a checkout whose bin/ holds the scripts to guard.\n' >&2
+  exit 2
+fi
 if [ "$findings" -gt 0 ]; then
   printf 'fm-gh-repo-guard: %s unpinned GitHub query/queries found.\n' "$findings" >&2
   printf 'Route them through fm_gh_query (bin/fm-gh-lib.sh) or pass --repo explicitly.\n' >&2

@@ -13,6 +13,8 @@
 #   (c) an explicit --repo/-R, or a routed fm_gh_query, is accepted
 #   (d) prose about these tools in a comment is not an invocation
 #   (e) an unreadable --root argument fails rather than passing vacuously
+#   (f) a --root whose bin/ holds no scripts fails rather than reporting an
+#       "ok" that checked nothing
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -98,8 +100,27 @@ test_unreadable_root_fails() {
   pass "fm-gh-repo-guard: an unusable --root fails instead of passing vacuously"
 }
 
+# A --root pointed one level off - at bin/ itself, at a sibling, at a checkout
+# whose scripts live elsewhere - matches nothing. Reporting success there would
+# tell a caller its bin/ is pinned when the guard never read a line of it.
+test_empty_scan_fails_instead_of_passing() {
+  local fixture out rc
+  fixture="$TMP_ROOT/no-bin-scripts"
+  mkdir -p "$fixture/bin"
+  printf '%s\n' 'not a script' > "$fixture/bin/README.md"
+  out=$("$GUARD" --root "$fixture" 2>&1) && rc=0 || rc=$?
+  expect_code 2 "$rc" "a scan that matched no scripts reported success"
+  assert_contains "$out" "nothing was checked" \
+    "the empty scan did not say why it proves nothing"
+  case "$out" in
+    *"ok scripts="*) fail "the empty scan still printed an ok line: $out" ;;
+  esac
+  pass "fm-gh-repo-guard: a scan that matches no scripts fails instead of passing vacuously"
+}
+
 test_repository_bin_is_clean
 test_unpinned_queries_are_refused
 test_pinned_and_routed_queries_are_accepted
 test_comments_are_not_invocations
 test_unreadable_root_fails
+test_empty_scan_fails_instead_of_passing

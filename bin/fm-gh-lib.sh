@@ -28,6 +28,7 @@
 #
 # Usage (sourced; see tests/fm-gh-lib.test.sh for the behavior contract):
 #   fm_gh_repo_from_url <url>           owner/repo from a canonical PR URL
+#   fm_gh_repo_from_remote_url <url>    owner/repo from one remote's URL
 #   fm_gh_repo_from_remote <dir>        owner/repo from <dir>'s origin remote
 #   fm_gh_query <gh|gh-axi> <dir> <arg>...   run the query with a pinned repo
 
@@ -79,30 +80,61 @@ fm_gh_args_pin_repo() {
   return 1
 }
 
-# owner/repo from <dir>'s `origin` remote, GitHub hosts only. Accepts the https
-# and ssh spellings with an optional .git suffix. A missing origin, a non-GitHub
-# host, or anything that does not parse returns non-zero rather than a guess, so
-# a GitLab-hosted or remote-less project refuses here instead of being asked
-# about the wrong forge.
+# owner/repo from a single remote's URL, GitHub hosts only. Accepts the
+# spellings git itself records: https:// and ssh:// with optional userinfo and
+# an optional port, the scp-style git@github.com:, and an optional .git suffix -
+# `git clone https://user@github.com/owner/repo` records the userinfo form, and
+# refusing it would cost a legitimate clone its repository for no gain.
 #
-# The configured URL is read with `git config` rather than `git remote get-url`
-# because get-url applies url.<base>.insteadOf rewriting. What is wanted here is
-# the remote's declared identity - which repository this is - not the transport
-# a local mirror or proxy rewrite happens to send it over.
-fm_gh_repo_from_remote() {
-  local dir=${1-} url owner_repo
-  [ -n "$dir" ] || return 1
-  url=$(git -C "$dir" config --get remote.origin.url 2>/dev/null) || return 1
+# Userinfo is stripped inside the authority only, and the host must then be
+# github.com exactly, so a path segment dressed up as a host
+# (https://evil.example/x@github.com/owner/repo) refuses like any other host. A
+# non-GitHub host, another scheme, or anything that does not parse returns
+# non-zero rather than a guess, so a GitLab-hosted project refuses here instead
+# of being asked about the wrong forge.
+fm_gh_repo_from_remote_url() {
+  local url=${1-} rest authority host port owner_repo
   case "$url" in
-    https://github.com/*)   owner_repo=${url#https://github.com/} ;;
-    ssh://git@github.com/*) owner_repo=${url#ssh://git@github.com/} ;;
-    git@github.com:*)       owner_repo=${url#git@github.com:} ;;
+    https://*|ssh://*)
+      rest=${url#*://}
+      case "$rest" in
+        */*) ;;
+        *) return 1 ;;
+      esac
+      authority=${rest%%/*}
+      owner_repo=${rest#*/}
+      host=${authority##*@}
+      case "$host" in
+        *:*)
+          port=${host##*:}
+          host=${host%:*}
+          [[ "$port" =~ ^[0-9]+$ ]] || return 1
+          ;;
+      esac
+      [ "$host" = github.com ] || return 1
+      ;;
+    git@github.com:*) owner_repo=${url#git@github.com:} ;;
     *) return 1 ;;
   esac
   owner_repo=${owner_repo%/}
   owner_repo=${owner_repo%.git}
   fm_gh_owner_repo_valid "$owner_repo" || return 1
   printf '%s\n' "$owner_repo"
+}
+
+# owner/repo from <dir>'s `origin` remote. A missing origin, or a URL
+# fm_gh_repo_from_remote_url refuses, returns non-zero rather than a guess, so a
+# remote-less project refuses here instead of falling back to another remote.
+#
+# The configured URL is read with `git config` rather than `git remote get-url`
+# because get-url applies url.<base>.insteadOf rewriting. What is wanted here is
+# the remote's declared identity - which repository this is - not the transport
+# a local mirror or proxy rewrite happens to send it over.
+fm_gh_repo_from_remote() {
+  local dir=${1-} url
+  [ -n "$dir" ] || return 1
+  url=$(git -C "$dir" config --get remote.origin.url 2>/dev/null) || return 1
+  fm_gh_repo_from_remote_url "$url"
 }
 
 # Run `gh` or `gh-axi` with the repository pinned, from inside <dir> so a

@@ -13,9 +13,12 @@
 # Matrix:
 #   (a) owner/repo derived from a canonical GitHub PR URL
 #   (b) a non-canonical or non-GitHub URL derives nothing
-#   (c) owner/repo derived from an https origin remote, .git suffix or not
-#   (d) owner/repo derived from an ssh origin remote (both spellings)
-#   (e) `upstream` is never read, even when origin is absent
+#   (c) owner/repo derived from an https origin remote, .git suffix or not,
+#       with or without the userinfo `git clone https://user@github.com/...` records
+#   (d) owner/repo derived from an ssh origin remote (both spellings, any port)
+#   (e) an origin that is not a GitHub repository - another host, or a path
+#       dressed up as one - derives nothing
+#   (f) `upstream` is never read, even when origin is absent
 #   (f) a resolvable directory injects --repo into the invocation
 #   (g) an argument that already pins the repository is passed through untouched
 #   (h) an unresolvable repository is REFUSED without running the tool at all
@@ -100,6 +103,13 @@ test_repo_from_https_origin_remote() {
   got=$(fm_gh_repo_from_remote "$repo") || fail "suffixless https origin did not resolve"
   [ "$got" = "gcdcintra/firstmate" ] \
     || fail "suffixless https origin resolved to '$got'"
+
+  # What `git clone https://user@github.com/owner/repo` records. Refusing it
+  # would cost a legitimate clone every pull-request and issue answer.
+  repo=$(make_repo https-origin-userinfo "origin=https://gcdcintra@github.com/gcdcintra/firstmate.git")
+  got=$(fm_gh_repo_from_remote "$repo") || fail "https origin with userinfo did not resolve"
+  [ "$got" = "gcdcintra/firstmate" ] \
+    || fail "https origin with userinfo resolved to '$got'"
   pass "fm-gh-lib: owner/repo is derived from an https origin remote"
 }
 
@@ -114,7 +124,35 @@ test_repo_from_ssh_origin_remote() {
   got=$(fm_gh_repo_from_remote "$repo") || fail "ssh:// origin did not resolve"
   [ "$got" = "gcdcintra/firstmate" ] \
     || fail "ssh:// origin resolved to '$got'"
+
+  # An explicit port is still the same repository on the same host.
+  repo=$(make_repo ssh-url-origin-port "origin=ssh://git@github.com:22/gcdcintra/firstmate.git")
+  got=$(fm_gh_repo_from_remote "$repo") || fail "ssh:// origin with a port did not resolve"
+  [ "$got" = "gcdcintra/firstmate" ] \
+    || fail "ssh:// origin with a port resolved to '$got'"
   pass "fm-gh-lib: owner/repo is derived from an ssh origin remote"
+}
+
+# Widening the accepted spellings must not widen what counts as GitHub. Each
+# origin below either names another host or only looks like it names GitHub;
+# resolving any of them would pin queries to a repository that is not ours.
+test_origin_urls_that_are_not_github_repositories_are_refused() {
+  local url repo got i=0
+  for url in \
+    "https://gitlab.com/group/project.git" \
+    "https://github.com@evil.example/gcdcintra/firstmate.git" \
+    "https://user@github.com.evil.example/gcdcintra/firstmate.git" \
+    "https://evil.example/x@github.com/gcdcintra/firstmate.git" \
+    "ssh://git@github.com:notaport/gcdcintra/firstmate.git" \
+    "https://github.com/gcdcintra" \
+    "git@gitlab.com:group/project.git" ; do
+    i=$((i + 1))
+    repo=$(make_repo "refuse-origin-$i" "origin=$url")
+    if got=$(fm_gh_repo_from_remote "$repo" 2>/dev/null); then
+      fail "origin '$url' resolved to '$got' instead of being refused"
+    fi
+  done
+  pass "fm-gh-lib: an origin that is not a GitHub repository derives nothing"
 }
 
 # Preferring `upstream` is the defect. Reading it here even as a fallback would
@@ -219,6 +257,7 @@ test_repo_from_canonical_pr_url
 test_non_canonical_urls_resolve_nothing
 test_repo_from_https_origin_remote
 test_repo_from_ssh_origin_remote
+test_origin_urls_that_are_not_github_repositories_are_refused
 test_upstream_remote_is_never_read
 test_query_injects_repo_from_origin
 test_already_pinned_arguments_pass_through
