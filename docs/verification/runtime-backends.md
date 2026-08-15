@@ -80,10 +80,42 @@ Zellij has no verified recovery-grade agent process probe, while Orca and cmux d
 
 The adapter's worker-pid resolver `fm_backend_tmux_agent_pid` reads `#{pane_pid}` for the pane's shell and then field 8 (tpgid) of that shell's `/proc` stat, which is the tty's current foreground process group leader and therefore the agent regardless of nesting depth.
 It runs only after the recovery-grade agent_state check above returns `alive`, because that check's session inventory is what stops tmux from silently falling back to the active window for an absent target and handing back another task's pid.
-It exists to supply the worker pid that the watcher's CPU-progress check samples before deferring a wedge escalation; `fm_backend_agent_pid`'s comment in `bin/fm-backend.sh` owns that contract, including what a doubtful read means there.
-As of 2026-08-15 this resolver has no recorded tmux-specific live measurement and no direct test coverage.
-The only live evidence on the consumer path is the Herdr run owned by [supervision.md](supervision.md#worker-cpu-progress), and the tmux evidence above was taken on macOS, which has no `/proc` for this resolver to read, so none of it transfers.
-Direct coverage is landing as a follow-up commit on this branch, together with the busy-path deferral restriction.
+It exists to supply the worker pid that the watcher's CPU-progress check samples on every wedge escalation; `fm_backend_agent_pid`'s comment in `bin/fm-backend.sh` owns that contract, including what a doubtful read means there.
+
+The resolver was measured live on 2026-08-15 with tmux 3.4 on Linux, USER_HZ=100.
+The cell was a private tmux session with two windows on a throwaway `FM_HOME`, isolated from the live fleet.
+In each window the harness process was started by typing into the pane rather than by replacing the pane shell, so the agent is a descendant of the pane shell and `#{pane_pid}` is not the agent - the exact shape this resolver exists to see through.
+The harness stand-in was a copy of `/bin/bash` named `claude`, so the pane's foreground command matches the adapter's harness-name test.
+
+Observed in window `busypane`, the agent working under a spin loop:
+
+```text
+#{pane_pid} (the pane shell) = 3819516 (comm bash)
+fm_backend_agent_state tmux  = alive
+fm_backend_agent_pid tmux    = 3819589 (comm claude), parent 3819516
+utime+stime+cutime+cstime    = 405 -> 2413 ticks over 20s = 2008 ticks, 100.40 ticks/s
+```
+
+Observed in window `idlepane`, the same harness-named process foreground and making no progress:
+
+```text
+#{pane_pid} (the pane shell) = 3819522 (comm bash)
+fm_backend_agent_state tmux  = alive
+fm_backend_agent_pid tmux    = 3819596 (comm claude), parent 3819522
+utime+stime+cutime+cstime    = 0 -> 0 ticks over 20s = 0 ticks, 0.00 ticks/s
+```
+
+This establishes that the resolver returns the agent process rather than the pane shell in both cases: each returned pid's parent is its own pane's shell, and the two windows resolved to two different pids, so it is not falling back to the active window.
+The counter it feeds cleanly separates a working agent from a stuck one.
+The refusal path is real rather than theoretical: with a foreground command that is not harness-shaped (`python3`, `sleep`), `fm_backend_tmux_agent_state` returns `ambiguous` and the resolver refuses, so the caller reads `unknown` and the pane escalates.
+
+The limits of that evidence, stated plainly:
+
+- The stand-in is a renamed `/bin/bash`, so this exercises the tpgid resolution and the counter read, not the real agent binary.
+- 100.40 ticks/s is a synthetic full-core spin, not a representative agent workload; the representative population figures stay where they already live in [supervision.md](supervision.md#worker-cpu-progress).
+- Direct automated test coverage for `fm_backend_tmux_agent_pid` remains absent, and is deferred scope rather than pending work on this branch.
+
+The only other live evidence on the consumer path is the Herdr run owned by [supervision.md](supervision.md#worker-cpu-progress); the tmux evidence earlier in this section was taken on macOS, which has no `/proc` for this resolver to read, so none of it transfers.
 
 The structural multi-row composer reader, Kimi pointer-delivery path, and OpenCode 1.18.4 busy-queue behavior are pinned by:
 

@@ -115,7 +115,10 @@ read_ticks() { awk '{n=index($0,")"); r=substr($0,n+2); split(r,f," "); print f[
 Two facts follow, and both are load-bearing.
 
 An idle agent is NOT quiet: a Claude Code worker sitting at its prompt animates its footer and burns 0.58-3.82 ticks/s, overlapping the busy range.
-CPU progress is therefore not a general "is this worker working" signal, and the watcher consults it only where an idle-at-prompt worker cannot appear - the wedge timer, which a pane reaches only after already being classified provably working or busy-past-its-turn-bound.
+CPU progress is therefore not a general "is this worker working" signal.
+The watcher consults it on every wedge path and reports the reading in each escalation, but only the busy-turn path may DEFER on it: that pane holds an exact busy verdict with no completed turn, the one state in which a worker cannot speak for itself.
+An idle-at-prompt worker does reach the wedge timer, through the provably-working stale path, which is exactly why deferral is restricted this way.
+The three non-busy wedge paths have no turn in progress, so their measured process is an agent at its prompt whose idle animation overlaps a working reading; they escalate on their ordinary cadence whatever the CPU says, which is what makes that overlap harmless.
 A finished worker that went quiet without a status line is surfaced immediately by the separate non-terminal stale path, which this change does not touch.
 
 The floor separates working from WEDGED, not working from idle.

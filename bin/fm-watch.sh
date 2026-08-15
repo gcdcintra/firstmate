@@ -29,11 +29,7 @@
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
-#                          wedge threshold also surfaces - unless the worker
-#                          PROCESS is measurably burning CPU, which is the one
-#                          thing a worker inside a long tool-driven turn cannot
-#                          say for itself (it only reaches its status file
-#                          BETWEEN turns) - with an "escalation N"
+#                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
 #                          consecutive escalations on the SAME pane, the reason
 #                          also carries a "demand-deep-inspection" marker so the
