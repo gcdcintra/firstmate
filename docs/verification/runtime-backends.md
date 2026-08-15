@@ -78,6 +78,13 @@ Tmux needs the exact `pi-launcher`, `pi-signed`, `pi`, and `Pi` process identiti
 Herdr uses native registered-agent state and needs no process-name branch.
 Zellij has no verified recovery-grade agent process probe, while Orca and cmux do not support secondmate spawns, so those three retain their existing generic ordinary-launch semantics without a new liveness matcher.
 
+The adapter's worker-pid resolver `fm_backend_tmux_agent_pid` reads `#{pane_pid}` for the pane's shell and then field 8 (tpgid) of that shell's `/proc` stat, which is the tty's current foreground process group leader and therefore the agent regardless of nesting depth.
+It runs only after the recovery-grade agent_state check above returns `alive`, because that check's session inventory is what stops tmux from silently falling back to the active window for an absent target and handing back another task's pid.
+It exists to supply the worker pid that the watcher's CPU-progress check samples before deferring a wedge escalation; `fm_backend_agent_pid`'s comment in `bin/fm-backend.sh` owns that contract, including what a doubtful read means there.
+As of 2026-08-15 this resolver has no recorded tmux-specific live measurement and no direct test coverage.
+The only live evidence on the consumer path is the Herdr run owned by [supervision.md](supervision.md#worker-cpu-progress), and the tmux evidence above was taken on macOS, which has no `/proc` for this resolver to read, so none of it transfers.
+Direct coverage is landing as a follow-up commit on this branch, together with the busy-path deferral restriction.
+
 The structural multi-row composer reader, Kimi pointer-delivery path, and OpenCode 1.18.4 busy-queue behavior are pinned by:
 
 ```sh
