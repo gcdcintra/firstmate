@@ -109,7 +109,9 @@ record_pi_busy() {  # <state-dir> <id>
     --source pi-ext --event agent-start
 }
 
-reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+# Delegated rather than inlined: this had the same unbounded `kill` then `wait`
+# shape that wedged PR 10, and wake-helpers.sh owns the bounded contract.
+reap() { fm_wake_terminate "$1"; }
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
@@ -1976,6 +1978,72 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
 }
 
+# Every test above drives a real watcher and then stops it through wake-helpers.
+# That stop must be bounded, because the cost of losing the bound is a whole CI
+# lane rather than one red test.
+#
+# PR 10 lost it. Its job log caught bin/fm-watch.sh emitting "trap: line 2:
+# unexpected EOF while looking for matching ')'", so the watcher's
+# `trap 'exit 1' HUP INT TERM` body never parsed and it outlived the single
+# SIGTERM wait_for_exit sends. The helper then sat in an unbounded `wait`, this
+# suite stopped after 28 of its 48 assertions still holding the runner's
+# `... | tee` pipe, and the job was cancelled 15 minutes later with an orphaned
+# tee - burning a shared CI slot and reporting no verdict at all.
+#
+# The check has to run in a shell that OWNS the child: `wait` on a non-child
+# returns immediately and would assert nothing. So it runs in a fixture whose
+# own shell spawns the survivor, and the outer `timeout` IS the assertion - if
+# the bound is ever lost again this fails on rc=124 instead of wedging the lane
+# the same way. A child that ignores SIGTERM stands in for the unparsed trap:
+# same observable outcome, delivered and not fatal, with no dependence on
+# reproducing the parse fault itself.
+test_wait_for_exit_cannot_block_on_a_child_that_survives_sigterm() {
+  local dir fixture out rc child reported
+  if ! command -v timeout >/dev/null 2>&1; then
+    pass "SKIP (timeout unavailable): wait_for_exit bound against a SIGTERM-proof child"
+    return
+  fi
+  dir=$(make_case wait-for-exit-bound)
+  fixture="$dir/fixture.sh"
+  out="$dir/fixture.out"
+  cat > "$fixture" <<SH
+#!/usr/bin/env bash
+set -u
+# shellcheck source=/dev/null
+. "$ROOT/tests/wake-helpers.sh"
+bash -c 'trap "" TERM; while :; do sleep 0.2; done' &
+child=\$!
+printf '%s\n' "\$child" > "$dir/child.pid"
+wait_for_exit "\$child" 4
+printf 'wait_for_exit returned %s\n' "\$?" > "$dir/rc.txt"
+kill -0 "\$child" 2>/dev/null && printf 'child still alive\n' >> "$dir/rc.txt"
+SH
+  chmod +x "$fixture"
+
+  timeout 60 bash "$fixture" > "$out" 2>&1
+  rc=$?
+  child=$(cat "$dir/child.pid" 2>/dev/null || true)
+  # Reap by exact pid before asserting, so a failure here can never leak the
+  # survivor into the shared process table.
+  if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+    kill -9 "$child" 2>/dev/null || true
+    [ "$rc" -eq 124 ] || fail "wait_for_exit returned but left a SIGTERM-proof child running"
+  fi
+  [ "$rc" -ne 124 ] \
+    || fail "wait_for_exit blocked on a child that ignored SIGTERM; a suite doing this wedges its whole CI lane with no verdict"
+  reported=$(cat "$dir/rc.txt" 2>/dev/null || true)
+  [ -n "$reported" ] || fail "the fixture never recorded a wait_for_exit result: $(cat "$out")"
+  case "$reported" in
+    *"child still alive"*)
+      fail "wait_for_exit returned without escalating past SIGTERM; the child survived" ;;
+  esac
+  case "$reported" in
+    "wait_for_exit returned 124"*) : ;;
+    *) fail "wait_for_exit did not report its own timeout code: $reported" ;;
+  esac
+  pass "wait_for_exit escalates past a SIGTERM-proof child instead of blocking its suite forever"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -2024,3 +2092,4 @@ test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
+test_wait_for_exit_cannot_block_on_a_child_that_survives_sigterm

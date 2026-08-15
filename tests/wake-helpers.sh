@@ -268,6 +268,40 @@ SH
   printf '%s\n' "$dir"
 }
 
+# Terminate a child THIS shell owns and reap it, without ever blocking forever.
+#
+# The escalation below is load-bearing, not defensive tidiness. A watcher whose
+# TERM handler never runs survives the single SIGTERM these helpers send, and
+# that is not hypothetical: PR 10's job log caught bin/fm-watch.sh emitting
+# "trap: line 2: unexpected EOF while looking for matching ')'", so its
+# `trap 'exit 1' HUP INT TERM` body failed to parse and the process simply
+# carried on. A bare `wait` on such a pid never returns.
+#
+# The cost of that is a whole CI lane, not one red test. bin/fm-test-run.sh
+# streams every suite as `bash "$script" 2>&1 | tee "$out"`, so a suite blocked
+# here stops mid-run still holding that pipe, and the job burns its entire
+# timeout-minutes cap producing NO verdict at all. PR 10 died exactly there,
+# after 28 of fm-watch-triage's 48 assertions, and was cancelled 15 minutes
+# later with an orphaned tee still open.
+#
+# SIGTERM is therefore escalated to SIGKILL after a bounded grace, so `wait`
+# only ever runs against a pid that is already dying. SIGKILL cannot be trapped,
+# which is what makes the bound hold whatever the child's own handlers do, or
+# fail to do. Kills are by exact pid, never by pattern: the process table is
+# shared with every other worker on the machine.
+fm_wake_terminate() {
+  local pid=$1 grace=${2:-50} i=0
+  kill "$pid" 2>/dev/null || true
+  while [ "$i" -lt "$grace" ] && is_live_non_zombie "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if is_live_non_zombie "$pid"; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
 wait_for_exit() {
   local pid=$1 limit=${2:-50} i=0
   while [ "$i" -lt "$limit" ]; do
@@ -278,8 +312,7 @@ wait_for_exit() {
     sleep 0.1
     i=$((i + 1))
   done
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  fm_wake_terminate "$pid"
   return 124
 }
 
