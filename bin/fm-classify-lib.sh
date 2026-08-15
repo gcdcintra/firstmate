@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Shared wake classifier: the common source of truth for captain-relevant status
-# tests, declared-external-wait vocabulary, and the working/paused absorb
-# classification that makes no-verb signal and stale-pane wakes safe to absorb.
+# tests, declared-external-wait vocabulary, the possible-wedge escalation reason
+# segment, and the working/paused absorb classification that makes no-verb signal
+# and stale-pane wakes safe to absorb.
 # Sourced by BOTH the always-on watcher
 # (bin/fm-watch.sh) and the away-mode daemon (bin/fm-supervise-daemon.sh) so the
 # overlapping triage policy lives in one place instead of two copies that can
@@ -65,6 +66,21 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # one owner.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
+
+# The possible-wedge escalation reason segment: a CONTRACT between the watcher
+# and the away-mode daemon, not a local label. bin/fm-watch.sh's
+# wedge_timer_check composes every wedge escalation reason around this segment,
+# and bin/fm-supervise-daemon.sh's handle_wake force-escalates any stale wake
+# whose detail contains it. In away mode the daemon runs the watcher as a child
+# and classifies each reason it prints, while the daemon's own housekeeping
+# drops a stale marker outright whenever the pane looks busy - so this match is
+# the only path that surfaces a worker wedged mid-turn behind a busy-looking
+# pane to an away captain. Both sides read this ONE definition rather than
+# hardcoding the literal, so a rewording on either side cannot silently sever
+# the contract. Deliberately not overridable: it is a wire format between two
+# components, not a per-home vocabulary. No non-wedge reason contains it.
+# shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
+FM_CLASSIFY_WEDGE_REASON_SEGMENT=', possible wedge, escalation '
 
 # The resolution verb and durable-backlog-transfer verb that CLOSE a keyed
 # status decision opened by needs-decision or blocked. See status_open_decisions

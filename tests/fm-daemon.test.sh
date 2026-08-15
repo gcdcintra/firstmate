@@ -150,7 +150,7 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     win="sess:fm-$task"
     pane="$dir/pane.txt"
     action_log="$dir/actions.log"
-    reason="stale: $win (idle 500s, possible wedge, escalation 3, demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)"
+    reason="stale: $win (no pane output for 500s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}3; unknown could not resolve the worker process for $win) (demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)"
     fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
     case "$case_name" in
       working) status_line='working: building' ;;
@@ -189,6 +189,55 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
       || fail "$case_name enriched wedge interrupted or killed the busy worker"
   done
   pass "enriched stale wedges bypass status absorption without disturbing busy workers"
+}
+
+# The away-mode wedge contract, producer to matcher: a worker wedged mid-turn
+# keeps rendering a busy footer and never completes a turn, so past
+# FM_BUSY_TURN_MAX_SECS the watcher's busy path emits its possible-wedge reason
+# even while state/.afk is set (the busy path is not afk-gated), and the daemon
+# must force-escalate that reason rather than absorb it as a transient stale -
+# a transient marker for a busy-looking pane is deleted by housekeeping's
+# recheck, so absorption here means the away captain is never woken. The reason
+# is produced by a REAL fm-watch.sh run, not a canned string, so this goes red
+# if the watcher's emitted format and the daemon's matcher ever drift apart.
+test_away_wedged_worker_escalation_reaches_daemon() {
+  local dir state fakebin out win task capture sig gen pid wake_line
+  dir=$(make_case away-wedge-contract)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture="$dir/pane.txt"
+  task=away-wedge; win="test:fm-$task"
+  date '+%s' > "$state/.afk"
+  fm_write_meta "$state/$task.meta" "window=$win" "kind=ship" "harness=pi"
+  printf 'working: driving the app end to end\n' > "$state/$task.status"
+  if [ "$(uname)" = Darwin ]; then sig=$(stat -f '%z:%Fm' "$state/$task.status"); else sig=$(stat -c '%s:%Y' "$state/$task.status"); fi
+  printf '%s' "$sig" > "$state/.seen-${task}_status"
+  printf 'Working... (esc to interrupt)\n' > "$capture"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$(printf '%s' "$win" | tr ':/.' '___')"
+  touch -t 200001010000 "$state/$task.meta"
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" "$task")
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" "$task" busy --gen "$gen" \
+    --source pi-ext --event agent-start
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$capture" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    "$ROOT/bin/fm-watch.sh" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || fail "the watcher did not wedge-escalate the busy frozen pane: $(cat "$out")"
+  wake_line=$(grep '^stale: ' "$out" | head -1)
+  [ -n "$wake_line" ] || fail "the watcher printed no stale wake reason: $(cat "$out")"
+  case "$wake_line" in
+    *"$FM_CLASSIFY_WEDGE_REASON_SEGMENT"*) ;;
+    *) fail "the watcher's wedge escalation lost the shared wedge reason segment: $wake_line" ;;
+  esac
+  (
+    LOG="$dir/daemon.log" FM_STATE_OVERRIDE="$state" handle_wake "$wake_line" "$state"
+  )
+  grep -F "${wake_line#stale: }" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "the daemon absorbed a watcher wedge escalation instead of delivering it: $(cat "$state/.subsuper-escalations" 2>/dev/null)"
+  [ ! -e "$state/.subsuper-stale-$task" ] \
+    || fail "the daemon recorded a transient stale marker for a wedge escalation instead of delivering it"
+  pass "a wedged worker's real watcher escalation force-escalates through the away-mode daemon"
 }
 
 test_stale_terminal_escalates() {
@@ -1836,6 +1885,7 @@ test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
 test_stale_diagnostic_wedge_survives_busy_housekeeping
+test_away_wedged_worker_escalation_reaches_daemon
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker

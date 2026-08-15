@@ -65,18 +65,22 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
 The hints came from that run's `fm-test-timing-portable-serial` artifact on 2026-08-02, where the lane ran 69 scripts in 1143762 ms of serial work.
+Two are exceptions, measured on 2026-08-15 on a host calibrated against that artifact and dominated by real-time settles that cost the same anywhere: `tests/fm-cpu-progress.test.sh` at 79501 ms and `tests/fm-watch-triage.test.sh` at 234787 ms.
 A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
+The table below is the partition of the lane as it stands today - 76 scripts, five of them unhinted and carrying the 20000 ms default - not of the 69 the 2026-08-02 artifact measured.
+Recompute it whenever a hint changes, or it contradicts the weights it claims to summarize.
+
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of4` | 15 | 285945 ms (~285.9 s) |
-| `portable-serial-2of4` | 18 | 285944 ms (~285.9 s) |
-| `portable-serial-3of4` | 17 | 285929 ms (~285.9 s) |
-| `portable-serial-4of4` | 19 | 285944 ms (~285.9 s) |
-| imbalance | | 16 ms |
+| `portable-serial-1of4` | 18 | 362505 ms (~362.5 s) |
+| `portable-serial-2of4` | 17 | 362506 ms (~362.5 s) |
+| `portable-serial-3of4` | 20 | 362514 ms (~362.5 s) |
+| `portable-serial-4of4` | 21 | 362517 ms (~362.5 s) |
+| imbalance | | 12 ms |
 
-The single longest script, `tests/fm-pr-check-security.test.sh` at 199573 ms, is the floor for any shard count.
+The single longest script, `tests/fm-watch-triage.test.sh` at 234787 ms, is the floor for any shard count.
 
 Refresh the hints by downloading the per-shard timing artifacts from a green CI run, replacing the `portable_serial_weight_hints` table in `bin/fm-test-run.sh` with the measured `path`/`duration_ms` pairs, and updating the table above:
 

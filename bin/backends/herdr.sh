@@ -1698,6 +1698,28 @@ fm_backend_herdr_agent_state() {  # <target>
   esac
 }
 
+# fm_backend_herdr_agent_pid: the pid of the harness agent running in <target>,
+# for the CPU-progress read in bin/fm-cpu-progress-lib.sh. Herdr reports the
+# pane's foreground process group directly, so this takes
+# `foreground_process_group_id` - the group LEADER, which is the agent - rather
+# than indexing into `foreground_processes`, whose order is not a contract and
+# which also holds the agent's children during a tool call. Fails on any doubt;
+# the caller reads a failure as `unknown`, which escalates.
+fm_backend_herdr_agent_pid() {  # <target>
+  local target=$1 info pgid
+  fm_backend_herdr_parse_target "$target" || return 1
+  info=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane process-info \
+    --pane "$FM_BACKEND_HERDR_PANE" 2>/dev/null) || return 1
+  printf '%s' "$info" | jq -e --arg pane "$FM_BACKEND_HERDR_PANE" '
+    .result.type == "pane_process_info"
+    and .result.process_info.pane_id == $pane
+  ' >/dev/null 2>&1 || return 1
+  pgid=$(printf '%s' "$info" | jq -er \
+    '.result.process_info.foreground_process_group_id | select(type == "number" and . > 1) | floor' 2>/dev/null) || return 1
+  case "$pgid" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$pgid"
+}
+
 # Backward-compatible three-state view for callers that only need a yes/no
 # agent verdict. The detailed state contract is owned by fm_backend_agent_state.
 fm_backend_herdr_agent_alive() {  # <target>

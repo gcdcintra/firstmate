@@ -94,6 +94,74 @@ tests/fm-busy-adapter-wiring.test.sh
 tests/fm-crew-state.test.sh
 ```
 
+## Worker CPU progress
+
+[`bin/fm-cpu-progress-lib.sh`](../../bin/fm-cpu-progress-lib.sh) reads utime+stime+cutime+cstime from `/proc/<pid>/stat`, and the watcher consults it before every wedge escalation.
+These measurements set its shipped floor of `FM_CPU_PROGRESS_MIN_TICKS_PER_MIN=120`, i.e. 2.0 ticks/s.
+Fields are USER_HZ units, fixed at 100 on Linux (`getconf CLK_TCK` reported `100` on the sampled host).
+
+Sampled 2026-08-12 on Linux 6.8.0-137 over a 45-second window, across every live Claude Code worker on one host also running builds and a UI suite, with each worker's declared turn state read from its own `state/<id>.busy-state` record:
+
+```sh
+read_ticks() { awk '{n=index($0,")"); r=substr($0,n+2); split(r,f," "); print f[12]+f[13]+f[14]+f[15]}' "/proc/$1/stat"; }
+# sample, sleep 45, re-sample, print the delta per worker
+```
+
+| Declared turn state | Observed ticks/s over 45s |
+| --- | --- |
+| busy (inside a turn) | 4.04, 4.67, 13.16 |
+| idle (waiting at its prompt) | 0.58, 0.91, 2.24, 3.33, 3.82 |
+
+Two facts follow, and both are load-bearing.
+
+An idle agent is NOT quiet: a Claude Code worker sitting at its prompt animates its footer and burns 0.58-3.82 ticks/s, overlapping the busy range.
+CPU progress is therefore not a general "is this worker working" signal.
+The watcher consults it on every wedge path and reports the reading in each escalation, but only the busy-turn path may DEFER on it: that pane holds an exact busy verdict with no completed turn, the one state in which a worker cannot speak for itself.
+An idle-at-prompt worker does reach the wedge timer, through the provably-working stale path, which is exactly why deferral is restricted this way.
+The three non-busy wedge paths hold no exact busy verdict, so their measured process may be an agent at its prompt whose idle animation overlaps a working reading; they escalate on their ordinary cadence whatever the CPU says, which is what makes that overlap harmless.
+The cost of gating on that verdict is a residual this predicate cannot see: the harnesses in the [semantic busy state](#semantic-busy-state) table that never produce one - Codex (`unknown codex-unverified`) and standalone Kimi (`unknown kimi-unverified`) - are never deferred even inside one long tool-driven turn, so the original false-alarm loop is unchanged for them, and closing it belongs to the busy-state contract in [`bin/fm-busy-lib.sh`](../../bin/fm-busy-lib.sh) rather than to this measure.
+A finished worker that went quiet without a status line is surfaced immediately by the separate non-terminal stale path, which this change does not touch.
+
+The floor separates working from WEDGED, not working from idle.
+The wedge cases sit an order of magnitude below every reading above: the 2026-08-10 stuck-TCP-send-queue wedge logged 10 ticks over 45s (0.22 ticks/s) with 539136 bytes pinned in `Send-Q`, and a hung process logs 0.
+At 2.0 ticks/s the floor sits ~9x above that wedge and ~1.5x below the slowest productive turn observed (3.1 ticks/s in an earlier 40s sample on the same host).
+A long tool-driven turn is the case being rescued, and the two independently sampled reproductions of it - one worker 100+ minutes into a single verification turn, one 5 hours into a single implementation turn - read 5.7 and 5.6 ticks/s.
+
+End-to-end on 2026-08-12, with a real `bin/fm-watch.sh` in a throwaway `FM_HOME`, pointed at live Herdr panes and resolving each worker pid through the real `herdr pane process-info` path.
+Both panes were set up identically - a busy record, a spawn record aged past `FM_BUSY_TURN_MAX_SECS`, and a wedge timer backdated 500s past `FM_STALE_ESCALATE_SECS` - so the CPU reading was the only difference between them.
+
+A worker several hours inside ONE agent turn was deferred, not escalated, and its wake queue stayed empty:
+
+```
+absorbed busy (no completed turn) timer reset: default:w7:p15
+deferred busy (no completed turn) wedge escalation, worker CPU progressing (500s without pane output):
+  default:w7:p15 - process 106286 used 326 CPU ticks in 46s (floor 92)
+```
+
+A pane whose agent had exited, leaving a bash prompt as its foreground process - a real near-flat counter of the same shape a hung or socket-blocked agent presents - still escalated, carrying its reading:
+
+```
+measured: class=flat delta=0 window=46
+stale: default:w7:pR (no pane output for 501s, possible wedge, escalation 1;
+  process 1398 used 0 CPU ticks in 46s (floor 92))
+```
+
+Both transcripts are verbatim from that run, including two pane-output phrases since corrected.
+Both panes were on the busy-turn path, where the timer counts seconds since the turn passed its age bound and pane output never resets it, so the deferral line's `<n>s without pane output` and the escalation reason's `no pane output for <n>s` both claimed more than the code had measured; that path now reads `no completed turn for <n>s` in each.
+The three non-busy paths keep the original wording, where it is accurate.
+
+Deterministic entry points:
+
+```sh
+tests/fm-cpu-progress.test.sh
+tests/fm-watch-triage.test.sh
+tests/fm-daemon.test.sh
+```
+
+`tests/fm-cpu-progress.test.sh` drives real processes rather than canned `/proc` fixtures, since the guarantee is about the counter the kernel maintains.
+A live worker is not a usable stand-in for a wedged one: a quiet agent can resume mid-sample and then correctly reads as progressing, which is why the flat-counter cases use processes the test controls or a pane whose agent has actually exited.
+The escalation reason carrying that reading is also a contract with the away-mode daemon's force-escalate matcher, so `tests/fm-daemon.test.sh` pins both ends together: it feeds a real `bin/fm-watch.sh` wedge escalation through the daemon's own wake handling and fails if either side's wording drifts off the shared segment.
+
 ## Turn-end guard
 
 The direct and passive mechanisms were validated across all five harnesses on 2026-07-08 through 2026-07-12, with Claude's replacement Stop-owned path revalidated on 2026-07-24.

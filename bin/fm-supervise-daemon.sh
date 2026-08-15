@@ -41,10 +41,17 @@
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
 #   - Bounded wedge latency: a stale pane without a declared external wait is
-#     escalated only after it has been idle for STALE_ESCALATE_SECS
+#     escalated only after it has gone STALE_ESCALATE_SECS without pane output
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
-#     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
-#     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
+#     within STALE_ESCALATE_SECS + a tick, never lost. The watcher reports the
+#     worker process's own CPU reading on EVERY wedge escalation, but only a
+#     pane still inside a turn - busy with no completed turn - may have that
+#     escalation DEFERRED, by the bounded budget bin/fm-watch.sh owns
+#     (FM_CPU_PROGRESS_MAX_DEFER_SECS): a longer delay on that one path, still
+#     not a loss. A stale pane holds no exact busy verdict, so it escalates on
+#     the cadence above whatever its CPU reads.
+#     A declared pause instead gets its own longer PAUSE_RESURFACE_SECS
+#     recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
@@ -86,8 +93,9 @@
 #                                   disables. Use sparingly: it overrides the
 #                                   captain-relevant escalation for matching
 #                                   kinds.
-#          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
-#                                   as a possible wedge (default 240)
+#          FM_STALE_ESCALATE_SECS   seconds without pane output before a stale
+#                                   pane escalates as a possible wedge
+#                                   (default 240)
 #          FM_PAUSE_RESURFACE_SECS  idle seconds before a declared external wait
 #                                   re-surfaces as a recheck (default 3600)
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
@@ -469,9 +477,14 @@ clear_pause_tracking() {  # <window> <state>
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   watcher_key=$(_stale_key "$win")
+  # The watcher's wedge markers are cleared as ONE set here too, matching
+  # fm-watch.sh's clear_wedge_tracking: leaving the worker-CPU anchor or the
+  # pane's spent deferral budget behind would make the watcher treat the next
+  # long turn on this pane as one that had already used its deferral up.
   rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
     "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
-    "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
+    "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key" \
+    "$state/.cpu-$watcher_key" "$state/.cpu-defer-since-$watcher_key"
 }
 
 reconcile_pause_tracking() {  # <window> <state> <last-status-line>
@@ -1212,8 +1225,14 @@ handle_wake() {  # <reason> <state>
     stale:*)  kind=stale; arg="${reason#stale: }"; stale_detail="${arg#"$arg"}"
               case "$arg" in *" ("*) stale_detail="${arg#*" ("}"; arg="${arg%% \(*}" ;; esac
               decision=$(classify_stale "$arg" "$state")
+              # A watcher wedge escalation carries the shared
+              # FM_CLASSIFY_WEDGE_REASON_SEGMENT (fm-classify-lib.sh owns the
+              # one definition for producer and matcher): force-escalate it
+              # past status-log absorption, because a transient stale marker
+              # for a pane that still looks busy is deleted by housekeeping's
+              # recheck and a worker wedged mid-turn would never surface.
               case "$stale_detail" in
-                idle\ *s,\ possible\ wedge,\ escalation\ *)
+                *"$FM_CLASSIFY_WEDGE_REASON_SEGMENT"*)
                   decision="escalate|${reason#stale: }" ;;
               esac ;;
     check:*)  decision=$(classify_check "$reason") ;;
