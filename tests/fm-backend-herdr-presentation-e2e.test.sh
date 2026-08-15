@@ -1064,12 +1064,24 @@ teardown_task aflat "$SECOND_HOME_A" > "$TMP_ROOT/aflat-teardown.out" 2> "$TMP_R
   || fail "flat cross-home contention fixture teardown failed"
 pass "real Herdr lab: session lock contention from a secondmate home falls back flat with no journal"
 
+# The sections below stop and re-provision the isolated session, which kills
+# every task pane. A pooled treehouse worktree is held only by the processes
+# inside it, so every worktree spawned above becomes an available pool slot the
+# moment its pane dies, while its task's metadata still records that path. Out of
+# one shared pool, a spawn from here on is handed a worktree the multi-home
+# fixtures above still name, and their teardown then refuses to act on it - which
+# is the ownership guard working as designed (bin/fm-worktree-owner-lib.sh), not
+# something for this suite to assert around. Every spawn from here on therefore
+# takes its worktree from its own project's pool, so the two can never collide.
+RESTART_PROJECT_DIR="$TMP_ROOT/project-restart"
+make_project "$RESTART_PROJECT_DIR"
+
 # Same-identity recovery replaces only one exact agent-free husk in its
 # original projected workspace.
 # Exercise both the leading fm- identity style seen in Hi Bit work and the
 # project-name identity style used by Wheelhouse work.
 for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
-  spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-first.out" 2> "$TMP_ROOT/$RESTART_ID-first.err" \
+  spawn_task "$RESTART_ID" "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-first.out" 2> "$TMP_ROOT/$RESTART_ID-first.err" \
     || fail "$RESTART_ID fixture's projected spawn failed: $(cat "$TMP_ROOT/$RESTART_ID-first.err")"
   RESTART_META="$HOME_DIR/state/$RESTART_ID.meta"
   OLD_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
@@ -1095,7 +1107,7 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
     fail "$RESTART_ID restart fixture unexpectedly retained a registered agent"
   fi
   RECLAIM_FOCUS=$(focus_snapshot)
-  spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-reclaim.out" 2> "$TMP_ROOT/$RESTART_ID-reclaim.err" \
+  spawn_task "$RESTART_ID" "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-reclaim.out" 2> "$TMP_ROOT/$RESTART_ID-reclaim.err" \
     || fail "$RESTART_ID same-identity reclaim failed: $(cat "$TMP_ROOT/$RESTART_ID-reclaim.err")"
   NEW_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
   NEW_RESTART_WSID=$(grep '^herdr_workspace_id=' "$RESTART_META" | cut -d= -f2-)
@@ -1120,7 +1132,7 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
       || fail "could not reprovision the isolated session for idempotent reclaim"
     PRIOR_RESTART_WT=$NEW_RESTART_WT
     PRIOR_RESTART_PANE=$NEW_RESTART_PANE
-    spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-idempotent.out" 2> "$TMP_ROOT/$RESTART_ID-idempotent.err" \
+    spawn_task "$RESTART_ID" "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-idempotent.out" 2> "$TMP_ROOT/$RESTART_ID-idempotent.err" \
       || fail "$RESTART_ID repeated reclaim failed: $(cat "$TMP_ROOT/$RESTART_ID-idempotent.err")"
     NEW_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
     NEW_RESTART_WSID=$(grep '^herdr_workspace_id=' "$RESTART_META" | cut -d= -f2-)
@@ -1145,7 +1157,7 @@ pass "real Herdr lab: Hi Bit and Wheelhouse-style same-identity restarts reclaim
 CROSS_RESTART_ID=wheel-child-resume
 mkdir -p "$SECOND_HOME_A/data/$CROSS_RESTART_ID"
 printf 'Cross-home restart fixture.\n' > "$SECOND_HOME_A/data/$CROSS_RESTART_ID/brief.md"
-spawn_task "$CROSS_RESTART_ID" "$SECOND_HOME_A" "$PROJECT_DIR" > "$TMP_ROOT/cross-restart-first.out" 2> "$TMP_ROOT/cross-restart-first.err" \
+spawn_task "$CROSS_RESTART_ID" "$SECOND_HOME_A" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/cross-restart-first.out" 2> "$TMP_ROOT/cross-restart-first.err" \
   || fail "cross-home restart fixture failed: $(cat "$TMP_ROOT/cross-restart-first.err")"
 CROSS_RESTART_META="$SECOND_HOME_A/state/$CROSS_RESTART_ID.meta"
 CROSS_OLD_WT=$(remember_meta_worktree "$CROSS_RESTART_META")
@@ -1161,7 +1173,7 @@ PATH="$HERDR_ORIGINAL_PATH" "$HERDR_LAB_HELPER" stop "$HERDR_LAB_SESSION" >/dev/
   || fail "could not stop the isolated session for cross-home restart"
 PATH="$HERDR_ORIGINAL_PATH" "$HERDR_LAB_HELPER" provision "$HERDR_LAB_SESSION" \
   || fail "could not reprovision the isolated session for cross-home restart"
-spawn_task "$CROSS_RESTART_ID" "$SECOND_HOME_A" "$PROJECT_DIR" > "$TMP_ROOT/cross-restart-resume.out" 2> "$TMP_ROOT/cross-restart-resume.err" \
+spawn_task "$CROSS_RESTART_ID" "$SECOND_HOME_A" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/cross-restart-resume.out" 2> "$TMP_ROOT/cross-restart-resume.err" \
   || fail "cross-home same-identity reclaim failed: $(cat "$TMP_ROOT/cross-restart-resume.err")"
 CROSS_NEW_WT=$(remember_meta_worktree "$CROSS_RESTART_META")
 CROSS_NEW_WSID=$(grep '^herdr_workspace_id=' "$CROSS_RESTART_META" | cut -d= -f2-)
@@ -1183,9 +1195,9 @@ BRAVO_WAVE_ID=resume-wave-bravo
 mkdir -p "$HOME_DIR/data/$PRIMARY_WAVE_ID" "$SECOND_HOME_B/data/$BRAVO_WAVE_ID"
 printf 'Concurrent primary recovery fixture.\n' > "$HOME_DIR/data/$PRIMARY_WAVE_ID/brief.md"
 printf 'Concurrent secondmate recovery fixture.\n' > "$SECOND_HOME_B/data/$BRAVO_WAVE_ID/brief.md"
-spawn_task "$PRIMARY_WAVE_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/primary-wave-first.out" 2> "$TMP_ROOT/primary-wave-first.err" \
+spawn_task "$PRIMARY_WAVE_ID" "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/primary-wave-first.out" 2> "$TMP_ROOT/primary-wave-first.err" \
   || fail "primary recovery-wave fixture failed: $(cat "$TMP_ROOT/primary-wave-first.err")"
-spawn_task "$BRAVO_WAVE_ID" "$SECOND_HOME_B" "$PROJECT_DIR" > "$TMP_ROOT/bravo-wave-first.out" 2> "$TMP_ROOT/bravo-wave-first.err" \
+spawn_task "$BRAVO_WAVE_ID" "$SECOND_HOME_B" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/bravo-wave-first.out" 2> "$TMP_ROOT/bravo-wave-first.err" \
   || fail "secondmate recovery-wave fixture failed: $(cat "$TMP_ROOT/bravo-wave-first.err")"
 PRIMARY_WAVE_META="$HOME_DIR/state/$PRIMARY_WAVE_ID.meta"
 BRAVO_WAVE_META="$SECOND_HOME_B/state/$BRAVO_WAVE_ID.meta"
@@ -1200,9 +1212,9 @@ PATH="$HERDR_ORIGINAL_PATH" "$HERDR_LAB_HELPER" stop "$HERDR_LAB_SESSION" >/dev/
 PATH="$HERDR_ORIGINAL_PATH" "$HERDR_LAB_HELPER" provision "$HERDR_LAB_SESSION" \
   || fail "could not reprovision the isolated session for concurrent recovery"
 CONCURRENT_RECOVERY_FOCUS=$(focus_snapshot)
-spawn_task "$PRIMARY_WAVE_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/primary-wave-resume.out" 2> "$TMP_ROOT/primary-wave-resume.err" &
+spawn_task "$PRIMARY_WAVE_ID" "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/primary-wave-resume.out" 2> "$TMP_ROOT/primary-wave-resume.err" &
 PRIMARY_WAVE_PID=$!
-spawn_task "$BRAVO_WAVE_ID" "$SECOND_HOME_B" "$PROJECT_DIR" > "$TMP_ROOT/bravo-wave-resume.out" 2> "$TMP_ROOT/bravo-wave-resume.err" &
+spawn_task "$BRAVO_WAVE_ID" "$SECOND_HOME_B" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/bravo-wave-resume.out" 2> "$TMP_ROOT/bravo-wave-resume.err" &
 BRAVO_WAVE_PID=$!
 wait "$PRIMARY_WAVE_PID" || fail "concurrent primary recovery failed: $(cat "$TMP_ROOT/primary-wave-resume.err")"
 wait "$BRAVO_WAVE_PID" || fail "concurrent secondmate recovery failed: $(cat "$TMP_ROOT/bravo-wave-resume.err")"
@@ -1241,7 +1253,7 @@ FLAT_TAB_OUT=$(lab tab create --workspace "$(lab workspace list | jq -r '.result
 FLAT_TAB_ID=$(printf '%s' "$FLAT_TAB_OUT" | jq -r '.result.tab.tab_id // empty')
 mkdir -p "$HOME_DIR/data/post-legacy"
 printf 'Post-legacy primary child.\n' > "$HOME_DIR/data/post-legacy/brief.md"
-spawn_task post-legacy "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/post-legacy.out" 2> "$TMP_ROOT/post-legacy.err" \
+spawn_task post-legacy "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/post-legacy.out" 2> "$TMP_ROOT/post-legacy.err" \
   || fail "post-legacy projected spawn failed: $(cat "$TMP_ROOT/post-legacy.err")"
 remember_meta_worktree "$HOME_DIR/state/post-legacy.meta" >/dev/null
 [ "$(lab workspace get "$LEGACY_WSID" | jq -r '.result.workspace.label')" = "firstmate/legacy-seed · p:AbCdEfGhIjKlMnOpQrStUv" ] \
