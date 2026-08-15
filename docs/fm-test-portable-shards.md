@@ -69,13 +69,16 @@ Two are exceptions, measured on 2026-08-15 on a host calibrated against that art
 A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
+The table below is the partition of the lane as it stands today - 76 scripts, five of them unhinted and carrying the 20000 ms default - not of the 69 the 2026-08-02 artifact measured.
+Recompute it whenever a hint changes, or it contradicts the weights it claims to summarize.
+
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of4` | 15 | 285945 ms (~285.9 s) |
-| `portable-serial-2of4` | 18 | 285944 ms (~285.9 s) |
-| `portable-serial-3of4` | 17 | 285929 ms (~285.9 s) |
-| `portable-serial-4of4` | 19 | 285944 ms (~285.9 s) |
-| imbalance | | 16 ms |
+| `portable-serial-1of4` | 18 | 362505 ms (~362.5 s) |
+| `portable-serial-2of4` | 17 | 362506 ms (~362.5 s) |
+| `portable-serial-3of4` | 20 | 362514 ms (~362.5 s) |
+| `portable-serial-4of4` | 21 | 362517 ms (~362.5 s) |
+| imbalance | | 12 ms |
 
 The single longest script, `tests/fm-watch-triage.test.sh` at 234787 ms, is the floor for any shard count.
 

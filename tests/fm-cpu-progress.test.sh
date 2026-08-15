@@ -14,6 +14,17 @@
 # all - returns `unknown`, which escalates. Watcher-level consequences
 # (deferral, the per-pane deferral budget, and the evidence carried in the wake
 # reason) live in tests/fm-watch-triage.test.sh.
+#
+# THE FIXTURE BUDGET, which every case inherits and none may opt out of: AT MOST
+# ONE fixture process is alive at any moment. Cases run through run_case, which
+# reaps whatever the case spawned the instant it returns, so a new case gets the
+# guarantee by being listed in the driver rather than by remembering to clean up
+# after itself. That reap is the PRIMARY mechanism. The EXIT trap and the
+# fixtures' own LIFE_SECS lifetime are backstops for an INTERRUPTED run only -
+# a suite killed mid-case never reaches the driver - and must never be relied on
+# during a normal one. This matters because these fixtures pin a whole core and
+# the suite shares a machine with live workers: a leak here is not a slow test,
+# it is stolen CPU that outlives the case that took it.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -53,10 +64,10 @@ trap 'reap_kids; fm_test_cleanup' EXIT
 
 # Fixture processes set SPAWNED rather than printing their pid: a command
 # substitution around a background start would block until the child's inherited
-# stdout closed, which for a spin loop is never. They are also self-terminating,
-# so a killed or crashed test run can never leave a spin loop burning a core on
-# a machine shared with other workers - the EXIT trap is the first line of
-# defense, LIFE_SECS is the backstop.
+# stdout closed, which for a spin loop is never. run_case reaps them as each case
+# returns; LIFE_SECS only bounds a fixture whose run was killed before the driver
+# could get to it, so no crashed run can leave a spin loop burning a core on a
+# machine shared with other workers.
 LIFE_SECS=120
 SPAWNED=""
 
@@ -307,18 +318,22 @@ test_platform_without_proc_is_unknown() {
   pass "a platform with no tick-resolution counter returns unknown, keeping the pre-existing behavior"
 }
 
-test_first_sample_is_unknown
-test_busy_process_is_progressing
-test_hung_process_is_flat
-test_barely_moving_process_is_flat_at_the_default_floor
-test_measurable_but_below_floor_is_flat
-test_unresolvable_worker_is_unknown
-test_vanished_process_is_unknown
-test_immature_window_carries_the_previous_verdict
-test_overwide_window_is_unknown
-test_backwards_clock_step_re_anchors_instead_of_carrying_progressing
-test_recycled_pid_is_not_trusted
-test_platform_without_proc_is_unknown
+run_case() {  # <case>
+  "$1"
+  reap_kids
+}
 
-reap_kids
+run_case test_first_sample_is_unknown
+run_case test_busy_process_is_progressing
+run_case test_hung_process_is_flat
+run_case test_barely_moving_process_is_flat_at_the_default_floor
+run_case test_measurable_but_below_floor_is_flat
+run_case test_unresolvable_worker_is_unknown
+run_case test_vanished_process_is_unknown
+run_case test_immature_window_carries_the_previous_verdict
+run_case test_overwide_window_is_unknown
+run_case test_backwards_clock_step_re_anchors_instead_of_carrying_progressing
+run_case test_recycled_pid_is_not_trusted
+run_case test_platform_without_proc_is_unknown
+
 printf 'ok - fm-cpu-progress: all cases passed\n'

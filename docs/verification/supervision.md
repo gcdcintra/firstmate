@@ -146,6 +146,10 @@ stale: default:w7:pR (no pane output for 501s, possible wedge, escalation 1;
   process 1398 used 0 CPU ticks in 46s (floor 92))
 ```
 
+Both transcripts are verbatim from that run, including a phrase since corrected.
+Both panes were on the busy-turn path, where the timer counts seconds since the turn passed its age bound and pane output never resets it, so `no pane output for <n>s` claimed more than the code had measured; that path now reads `no completed turn for <n>s`.
+The three non-busy paths keep the original wording, where it is accurate.
+
 Deterministic entry points:
 
 ```sh

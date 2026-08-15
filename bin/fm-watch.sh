@@ -381,7 +381,7 @@ clear_wedge_tracking() {  # <window>
 # a future call site that forgets it escalates rather than silently deferring.
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <cpu-deferral-allowed>
   local win=$1 since_file=$2 label=$3 escalation_file=$4 cpu_deferral=${5:-0}
-  local since age n reason
+  local since age n reason age_phrase
   local cpu cpu_class cpu_detail defer_file defer_since deferred_for may_defer now
   local budget_spent budget_detail
   # Sample on EVERY poll of an aging pane, not only when an escalation is due:
@@ -412,6 +412,21 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         # with no /proc - all escalate exactly as they did before this check.
         # Deferral is bounded twice over: by this timer's own age, and by the
         # pane's deferral budget, which the escalation below cannot refund.
+        #
+        # What the age measures differs by path, so the wording does too. On the
+        # busy-turn path the timer starts when the turn passed BUSY_TURN_MAX_SECS
+        # and pane output never resets it - a pane whose footer ticks on every
+        # poll reaches here - so it counts seconds with no COMPLETED TURN. On the
+        # three non-busy paths it starts when a stale hash is absorbed and runs
+        # only while that hash is unchanged, so there it counts seconds with no
+        # PANE OUTPUT. Claiming the pane went silent when only the turn ran long
+        # would point triage at a frozen pane instead of the spin loop the rest
+        # of the same sentence asks for.
+        if [ "$cpu_deferral" -eq 1 ]; then
+          age_phrase="no completed turn for ${age}s"
+        else
+          age_phrase="no pane output for ${age}s"
+        fi
         deferred_for=0
         budget_spent=0
         budget_detail=
@@ -450,25 +465,27 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
           # would push unrelated triage history past the log's size cap.
           if [ -z "$defer_since" ]; then
             printf '%s\n' "$now" > "$defer_file"
-            triage_log "deferred $label wedge escalation, worker CPU progressing (${age}s without pane output): $win - $cpu_detail"
+            triage_log "deferred $label wedge escalation, worker CPU progressing ($age_phrase): $win - $cpu_detail"
           fi
           return 0
         fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
-        # The age counts seconds without PANE OUTPUT, which is not the same as
-        # seconds idle once CPU progress has deferred: say what was measured.
         # A supervisor must be able to tell "deferred because it is progressing"
         # from "was deferred, its budget is spent, escalating anyway", so the
-        # reason names which of the two it is and the reading behind it.
+        # reason names which of the two it is and the reading behind it. The
+        # shared segment is placed ONCE, here, so a future edit to it cannot land
+        # in three of four branches and sever the away-mode matcher for the one
+        # it missed.
+        reason="stale: $win (${age_phrase}${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail"
         if [ "$cpu_deferral" -eq 0 ]; then
-          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and this pane holds no exact busy verdict, so a CPU reading never defers here - the reading alone cannot tell a working agent from one stopped at its prompt)"
+          reason="$reason, and this pane holds no exact busy verdict, so a CPU reading never defers here - the reading alone cannot tell a working agent from one stopped at its prompt)"
         elif [ "$cpu_class" = progressing ] && [ "$budget_spent" -eq 1 ]; then
-          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, but this pane's ${CPU_PROGRESS_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - $budget_detail - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent)"
+          reason="$reason, but this pane's ${CPU_PROGRESS_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - $budget_detail - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent)"
         elif [ "$cpu_class" = progressing ]; then
-          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent)"
+          reason="$reason, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent)"
         else
-          reason="stale: $win (no pane output for ${age}s${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $cpu_detail)"
+          reason="$reason)"
         fi
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
           reason="$reason (demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
