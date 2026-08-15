@@ -670,6 +670,70 @@ assert len(doc["scripts"])==3
   pass "aggregate-json merges lane timing artifacts"
 }
 
+# A failing suite must cost one red result, never a whole lane. run_one_serial
+# streams each suite as `bash "$script" 2>&1 | tee "$out"`, so any child that
+# outlives the suite inherits the write end of that pipe through stderr; tee then
+# never sees EOF and the lane burns its entire timeout-minutes cap WITHOUT ever
+# reporting the assertion that failed. That is what shipped for a while: because
+# fm_test_tmproot echoes its root, suites take it as `TMP_ROOT=$(fm_test_tmproot
+# ...)`, and the registration plus the lazily-installed EXIT trap both died in
+# that command-substitution subshell - so a leaked watcher kept polling a state
+# dir nothing ever removed. tests/lib.sh now installs the trap at source time,
+# registers roots through a file that survives a subshell, and reaps this shell's
+# own background jobs by exact pid before deleting anything.
+#
+# The `timeout` below IS the assertion: if the construct returns, this test fails
+# on rc=124 instead of hanging the lane the same way.
+test_failing_suite_with_background_child_cannot_wedge_runner() {
+  local tmp fixture out rc case_root child
+  if ! command -v timeout >/dev/null 2>&1; then
+    pass "SKIP (timeout unavailable): failing suite with a live background child"
+    return
+  fi
+  # This scaffolding is made with mktemp directly, not fm_test_tmproot, so the
+  # test's own fixtures never depend on the behavior it is asserting. It is still
+  # registered rather than hand-removed, because an assertion below can exit this
+  # suite early and cleanup must not depend on reaching a tidy-up line.
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-wedge.XXXXXX")
+  fm_test_cleanup_register "$tmp"
+  fixture="$tmp/leaky.test.sh"
+  out="$tmp/out.txt"
+  cat >"$fixture" <<SH
+#!/usr/bin/env bash
+set -u
+# shellcheck source=/dev/null
+. "$ROOT/tests/lib.sh"
+case_root=\$(fm_test_tmproot fm-test-run-wedge-case)
+sleep 300 &
+printf '%s\n' "\$case_root" > "$tmp/root.txt"
+printf '%s\n' "\$!" > "$tmp/child.txt"
+fail "simulated assertion failure while a background child is live"
+SH
+  chmod +x "$fixture"
+
+  set +e
+  timeout 60 "$RUNNER" "$fixture" >"$out" 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 124 ] \
+    || { fail "the runner wedged: a background child outlived a failing suite and held its output pipe open"; }
+  [ "$rc" -ne 0 ] || { fail "the runner reported success for a failing suite"; }
+  grep -q 'not ok - simulated assertion failure' "$out" \
+    || { fail "the failing assertion never reached the runner's output: $(cat "$out")"; }
+
+  case_root=$(cat "$tmp/root.txt" 2>/dev/null || true)
+  [ -n "$case_root" ] || { fail "the fixture never recorded its temp root"; }
+  [ ! -d "$case_root" ] \
+    || { fail "a temp root taken through command substitution survived EXIT"; }
+
+  child=$(cat "$tmp/child.txt" 2>/dev/null || true)
+  if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+    kill "$child" 2>/dev/null || true
+    fail "a background child outlived the failing suite that spawned it"
+  fi
+  pass "a failing suite with a live background child is reported red promptly instead of wedging the runner"
+}
+
 test_list_all_exact_suite_coverage
 test_family_selection
 test_single_script_selection
@@ -687,3 +751,4 @@ test_portable_serial_shard_lane_refusals
 test_jobs_requires_proven_isolated
 test_jobs_parallel_scheduler_and_failure_propagation
 test_aggregate_json
+test_failing_suite_with_background_child_cannot_wedge_runner

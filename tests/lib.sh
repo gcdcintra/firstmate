@@ -53,26 +53,78 @@ pass() {
 # --- self-cleaning temp root ------------------------------------------------
 #
 # fm_test_tmproot <prefix> echoes a fresh temp dir and registers it for removal
-# on EXIT. The first call installs the cleanup trap. A test file that needs
-# extra teardown (e.g. killing a daemon) should define its own EXIT trap and
-# call fm_test_cleanup from inside it so registered dirs are still removed.
+# on EXIT. fm_test_cleanup_register <dir> registers a dir the caller made
+# itself. A test file that needs extra teardown (e.g. killing a daemon) should
+# define its own EXIT trap and call fm_test_cleanup from inside it so registered
+# dirs are still removed.
+#
+# Two properties below are load-bearing, and both were once absent:
+#
+#   1. The EXIT trap is installed HERE, at source time, never lazily on first
+#      registration. fm_test_tmproot echoes its root, so nearly every caller
+#      writes `TMP_ROOT=$(fm_test_tmproot ...)` - which runs the body in a
+#      command-substitution subshell, where an installed trap dies with the
+#      subshell. Registering lazily left the real shell with no trap at all.
+#   2. Registrations go to a FILE, not only to a shell array, for the same
+#      reason: a subshell's array append is invisible to its parent, while an
+#      append to the registry file is not.
+#
+# Losing cleanup does not merely leak a directory. bin/fm-test-run.sh runs every
+# suite as `bash "$script" 2>&1 | tee "$out"`, so each background child a suite
+# leaves behind inherits the write end of that pipe through stderr. A watcher
+# whose state dir still exists keeps polling forever, tee never sees EOF, and the
+# lane burns its whole timeout-minutes cap without ever reporting the assertion
+# that actually failed. fm_test_cleanup therefore reaps this shell's own
+# background jobs BEFORE removing directories, by exact pid from `jobs -p`: the
+# process table is shared with every other worker on the machine, so it must
+# never pattern-match a process name.
 
 FM_TEST_CLEANUP_DIRS=()
 
+# Deliberately NOT exported. A subshell inherits it, which is the whole point,
+# while a separate test process that sources this library gets its own registry
+# and so can never delete a parent's roots.
+FM_TEST_CLEANUP_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/fm-test-registry.XXXXXX")
+
+# fm_test_cleanup_register <dir>: register <dir> for removal on EXIT. Safe to
+# call from a command-substitution subshell.
+fm_test_cleanup_register() {
+  [ -n "${1:-}" ] || return 0
+  printf '%s\n' "$1" >> "$FM_TEST_CLEANUP_REGISTRY"
+}
+
 fm_test_cleanup() {
-  local d
+  local d p pids
+  # Exact-pid reap of this shell's own background jobs, so nothing this suite
+  # spawned outlives it holding the runner's stdout pipe open.
+  pids=$(jobs -p 2>/dev/null || true)
+  for p in $pids; do
+    kill "$p" 2>/dev/null || true
+  done
+  if [ -n "$pids" ]; then
+    sleep 0.2
+    for p in $pids; do
+      kill -9 "$p" 2>/dev/null || true
+      wait "$p" 2>/dev/null || true
+    done
+  fi
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
+  if [ -f "$FM_TEST_CLEANUP_REGISTRY" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] && rm -rf "$d"
+    done < "$FM_TEST_CLEANUP_REGISTRY"
+    rm -f "$FM_TEST_CLEANUP_REGISTRY"
+  fi
 }
+
+trap fm_test_cleanup EXIT
 
 fm_test_tmproot() {
   local prefix=${1:-fm-test} root
   root=$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
-  if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
-    trap fm_test_cleanup EXIT
-  fi
-  FM_TEST_CLEANUP_DIRS+=("$root")
+  fm_test_cleanup_register "$root"
   printf '%s\n' "$root"
 }
 
