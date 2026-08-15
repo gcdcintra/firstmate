@@ -1590,7 +1590,7 @@ cpu_wedge_case() {  # <name> <window> -> echoes dir
 }
 
 test_long_productive_turn_is_not_escalated_as_a_wedge() {
-  local dir state fakebin out window key pid
+  local dir state fakebin out window key pid deferrals
   window="test:fm-cpu-busy"
   dir=$(cpu_wedge_case cpu-progress-productive "$window")
   state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
@@ -1627,8 +1627,87 @@ test_long_productive_turn_is_not_escalated_as_a_wedge() {
   [ ! -s "$out" ] || { cpu_reap_kids; reap "$pid"; fail "a productive long turn printed a wake reason: $(cat "$out")"; }
   [ ! -s "$state/.wake-queue" ] || { cpu_reap_kids; reap "$pid"; fail "a productive long turn queued a wake"; }
   reap "$pid"
+  # Deferral is recorded once per EPISODE, not once per poll. Phase B deferred
+  # across several polls; a pane deferring for the full budget is polled
+  # hundreds of times, and a line each would push unrelated triage history out
+  # at the log's size cap - the one thing that log exists to keep.
+  deferrals=$(grep -c 'wedge escalation, worker CPU progressing' "$state/.watch-triage.log" 2>/dev/null || true)
+  case "$deferrals" in ''|*[!0-9]*) deferrals=0 ;; esac
+  [ "$deferrals" -eq 1 ] \
+    || { cpu_reap_kids; fail "a pane deferring across several polls logged $deferrals deferral lines instead of one for the episode: $(cat "$state/.watch-triage.log" 2>/dev/null)"; }
+  [ -s "$state/.cpu-defer-since-$key" ] \
+    || { cpu_reap_kids; fail "the deferral episode recorded no start epoch to bound the pane's budget with"; }
   cpu_reap_kids
-  pass "a worker inside a long productive turn is not escalated as a possible wedge while its CPU counter keeps moving"
+  pass "a worker inside a long productive turn is not escalated as a possible wedge while its CPU counter keeps moving, and its deferral is logged once per episode"
+}
+
+# Past its deferral budget, a wedge that KEEPS burning CPU must return to the
+# ordinary escalation cadence. The escalation resets the wedge timer, so a
+# budget measured only from that timer would re-open a full deferral window
+# after every escalation: a spinning wedge would then surface once per budget
+# (hours) rather than every FM_STALE_ESCALATE_SECS, and the
+# FM_WEDGE_DEMAND_INSPECT_COUNT consecutive escalations that force a deep look
+# would take that many hours to reach. The per-pane budget marker is what
+# survives the reset. The cap here is left far above the wedge timer's age for
+# every round, so nothing but that spent budget can end the deferral.
+test_spent_deferral_budget_escalates_on_the_normal_cadence() {
+  local dir state fakebin out window key pid n
+  window="test:fm-cpu-spinning"
+  dir=$(cpu_wedge_case cpu-progress-spent-budget "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "the spent-budget fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the spinning worker as progressing: $(cat "$state/.cpu-$key")"; }
+
+  # This pane opened its deferral episode a full budget ago and is still
+  # burning CPU - the spin-loop shape the predicate cannot tell from work.
+  echo $(( $(date +%s) - 3700 )) > "$state/.cpu-defer-since-$key"
+  n=1
+  while [ "$n" -le 3 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+      FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+      FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 100 \
+      || { cpu_reap_kids; fail "a spinning wedge past its deferral budget was deferred again in round $n instead of escalating: $(cat "$out")"; }
+    grep -F "escalation $n" "$out" >/dev/null \
+      || { cpu_reap_kids; fail "spent-budget round $n did not escalate on the normal cadence: $(cat "$out")"; }
+    # The supervisor has to be able to tell "deferred because it is progressing"
+    # from "was deferred, budget spent, escalating anyway", with the reading.
+    grep -F "deferral budget is spent" "$out" >/dev/null \
+      || { cpu_reap_kids; fail "spent-budget round $n did not say the deferral budget was spent: $(cat "$out")"; }
+    grep -F "CPU ticks in" "$out" >/dev/null \
+      || { cpu_reap_kids; fail "spent-budget round $n carried no CPU reading: $(cat "$out")"; }
+    grep -F "spin loop" "$out" >/dev/null \
+      || { cpu_reap_kids; fail "spent-budget round $n did not name the spin loop it cannot rule out: $(cat "$out")"; }
+    if [ "$n" -lt 3 ]; then
+      grep -F "demand-deep-inspection" "$out" >/dev/null \
+        && { cpu_reap_kids; fail "spent-budget round $n demanded deep inspection before the threshold: $(cat "$out")"; }
+    else
+      grep -F "demand-deep-inspection" "$out" >/dev/null \
+        || { cpu_reap_kids; fail "spent-budget round $n (threshold) did not demand deep inspection: $(cat "$out")"; }
+    fi
+    n=$((n + 1))
+  done
+  cpu_reap_kids
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] \
+    || fail "a spinning wedge's escalation counter did not climb on the normal cadence past its spent budget"
+  pass "a wedge still burning CPU past its spent deferral budget escalates on the normal cadence and reaches demand-deep-inspection"
 }
 
 test_hung_worker_still_escalates_with_its_evidence() {
@@ -2290,6 +2369,7 @@ test_long_productive_turn_is_not_escalated_as_a_wedge
 test_hung_worker_still_escalates_with_its_evidence
 test_unmeasurable_worker_still_escalates
 test_cpu_progress_deferral_is_bounded
+test_spent_deferral_budget_escalates_on_the_normal_cadence
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces

@@ -10,10 +10,10 @@
 #
 # The safety invariant under test throughout: `progressing` is the ONLY verdict
 # that may suppress an escalation, and every failure mode - unresolvable pid,
-# vanished process, immature or over-wide window, no /proc at all - returns
-# `unknown`, which escalates. Watcher-level consequences (deferral, the bounded
-# deferral cap, and the evidence carried in the wake reason) live in
-# tests/fm-watch-triage.test.sh.
+# vanished process, immature, over-wide, or clock-stepped window, no /proc at
+# all - returns `unknown`, which escalates. Watcher-level consequences
+# (deferral, the per-pane deferral budget, and the evidence carried in the wake
+# reason) live in tests/fm-watch-triage.test.sh.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -244,6 +244,36 @@ test_overwide_window_is_unknown() {
   pass "a sampling window too wide to describe now returns unknown and re-anchors"
 }
 
+# A backwards clock step (NTP correction, VM suspend/resume, laptop sleep)
+# leaves the anchor stamped in the FUTURE. Treating that span as merely immature
+# would re-serve the recorded `progressing` on every later call for as long as
+# the skew lasts - a suppression built on a measurement the clock cannot
+# support, and the one failure shape that degrades toward blindness.
+test_backwards_clock_step_re_anchors_instead_of_carrying_progressing() {
+  local rec v ts line
+  rec=$(new_record clock-step); rm -f "$rec"
+  spawn_busy; FAKE_PID=$SPAWNED
+  FM_CPU_PROGRESS_WINDOW=3 fm_cpu_progress_check "$rec" tmux test:win >/dev/null
+  settle_window 4
+  v=$(FM_CPU_PROGRESS_WINDOW=3 fm_cpu_progress_check "$rec" tmux test:win)
+  [ "$(verdict_class "$v")" = progressing ] || fail "setup did not reach a progressing verdict: $v"
+  # The clock stepping back an hour is indistinguishable from the anchor being
+  # stamped an hour ahead of it.
+  ts=$(sed -n 's/.* ts=\([0-9][0-9]*\) .*/\1/p' "$rec")
+  [ -n "$ts" ] || fail "the anchor recorded no timestamp to step: $(cat "$rec")"
+  line=$(sed "s/ts=$ts/ts=$(( ts + 3600 ))/" "$rec")
+  printf '%s\n' "$line" > "$rec"
+  v=$(FM_CPU_PROGRESS_WINDOW=3 fm_cpu_progress_check "$rec" tmux test:win)
+  [ "$(verdict_class "$v")" = unknown ] \
+    || fail "an anchor from after a backwards clock step returned '$v' instead of unknown"
+  grep -q 'class=unknown' "$rec" \
+    || fail "a backwards clock step did not re-anchor the record: $(cat "$rec")"
+  v=$(FM_CPU_PROGRESS_WINDOW=3 fm_cpu_progress_check "$rec" tmux test:win)
+  [ "$(verdict_class "$v")" = unknown ] \
+    || fail "the re-anchored record still served a remembered verdict: $v"
+  pass "an anchor stamped after a backwards clock step re-anchors and returns unknown, never a carried-forward progressing"
+}
+
 test_recycled_pid_is_not_trusted() {
   local rec v pid start line
   rec=$(new_record recycled); rm -f "$rec"
@@ -286,6 +316,7 @@ test_unresolvable_worker_is_unknown
 test_vanished_process_is_unknown
 test_immature_window_carries_the_previous_verdict
 test_overwide_window_is_unknown
+test_backwards_clock_step_re_anchors_instead_of_carrying_progressing
 test_recycled_pid_is_not_trusted
 test_platform_without_proc_is_unknown
 

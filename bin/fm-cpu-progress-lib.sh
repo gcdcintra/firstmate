@@ -13,9 +13,12 @@
 #   `progressing` is the ONLY verdict that may SUPPRESS an escalation.
 #   Every other outcome - no pid resolver for the backend, no /proc on this
 #   platform, an unreadable or vanished process, a first sample with no anchor
-#   yet, or a sampling window too wide to trust after a watcher restart -
-#   returns `unknown`, and `unknown` escalates exactly as before this library
-#   existed. Every failure mode degrades toward NOISE, never toward BLINDNESS.
+#   yet, a sampling window too wide to trust after a watcher restart, or a
+#   window that a backwards clock step (NTP correction, VM suspend/resume,
+#   laptop sleep) made impossible - returns `unknown`, and `unknown` escalates
+#   exactly as before this library existed. A verdict is never carried forward
+#   on a measurement the clock cannot support: that is the one shape of failure
+#   that would degrade toward BLINDNESS instead of NOISE.
 # This library never escalates anything on its own and never touches a worker;
 # it only ever answers "is this process burning CPU", and its caller decides.
 #
@@ -203,7 +206,20 @@ fm_cpu_progress_check() {  # <record-file> <backend> <target>
   fi
 
   window=$(( now - ts ))
-  if [ "$window" -lt 0 ]; then window=0; fi
+
+  # An anchor stamped in the FUTURE means the host clock stepped backwards, so
+  # the span between the two samples is unknown. Clamping it to 0 would make it
+  # look merely immature and carry the recorded verdict forward on every later
+  # call - a stale `progressing` re-served for as long as the skew lasts, which
+  # is the blindness this library must never introduce. Re-anchor instead, the
+  # same way an over-wide window does, and escalate.
+  if [ "$window" -lt 0 ]; then
+    printf '%s pid=%s start=%s ticks=%s ts=%s class=unknown delta=0 window=0\n' \
+      "$FM_CPU_PROGRESS_LIB_VERSION" "$pid" "$start" "$cur_ticks" "$now" > "$record"
+    printf 'unknown CPU sampling window of process %s is impossible (%ss - the clock stepped backwards), re-anchored' \
+      "$pid" "$window"
+    return 0
+  fi
 
   # Window still maturing: carry the previous verdict, and its own evidence,
   # forward rather than re-anchoring - otherwise frequent polling would keep
