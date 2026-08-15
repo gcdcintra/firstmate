@@ -1641,6 +1641,91 @@ test_long_productive_turn_is_not_escalated_as_a_wedge() {
   pass "a worker inside a long productive turn is not escalated as a possible wedge while its CPU counter keeps moving, and its deferral is logged once per episode"
 }
 
+# The epoch that opens a deferral episode records when the episode BEGAN and is
+# never rewritten while the pane keeps deferring. That is what makes the budget
+# latchable at all: the cap is measured from this epoch, so refreshing it on
+# each deferring poll would reset the elapsed comparison, the budget would never
+# be spent, and a pane burning CPU would be suppressed forever - the blindness
+# shape that is worse than the false alarms this predicate exists to stop.
+# The other budget cases seed the epoch by hand, which cannot see that; here the
+# WATCHER writes it, and the case pins both the mechanism (the recorded value
+# does not move across further deferring polls) and its consequence (once the
+# span since that value passes the cap, the pane escalates again and says the
+# budget is spent). A refresh regression fails both: the value advances, and
+# the still-young epoch would defer the final phase instead of escalating it.
+test_deferral_epoch_latches_and_is_never_refreshed() {
+  local dir state fakebin out window key pid epoch later cap
+  window="test:fm-cpu-latch"
+  dir=$(cpu_wedge_case cpu-progress-epoch-latch "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  # Phase A: mature the sampling window against the real process, with no
+  # escalation due yet.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "the epoch-latch fixture escalated during window warm-up: $(cat "$out")"
+  fi
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the spinning worker as progressing: $(cat "$state/.cpu-$key")"; }
+
+  # Phase B: the watcher opens the episode itself and keeps deferring. The cap
+  # is far above the timer's age, so only the watcher decides when to write.
+  echo $(( $(date +%s) - 3 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.cpu-defer-since-$key" 100; then
+    cpu_reap_kids; reap "$pid"; fail "the watcher never opened a deferral episode to latch: $(cat "$out")"
+  fi
+  epoch=$(cat "$state/.cpu-defer-since-$key")
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "a productive long turn was escalated while its budget was unspent: $(cat "$out")"
+  fi
+  reap "$pid"
+  later=$(cat "$state/.cpu-defer-since-$key" 2>/dev/null || true)
+  [ "$later" = "$epoch" ] \
+    || { cpu_reap_kids; fail "the deferral epoch was refreshed across deferring polls ($epoch -> $later), so the budget could never latch"; }
+
+  # Phase C: the consequence. The cap is taken from the span that has actually
+  # elapsed since the watcher wrote that epoch, so the budget is spent by
+  # construction - and would NOT be if the epoch had been refreshed. The wedge
+  # timer is re-armed young, well under the cap, so the spent budget is the only
+  # thing that can end the deferral.
+  cap=$(( $(date +%s) - epoch ))
+  while [ "$cap" -lt 8 ]; do
+    sleep 1
+    cap=$(( $(date +%s) - epoch ))
+  done
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the fixture stopped spinning before the budget phase: $(cat "$state/.cpu-$key")"; }
+  echo $(( $(date +%s) - 2 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS="$cap" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { cpu_reap_kids; fail "a pane past the span measured from its own latched epoch kept deferring instead of escalating: $(cat "$out")"; }
+  grep -F "deferral budget is spent" "$out" >/dev/null \
+    || { cpu_reap_kids; fail "the escalation past the latched epoch did not report a spent budget: $(cat "$out")"; }
+  grep -F "CPU ticks in" "$out" >/dev/null \
+    || { cpu_reap_kids; fail "the escalation past the latched epoch carried no CPU reading: $(cat "$out")"; }
+  cpu_reap_kids
+  pass "the deferral epoch the watcher writes is never refreshed while the pane defers, so the budget still latches and the pane escalates again"
+}
+
 # Past its deferral budget, a wedge that KEEPS burning CPU must return to the
 # ordinary escalation cadence. The escalation resets the wedge timer, so a
 # budget measured only from that timer would re-open a full deferral window
@@ -2550,6 +2635,7 @@ test_hung_worker_still_escalates_with_its_evidence
 test_unmeasurable_worker_still_escalates
 test_cpu_progress_deferral_is_bounded
 test_spent_deferral_budget_escalates_on_the_normal_cadence
+test_deferral_epoch_latches_and_is_never_refreshed
 test_idle_at_prompt_stale_is_never_deferred
 test_long_turn_keeps_its_busy_verdict_and_still_defers
 test_spent_budget_reason_does_not_claim_ongoing_suppression

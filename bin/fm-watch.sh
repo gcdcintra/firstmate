@@ -329,8 +329,9 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # FM_WEDGE_DEMAND_INSPECT_COUNT - until it goes genuinely active again.
 CPU_PROGRESS_MAX_DEFER_SECS=${FM_CPU_PROGRESS_MAX_DEFER_SECS:-7200}
 
-# The ONE spelling of a window's marker-key transform, so the key contract that
-# fm-supervise-daemon.sh's _stale_key must stay in sync with is stated once.
+# The wedge-marker key spelling, stated once for the sites routed through it,
+# so the key contract that fm-supervise-daemon.sh's _stale_key must stay in
+# sync with has one owner here.
 window_key() {  # <window>
   printf '%s' "$1" | tr ':/.' '___'
 }
