@@ -2701,6 +2701,10 @@ test_live_but_unresponsive_pane_still_wedge_escalates() {
   read -r dir state fakebin <<<"$(make_absence_case gone-live-wedge "test:fm-wedged" "working: implementing")"
   out="$dir/watch.out"; window="test:fm-wedged"
   key=$(printf '%s' "$window" | tr ':/.' '___')
+  # Enter on the already-classified stale hash with a backdated timer, the same
+  # priming the sibling wedge cases use, so this exercises the wedge escalation
+  # itself rather than a first sighting that would restart the timer.
+  printf '%s' "$(hash_text "idle pane frame")" > "$state/.stale-$key"
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 

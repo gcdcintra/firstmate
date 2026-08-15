@@ -162,6 +162,25 @@ tests/fm-daemon.test.sh
 A live worker is not a usable stand-in for a wedged one: a quiet agent can resume mid-sample and then correctly reads as progressing, which is why the flat-counter cases use processes the test controls or a pane whose agent has actually exited.
 The escalation reason carrying that reading is also a contract with the away-mode daemon's force-escalate matcher, so `tests/fm-daemon.test.sh` pins both ends together: it feeds a real `bin/fm-watch.sh` wedge escalation through the daemon's own wake handling and fails if either side's wording drifts off the shared segment.
 
+## Endpoint absence
+
+The `gone` wake distinguishes a killed endpoint from a wedged worker, which no pane-shaped heuristic can do: both hold a frozen frame and a flat CPU counter.
+It rests on `fm_backend_agent_state` returning `missing` for both endpoint-loss shapes, checked live on 2026-08-15 with tmux 3.4 on a private socket (`TMUX_TMPDIR` pointed at a throwaway directory, so the fleet's default server was never addressed).
+
+```sh
+tmux new-session -d -s live -n worker 'sleep 600'
+fm_backend_agent_state tmux live:worker   # -> ambiguous
+tmux kill-window -t live:worker
+fm_backend_agent_state tmux live:worker   # -> missing
+tmux kill-server
+fm_backend_agent_state tmux live:worker   # -> missing
+```
+
+A live window running an unrecognized command reads `ambiguous` and therefore never wakes, which is what keeps this check from claiming a window that normal triage should handle.
+Both the killed-window and dead-server shapes read `missing`, so a server that dies with its session reaches the wake rather than a blind spot; the dead-server case is the one observed on 2026-08-15, when a desktop-session collapse made systemd SIGKILL an entire user control group and every pane with it.
+
+`tests/fm-watch-triage.test.sh` pins the behavior around that verdict: a killed endpoint and a dead server each wake as `gone` and never as a stale pane or a wedge, a husk shell names the working directory it fell back to, a live pane with a running agent still wedge-escalates with its unchanged wording, and an absence wakes once per episode and is absorbed after a terminal outcome.
+
 ## Turn-end guard
 
 The direct and passive mechanisms were validated across all five harnesses on 2026-07-08 through 2026-07-12, with Claude's replacement Stop-owned path revalidated on 2026-07-24.
