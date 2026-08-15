@@ -12,7 +12,10 @@
 #   (a) active run-step is authoritative                          -> run-step
 #   (b) needs-decision/blocked log + resumed run = SUPERSEDED     -> run-step
 #   (c) genuine parked run + needs-decision log = NOT superseded  -> run-step
-#   (d) terminal run-step (passed/failed) is authoritative        -> run-step
+#   (d) terminal run-step (passed/failed) is authoritative        -> run-step,
+#       and a failed run names its cause when the failed step's log proves the
+#       pipeline agent was killed by the usage limit - while a genuine agent
+#       failure stays a plain failure and is never excused as external
 #   (e) cross-branch attribution: this branch's own run found via list lookup
 #   (f) no run + semantic busy                                    -> pane
 #   (g) no run + semantic idle falls to the status-log verb       -> status-log
@@ -74,7 +77,15 @@ case "${1:-}" in
         if [ "${1:-}" = --run ]; then printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
         else printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"; fi ;;
       logs)
-        printf '%s\n' "${FM_FAKE_CI_LOGS:-}" ;;
+        # The helper reads two different step logs: the ci step (CI-green
+        # detection) and, only for a failed run, the step that failed.
+        shift
+        step=
+        while [ $# -gt 0 ]; do
+          case "$1" in --step) step=${2:-}; shift 2 ;; *) shift ;; esac
+        done
+        if [ "$step" = ci ]; then printf '%s\n' "${FM_FAKE_CI_LOGS:-}"
+        else printf '%s\n' "${FM_FAKE_STEP_LOGS:-}"; fi ;;
     esac
     ;;
   runs)
@@ -173,8 +184,9 @@ reset_fakes() {
   FM_FAKE_HERDR_MISSING=0
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
+  FM_FAKE_STEP_LOGS=""
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING
-  export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
+  export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS FM_FAKE_STEP_LOGS
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -291,6 +303,27 @@ run:
   pr: ""
   findings: none
 outcome: failed
+EOF
+}
+
+# A failed run that DOES report which step failed, so the helper can read that
+# step's log and say why. `run_failed` above deliberately carries no steps table
+# (the coarse shape), which is what keeps the cause read off that path.
+run_failed_at_step() {  # <branch> <step>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: failed
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+  steps[3]{step,status,findings,duration_ms}:
+    intent,completed,0,5
+    rebase,completed,0,1624
+    $2,failed,0,4049
+outcome: failed
+error: "step $2 failed: agent $2: claude exited: exit status 1: "
 EOF
 }
 
@@ -742,6 +775,55 @@ test_terminal_failed() {
   assert_contains "$out" "state: failed" "failed run -> failed"
   assert_contains "$out" "source: run-step" "failed -> run-step source"
   pass "terminal failed run is authoritative"
+}
+
+# A pipeline agent killed by the account usage limit and one that genuinely broke
+# fail the run with byte-identical text, so these two cases are a pair: the first
+# proves the cause is now readable from firstmate's own state read, the second is
+# the regression that must never be traded for it.
+test_failed_cause_quota_kill() {
+  reset_fakes
+  local d; d=$(new_case failed-quota)
+  make_repo_on_branch "$d/wt" fm/feat-quota
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-quota.meta" "window=fm:fm-feat-quota" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_failed_at_step fm/feat-quota review)"
+  FM_FAKE_STEP_LOGS="reviewing changes...
+
+claude started pid=95327
+
+You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.
+claude exited pid=95327 error=claude exited: exit status 1:
+
+error: agent review: claude exited: exit status 1:"
+  local out; out=$(run_crew_state "$d" feat-quota)
+  assert_contains "$out" "state: failed" "a quota kill is still a failed run, not a healthy one"
+  assert_contains "$out" "usage limit killed the pipeline agent at step review" \
+    "the failed detail must name the usage limit as the cause"
+  assert_contains "$out" "model:Fable 5" "the failed detail must name the window that ran out"
+  pass "a failed run killed by the usage limit reports that cause, with its window and evidence"
+}
+
+test_failed_cause_genuine_failure_not_excused() {
+  reset_fakes
+  local d; d=$(new_case failed-genuine)
+  make_repo_on_branch "$d/wt" fm/feat-genuine
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-genuine.meta" "window=fm:fm-feat-genuine" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_failed_at_step fm/feat-genuine test)"
+  FM_FAKE_STEP_LOGS="running tests...
+
+claude started pid=2706190
+
+I'll start by orienting: reviewing what changed between base and target.
+claude exited pid=2706190 error=claude exited: signal: killed:
+
+error: agent run tests: claude exited: signal: killed:"
+  local out; out=$(run_crew_state "$d" feat-genuine)
+  assert_contains "$out" "state: failed" "a genuine agent death is still a failed run"
+  assert_not_contains "$out" "usage limit" \
+    "a genuine agent failure must NEVER be reported as an external quota event"
+  pass "a genuine agent failure stays a plain failure and is never excused as a quota event"
 }
 
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
@@ -1539,6 +1621,8 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_failed_cause_quota_kill
+test_failed_cause_genuine_failure_not_excused
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status

@@ -59,6 +59,54 @@ grep -q 'herdr: agent blocked' "$STATE_DIR/.wake-queue" || fail "the stale paylo
 [ -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "handle_push_transition must commit dedupe only after enqueue"
 pass "handle_push_transition: a blocked crew enqueues a stale wake naming its window and wakes the supervisor"
 
+# --- handle_push_transition: the blocked wake names a usage-limit dialog ------
+#
+# The backend's native event says only "waiting on human", which a usage-limit
+# dialog, a trust prompt and a plain question all produce alike. These three
+# cases pin the enrichment AND its fail-safe: an unrecognized or unreadable pane
+# must leave the wake reason exactly as it was before.
+
+GENERIC='herdr: agent blocked - waiting on human, escalated immediately, not via wedge timer'
+
+reset_state
+fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+# shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
+fm_backend_capture() { printf 'esc to interrupt\nYou'"'"'ve reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\nWhat do you want to do?\n'; }
+handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+grep -q 'on the account usage limit (model:Fable 5)' "$WAKE_LOG" \
+  || fail "a worker stopped on the usage-limit dialog must wake with that cause named: $(cat "$WAKE_LOG")"
+grep -q 'on the account usage limit' "$STATE_DIR/.wake-queue" \
+  || fail "the durable wake record must carry the cause too, not just the live wake"
+grep -q 'escalated immediately, not via wedge timer' "$WAKE_LOG" \
+  || fail "the enriched reason must keep saying the escalation beat the wedge timer"
+pass "handle_push_transition: a worker on the usage-limit dialog wakes with the limit named, not as a bare wedge"
+
+reset_state
+fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+# shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
+fm_backend_capture() { printf 'Do you trust the files in this folder?\n1. Yes, proceed\n'; }
+handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+grep -qF "$GENERIC" "$WAKE_LOG" \
+  || fail "an unrecognized blocked dialog must keep the generic reason byte-identical: $(cat "$WAKE_LOG")"
+grep -q 'usage limit' "$WAKE_LOG" \
+  && fail "a trust dialog must never be reported as a usage limit"
+pass "handle_push_transition: an unrecognized blocked dialog keeps the pre-existing generic reason"
+
+reset_state
+fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+# shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
+fm_backend_capture() { return 1; }
+handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+grep -qF "$GENERIC" "$WAKE_LOG" \
+  || fail "an unreadable pane must still produce today's wake, never swallow it: $(cat "$WAKE_LOG")"
+pass "handle_push_transition: an unreadable pane still escalates, with the pre-existing generic reason"
+
+# Every case below this point predates the enrichment and must stay hermetic, so
+# the pane read keeps a deterministic unreadable default rather than falling
+# through to a real backend on a machine that has one.
+# shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
+fm_backend_capture() { return 1; }
+
 reset_state
 fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
 (

@@ -32,7 +32,10 @@
 #      SUBMITTED binds the run too - see nm_run_head_matches_worktree.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
-#      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
+#      passed/checks-passed -> done, failed/cancelled -> failed. A failed run
+#      also names its cause when the failed step's log proves the pipeline agent
+#      was killed by the account usage limit rather than failing on its own
+#      (nm_failed_cause); anything unrecognized stays a plain failure. EXCEPT: while
 #      the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
@@ -66,6 +69,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# shellcheck source=bin/fm-quota-kill-lib.sh
+. "$SCRIPT_DIR/fm-quota-kill-lib.sh"
 
 ID=${1:-}
 [ -n "$ID" ] || { echo "usage: fm-crew-state.sh <id>" >&2; exit 2; }
@@ -325,6 +330,31 @@ nm_ci_checks_state() {
     *) printf 'unknown' ;;
   esac
 }
+
+# Why a failed run failed, when that can be established. no-mistakes reports
+# every dead pipeline agent identically ("agent review: claude exited: exit
+# status 1"), so a usage-limit kill - a known, recoverable, external condition
+# that leaves the crew's branch content untouched - is indistinguishable at that
+# level from a genuine crash. The failed step's own log carries the vendor's
+# message verbatim, so one bounded `axi logs` read separates them.
+# Prints the clause to append to the failed detail, or nothing at all when the
+# run failed for any other reason, when no failed step is reported, or when the
+# log is unreadable - an unrecognized cause always reports as a plain failure and
+# is never excused as external. Only meaningful for a full `axi status` read: the
+# coarse runs-list fallback carries neither a run id nor a step table.
+nm_failed_cause() {
+  local run_id step log_out record
+  run_id=$(strip_quotes "$(nm_field id)")
+  [ -n "$run_id" ] || return 0
+  step=$(printf '%s\n' "$RUN_OUT" | fm_quota_kill_failed_step)
+  [ -n "$step" ] || return 0
+  log_out=$(nm_run axi logs --step "$step" --run "$run_id" --full) || true
+  [ -n "$log_out" ] || return 0
+  record=$(printf '%s\n' "$log_out" | fm_quota_kill_scan --agent-episode) || return 0
+  printf 'usage limit killed the pipeline agent at step %s (%s) - %s' \
+    "$step" "$(fm_quota_kill_window "$record")" "$(fm_quota_kill_evidence "$record")"
+}
+
 # Coarse fallback for cross-branch attribution. `no-mistakes axi status` (bare)
 # reports the active-or-most-recent run for the CURRENT branch when one
 # exists, else falls back to some other branch's run purely as informational
@@ -550,6 +580,18 @@ if [ "$HAVE_RUN" = 1 ]; then
             ;;
         esac
       fi
+    fi
+  fi
+
+  # A failed run says WHY when the cause can be established from the pipeline's
+  # own logs, so a usage-limit kill is not read as a crewmate that broke its
+  # work. Deliberately after the state resolution above and only on the full
+  # read, so the extra bounded call happens once, on failure, and never on a
+  # healthy crew.
+  if [ "$RUN_STATE" = failed ] && [ "$RUN_SOURCE" = full ]; then
+    FAILED_CAUSE=$(nm_failed_cause)
+    if [ -n "$FAILED_CAUSE" ]; then
+      RUN_DETAIL="$RUN_DETAIL: $FAILED_CAUSE"
     fi
   fi
 
