@@ -400,12 +400,18 @@ teardown_task() {  # <id> <home>
     "$ROOT/bin/fm-teardown.sh" "$id" --force
 }
 
+# Blank out the identifiers that are minted fresh by every spawn: the Herdr
+# container ids, and the worktree ownership token that pairs this task's meta
+# with the marker in its worktree. The LINES stay, so a path that stops writing
+# one of them still fails the comparison; only their per-spawn values are
+# normalized away.
 normalize_meta() {  # <meta>
   sed -E \
     -e 's|^window=.*$|window=<herdr-container-id>|' \
     -e 's|^herdr_workspace_id=.*$|herdr_workspace_id=<herdr-container-id>|' \
     -e 's|^herdr_tab_id=.*$|herdr_tab_id=<herdr-container-id>|' \
     -e 's|^herdr_pane_id=.*$|herdr_pane_id=<herdr-container-id>|' \
+    -e 's|^worktree_owner=.*$|worktree_owner=<per-spawn-token>|' \
     "$1"
 }
 
@@ -659,7 +665,7 @@ PROJECTION_ORDER_START=$(log_line_count)
 normalize_meta "$OFF_META" > "$TMP_ROOT/off.meta.normalized"
 normalize_meta "$ON_META" > "$TMP_ROOT/on.meta.normalized"
 cmp -s "$TMP_ROOT/off.meta.normalized" "$TMP_ROOT/on.meta.normalized" \
-  || fail "metadata changed beyond Herdr container IDs between flag-off and projected paths"
+  || fail "metadata changed beyond per-spawn identifiers between flag-off and projected paths"
 
 # Two real concurrent primary spawns share the bounded presentation-order lock.
 # Their final relative order must match Herdr's actual serialized create order,
@@ -787,7 +793,7 @@ teardown_task shape "$HOME_DIR" > "$TMP_ROOT/on-teardown.out" 2> "$TMP_ROOT/on-t
   || fail "projected teardown failed: $(cat "$TMP_ROOT/on-teardown.err")"
 assert_focus_is "$CAPTAIN_FOCUS" "projected teardown"
 assert_cleanup_focus_preserved "$SHAPE_CLEANUP_AUDIT_START" "$PROJECTED_PANE" "$CAPTAIN_FOCUS"
-pass "real Herdr lab: Treehouse commands and metadata shape are byte-identical except for Herdr container IDs"
+pass "real Herdr lab: Treehouse commands and metadata shape are byte-identical except for per-spawn identifiers"
 if lab workspace get "$PROJECTED_WSID" >/dev/null 2>&1; then
   fail "closing the exact projected task pane did not remove its last-tab workspace"
 fi
