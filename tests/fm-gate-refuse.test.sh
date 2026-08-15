@@ -2,10 +2,12 @@
 # Behavior tests for the no-mistakes GATE-agent fleet-lifecycle refusal.
 #
 # A confused no-mistakes gate agent runs inside a firstmate checkout, adopts the
-# captain identity from AGENTS.md, and reaches for fm-spawn/fm-send/fm-teardown.
-# bin/fm-gate-refuse-lib.sh is the firstmate capability-removal half: sourced at
-# the top of those three entrypoints and called before any fleet mutation, it
-# fails closed on either of two independent signals:
+# captain identity from AGENTS.md, and reaches for fm-spawn.sh, fm-send.sh,
+# fm-teardown.sh, and fm-worktree-owner.sh (its record-writing `claim`, not its
+# read-only `show`). bin/fm-gate-refuse-lib.sh is the firstmate
+# capability-removal half: sourced at the top of those entrypoints and called
+# before any fleet mutation, it fails closed on either of two independent
+# signals:
 #   1. NO_MISTAKES_GATE set in the environment (the marker no-mistakes stamps);
 #   2. the current worktree's git-common-dir resolves under a no-mistakes gate
 #      repo (.../.no-mistakes/repos/*.git) - the unspoofable backstop, which

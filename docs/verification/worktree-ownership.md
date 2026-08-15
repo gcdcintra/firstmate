@@ -78,7 +78,8 @@ failed to return worktree: lease precondition failed: worktree ... is not leased
 ```
 
 Both refusals exit 1 and leave the lease untouched, and the two messages are distinguishable.
-`bin/fm-teardown.sh` and `bin/fm-home-seed.sh` therefore pass `--if-lease-holder` only where a lease is expected, treat the holder mismatch as a refusal, and fall back to an unguarded return on the "is not leased" signature so a home predating the lease is not stranded.
+`bin/fm-teardown.sh` and `bin/fm-home-seed.sh` therefore pass `--if-lease-holder` only where a lease is expected and treat a guarded failure as a refusal, leaving the worktree in place rather than releasing it.
+Only teardown adds a fallback to an unguarded return, confined to the distinct "is not leased" signature so a home predating the holder record is not stranded; `bin/fm-teardown.sh`'s `teardown_treehouse_return` header owns that attempt sequence.
 
 ## The capability floor: v2.0.1 leases but cannot guard the return
 

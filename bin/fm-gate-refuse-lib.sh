@@ -38,7 +38,7 @@
 # HEAD-continuity guard, which remains the adversarial/residual backstop.
 #
 # TEST-HARNESS ESCAPE HATCH (FM_GATE_REFUSE_BYPASS=1): firstmate's own test suite
-# must exercise the REAL fm-spawn/fm-send/fm-teardown, but the no-mistakes gate
+# must exercise the REAL fleet-lifecycle entrypoints, but the no-mistakes gate
 # runs that suite FROM a gate worktree (cwd git-common-dir under
 # .no-mistakes/repos/*.git, and possibly NO_MISTAKES_GATE set) - the exact
 # environment this guard refuses. So both signals would fire during firstmate's
