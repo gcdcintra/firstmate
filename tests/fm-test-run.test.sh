@@ -131,6 +131,57 @@ init_changed_fixture_repo() {
   git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm baseline
 }
 
+# A shared library consumed by two scripts in DIFFERENT families must select
+# both, which is the map's own stated invariant: over-select rather than
+# under-select. The fixture above is synthetic, so it cannot prove anything about
+# real paths; this one copies the real bin/ and tests/ into a scratch repo so the
+# real map runs against the real test corpus, and asserts through the runner's
+# selection rather than by reading the map's source.
+test_changed_shared_library_selects_every_consuming_family() {
+  local tmp repo listed
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-sharedlib.XXXXXX")
+  repo="$tmp/repo"
+  mkdir -p "$repo"
+  cp -a "$ROOT/bin" "$ROOT/tests" "$repo/"
+  git -C "$repo" init -q
+  git -C "$repo" add .
+  git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm baseline
+
+  # bin/fm-quota-axi-lib.sh: the version floor for bin/fm-bootstrap.sh
+  # (session-bootstrap) and the bounding ladder for bin/fm-quota-advice.sh
+  # (pure-contract-unit).
+  printf '\n' >>"$repo/bin/fm-quota-axi-lib.sh"
+  listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD) \
+    || fail "changed selection for the shared quota-axi library must succeed"
+  case "$listed" in
+    *tests/fm-quota-advice.test.sh*) : ;;
+    *) fail "a bin/fm-quota-axi-lib.sh change must select its bounding-ladder consumer's suite, got: $listed" ;;
+  esac
+  case "$listed" in
+    *tests/fm-bootstrap.test.sh*) : ;;
+    *) fail "a bin/fm-quota-axi-lib.sh change must still select its version-floor consumer's suite, got: $listed" ;;
+  esac
+  git -C "$repo" checkout -q -- bin/fm-quota-axi-lib.sh
+
+  # bin/fm-quota-kill-lib.sh: the failed-run cause for bin/fm-crew-state.sh
+  # (pure-contract-unit) and the blocked-pane cause for
+  # bin/fm-push-transition-lib.sh (watcher-wake-lock).
+  printf '\n' >>"$repo/bin/fm-quota-kill-lib.sh"
+  listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD) \
+    || fail "changed selection for the shared quota-kill recognizer must succeed"
+  case "$listed" in
+    *tests/fm-quota-kill.test.sh*) : ;;
+    *) fail "a bin/fm-quota-kill-lib.sh change must select the recognizer's own suite, got: $listed" ;;
+  esac
+  case "$listed" in
+    *tests/fm-supervision-events.test.sh*) : ;;
+    *) fail "a bin/fm-quota-kill-lib.sh change must select its blocked-pane consumer's suite, got: $listed" ;;
+  esac
+
+  rm -rf "$tmp"
+  pass "a shared library change selects every family that consumes it, not just the nearest one"
+}
+
 test_changed_dependency_selection_and_unmapped_failure() {
   local tmp repo listed rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-changed.XXXXXX")
@@ -739,6 +790,7 @@ test_family_selection
 test_single_script_selection
 test_changed_file_selection_is_conservative
 test_changed_dependency_selection_and_unmapped_failure
+test_changed_shared_library_selects_every_consuming_family
 test_empty_selection_emits_summary
 test_timing_markers_and_json
 test_aggregate_exit_behavior

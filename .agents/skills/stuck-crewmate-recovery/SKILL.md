@@ -34,6 +34,14 @@ Preserve its uncommitted changes and commits, keep the same task identity, and r
 Do not use a fresh generic spawn while the recorded worktree is unaccounted for, because allocating another worktree can split one task across two copies.
 If the worktree or ownership cannot be reconciled safely, leave all state intact and report the task failed or blocked with the conflicting evidence.
 
+## A worker stopped by the account usage limit is not wedged
+
+A wake reason naming the account usage limit, or a peek showing the vendor's limit dialog, is a known external wait, not a stuck worker.
+Relaunching into an exhausted window dies immediately and can strand the branch, so do not escalate this through the wedge ladder below.
+Read `bin/fm-quota-advice.sh` before deciding anything: the account, weekly, and per-model windows bound the work independently, and a limit message states when it was written rather than what is true now.
+Release the worker once the binding window has room, and record the wait as a declared pause meanwhile.
+A failed validation run reports the same cause in `bin/fm-crew-state.sh`'s detail when the pipeline's own logs prove it; that run's branch content is untouched and its worker is not at fault.
+
 ## Live-endpoint escalation
 
 Escalate in order:

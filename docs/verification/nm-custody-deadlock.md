@@ -14,6 +14,7 @@ A terminal run keeps a custody claim on its branch.
 The supported return is guarded on the gate branch still sitting exactly at the head that run recorded, so once anything moves the gate off that head the guard can never pass again.
 
 Reproduced end to end in a scratch repository with a local bare origin, triggered by a real pipeline-agent kill (`You've reached your Fable 5 limit`), which is the same trigger as every field occurrence.
+[quota-kill-classification.md](quota-kill-classification.md) owns how that trigger is recognized and reported.
 The rebase step alone is enough to strand a branch: it advances the run's recorded head inside the gate without moving the gate ref.
 
 ```
