@@ -87,12 +87,6 @@ set_mtime() {  # <epoch> <file>
   fi
 }
 
-# Signature a primed .seen-* marker must hold so the per-poll signal scan does not
-# fire on a pre-existing status (mirrors fm-watch.sh's stat_sig exactly).
-seen_sig() {
-  if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
-}
-
 # Prime <file>'s .seen-* suppressor to its CURRENT signature, so the per-poll
 # no-verb signal scan (which watches every *.turn-ended for a size:mtime change)
 # treats a just-created or just-backdated turn-ended marker as already seen.
@@ -2693,6 +2687,31 @@ test_husk_shell_wakes_gone_and_names_primary_checkout() {
   pass "a pane whose agent died into a bare shell wakes as gone and names the primary-checkout fallback"
 }
 
+# The same hazard as above, at the address it actually has. Crew panes are
+# created in the task's recorded `project=` checkout, which for every project
+# other than this firstmate home is a different directory from FM_ROOT - so a
+# shell that fell back there is unisolated for exactly the same reason and must
+# be named the same way, not filed as unremarkable drift.
+test_husk_shell_names_the_project_checkout_fallback() {
+  local dir state fakebin out window pid proj
+  read -r dir state fakebin <<<"$(make_absence_case gone-husk-project "test:fm-proj" "working: implementing")"
+  out="$dir/watch.out"; window="test:fm-proj"; proj="$dir/checkout"
+  mkdir -p "$proj"
+  printf 'project=%s\n' "$proj" >> "$state/absent.meta"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=bash FM_FAKE_TMUX_CURRENT_PATH="$proj" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a husk shell in the project checkout never woke the watcher: $(cat "$out")"; }
+  grep -F "primary checkout $proj" "$out" >/dev/null \
+    || fail "the gone wake did not name the project checkout as the isolation hazard: $(cat "$out")"
+  pass "a husk shell that fell back to the task's project checkout is named as the isolation hazard it is"
+}
+
 # Criterion 3, pinned: this check adds a signal and removes none. A pane that is
 # genuinely there with a genuinely running agent, gone quiet, must escalate with
 # the identical wedge wording it had before the endpoint read existed.
@@ -2769,6 +2788,39 @@ test_gone_endpoint_wakes_once_and_absorbs_after_a_terminal_outcome() {
   pass "a gone endpoint wakes once per episode, and an absence after a terminal outcome is absorbed"
 }
 
+# A declared pause is the one case where a confidently-exited agent is expected,
+# so the endpoint check absorbs it - but absorbing must not also cancel the
+# bounded recheck that is what makes a long wait safe to absorb in the first
+# place. A pause that stops rechecking is exactly the invisible rot
+# PAUSE_RESURFACE_SECS exists to prevent. The husk shell is the production shape
+# and the reason the sibling pause cases cannot catch this: with no pane command
+# the backend reads `unreadable`, and only a real shell reads `dead`.
+test_paused_husk_shell_keeps_its_bounded_recheck() {
+  local dir state fakebin out window key pid
+  read -r dir state fakebin <<<"$(make_absence_case gone-paused-recheck "test:fm-held" "paused: waiting on external CI")"
+  out="$dir/watch.out"; window="test:fm-held"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # The wait is already older than one recheck window, and the absence episode is
+  # one poll short of confirming, so a single stale poll decides both at once -
+  # the collision the absorb has to survive.
+  set_mtime "$(( $(date +%s) - 500 ))" "$state/absent.status"
+  printf '%s' "$(seen_sig "$state/absent.status")" > "$state/.seen-absent_status"
+  printf 'dead:1' > "$state/.gone-seen-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=bash \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=60 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a declared pause whose agent exited into a husk shell stopped being rechecked: $(cat "$out")"; }
+  grep -F "confirm the wait still holds" "$out" >/dev/null \
+    || fail "the declared pause lost its bounded recheck: $(cat "$out")"
+  grep -F "gone: " "$out" >/dev/null && fail "a declared pause was reported as a killed endpoint"
+  pass "a declared pause whose agent exited into a husk shell keeps its bounded recheck"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -2829,6 +2881,8 @@ test_afk_paused_changed_pane_hands_off_plain_stale
 test_missing_endpoint_wakes_gone_not_stale
 test_dead_backend_server_wakes_gone
 test_husk_shell_wakes_gone_and_names_primary_checkout
+test_husk_shell_names_the_project_checkout_fallback
 test_live_but_unresponsive_pane_still_wedge_escalates
 test_gone_endpoint_wakes_once_and_absorbs_after_a_terminal_outcome
+test_paused_husk_shell_keeps_its_bounded_recheck
 test_wait_for_exit_cannot_block_on_a_child_that_survives_sigterm

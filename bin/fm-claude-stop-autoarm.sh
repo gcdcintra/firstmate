@@ -80,6 +80,10 @@ esac
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-session-lock-lib.sh
 . "$SCRIPT_DIR/fm-session-lock-lib.sh"
+# For FM_WAKE_REASON_PREFIX_RE, the one definition of which watcher stdout lines
+# are wakes. Sourced for that constant alone; none of its classifiers run here.
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 
 # Consume the Stop payload once. The decisions below are state-based; the
 # payload is read so a slow writer can never wedge on a full pipe.
@@ -185,7 +189,7 @@ while [ "$attempt" -lt "$AUTOARM_ATTEMPTS" ]; do
 
   ACTIONABLE=0
   if [ -n "$OUT" ]; then
-    grep -Eq '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" 2>/dev/null && ACTIONABLE=1
+    grep -Eq "$FM_WAKE_REASON_PREFIX_RE" "$OUT" 2>/dev/null && ACTIONABLE=1
   fi
   [ "$ACTIONABLE" -eq 1 ] && break
 
@@ -232,7 +236,7 @@ if [ "$ACTIONABLE" -eq 1 ]; then
   write_epoch rewake
   {
     printf 'firstmate watcher wake - one supervision event needs a handling turn now.\n'
-    [ -n "$OUT" ] && grep -E '^(signal:|stale:|check:|heartbeat)' "$OUT" 2>/dev/null | head -8
+    [ -n "$OUT" ] && grep -E "$FM_WAKE_REASON_PREFIX_RE" "$OUT" 2>/dev/null | head -8
     printf 'Run bin/fm-wake-drain.sh first and handle the wake. This Stop hook owns watcher continuity: when the handling turn ends, the next needed cycle arms automatically - do NOT run bin/fm-watch-arm.sh after an ordinary wake.\n'
   } >&2
   [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
@@ -246,7 +250,7 @@ if [ ! -e "$FAILURE_NOTICE" ]; then
   write_epoch failed
   {
     printf 'firstmate watcher auto-arm FAILED - the Stop-owned automatic supervision mechanism is broken after %s bounded attempts, and no live watcher with a fresh beacon was verified.\n' "$attempt"
-    [ -n "$OUT" ] && grep -E '^(watcher:|signal:|stale:|check:|heartbeat)' "$OUT" 2>/dev/null | head -8
+    [ -n "$OUT" ] && grep -E "^watcher:|$FM_WAKE_REASON_PREFIX_RE" "$OUT" 2>/dev/null | head -8
     printf 'Do not launch a manual background arm from this notice; investigate the automatic Stop hook and watcher startup before ending blind.\n'
   } >&2
   : > "$FAILURE_NOTICE" 2>/dev/null || true

@@ -722,11 +722,30 @@ test_is_wake_reason_distinguishes_status_stdout() {
   # are not, so the main loop can idle them without flooding escalations.
   is_wake_reason "signal: /x/y.status" || fail "signal: not recognized as wake"
   is_wake_reason "stale: s:fm-x" || fail "stale: not recognized as wake"
+  is_wake_reason "gone: s:fm-x (the worker's endpoint no longer exists)" || fail "gone: not recognized as wake"
   is_wake_reason "check: /s/c.sh: merged" || fail "check: not recognized as wake"
   is_wake_reason "heartbeat" || fail "heartbeat not recognized as wake"
   is_wake_reason "watcher: already running" && fail "singleton status line misclassified as wake"
   is_wake_reason "watcher: already running pid 123" && fail "singleton status (pid) misclassified as wake"
   pass "is_wake_reason distinguishes watcher wake reasons from singleton-status stdout"
+}
+
+# A killed endpoint never clears on its own and relaunching a worker is not a
+# decision the away-mode daemon may make, so it must reach the captain. Both
+# halves are pinned: the main loop only calls handle_wake for reasons
+# is_wake_reason accepts, so a gone wake that the recognizer above rejected
+# would leave this escalation permanently unreachable.
+test_gone_wake_escalates_to_an_away_captain() {
+  local dir state reason
+  dir=$(make_supercase gone-escalates)
+  state="$dir/state"
+  printf 'working: implementing\n' > "$state/gone-w1.status"
+  reason="gone: sess:fm-gone-w1 (the worker's endpoint no longer exists - it was killed)"
+  is_wake_reason "$reason" || fail "the daemon's main loop would idle a gone wake instead of handling it"
+  FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+  grep -F "$reason" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "a gone wake was self-handled instead of escalated: $(cat "$state/.subsuper-escalations" 2>/dev/null)"
+  pass "a killed endpoint escalates to an away captain instead of being absorbed"
 }
 
 test_terminal_stale_escalate_leaves_no_marker() {
@@ -1911,6 +1930,7 @@ test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_inject_skip_forces_self
 test_is_wake_reason_distinguishes_status_stdout
+test_gone_wake_escalates_to_an_away_captain
 test_terminal_stale_escalate_leaves_no_marker
 test_signal_escalate_marks_seen_no_catchall_refire
 test_collapse_newlines_pure

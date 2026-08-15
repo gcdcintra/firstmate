@@ -75,6 +75,7 @@ install_autoarm_scripts() {
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
   cp "$ROOT/bin/fm-session-lock-lib.sh" "$dir/bin/fm-session-lock-lib.sh"
+  cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/fm-classify-lib.sh"
   cp "$ROOT/bin/fm-lock.sh" "$dir/bin/fm-lock.sh"
   chmod +x "$dir/bin/fm-claude-stop-autoarm.sh" "$dir/bin/fm-lock.sh"
 }
@@ -131,6 +132,15 @@ write_arm_fixture() {
 echo "$$" >> "$FM_HOME/state/arm-ran"
 printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
 printf 'stale: fixture-win actionable\n'
+exit 0
+SH
+      ;;
+    gone)
+      cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+echo "$$" >> "$FM_HOME/state/arm-ran"
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+printf "gone: fixture-win (the worker's endpoint no longer exists - it was killed)\n"
 exit 0
 SH
       ;;
@@ -468,6 +478,26 @@ test_actionable_close_rewakes_with_reason() {
   pass "auto-arm: actionable close translates to exactly one exit-2 rewake with reason"
 }
 
+# Claude is the primary harness, so this hook is the last hop between a killed
+# crewmate and the only agent that can relaunch it. A kind the hook does not
+# recognize is not delayed but lost: the watcher already marked the absence
+# episode delivered, and after a fleet-wide kill no other window is left to
+# raise it again.
+test_gone_close_rewakes_with_reason() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/gone")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" gone
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "a killed endpoint must exit 2 so Claude rewakes"
+  assert_contains "$out" "firstmate watcher wake" "a gone close must rewake with the wake banner"
+  assert_contains "$out" "gone: fixture-win" "the rewake must carry the gone reason line"
+  assert_contains "$out" "no longer exists" "the rewake must carry what the watcher said was wrong"
+  assert_not_contains "$out" "automatic supervision mechanism is broken" "a killed worker must not be reported as a broken watcher"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "a gone close must record outcome=rewake, got: $(epoch_outcome "$dir")"
+  pass "auto-arm: a killed endpoint reaches Claude as an exit-2 rewake carrying its reason"
+}
+
 test_actionable_close_with_live_successor_rewakes_once() {
   local dir out out2 status status2 pid identity
   dir=$(make_primary_dir "$TMP_ROOT/actionable-live-successor")
@@ -709,6 +739,7 @@ test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain
 test_inert_when_fleet_idle
 test_actionable_close_rewakes_with_reason
+test_gone_close_rewakes_with_reason
 test_actionable_close_with_live_successor_rewakes_once
 test_failed_close_rewakes_with_failure_banner
 test_failed_cycles_notify_once_and_keep_retrying

@@ -313,6 +313,14 @@ hash_text() {
   fi
 }
 
+# Signature a primed .seen-* marker must hold so the per-poll signal scan does not
+# fire on a pre-existing status (mirrors fm-watch.sh's stat_sig exactly). Any
+# fixture that writes a status file up front and then asserts on a LATER wake
+# needs this, or the status's own first sighting fires first and masks the case.
+seen_sig() {
+  if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
+}
+
 dead_pid() {
   local p=999999
   while kill -0 "$p" 2>/dev/null; do

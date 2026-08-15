@@ -179,7 +179,11 @@ fm_backend_agent_state tmux live:worker   # -> missing
 A live window running an unrecognized command reads `ambiguous` and therefore never wakes, which is what keeps this check from claiming a window that normal triage should handle.
 Both the killed-window and dead-server shapes read `missing`, so a server that dies with its session reaches the wake rather than a blind spot; the dead-server case is the one observed on 2026-08-15, when a desktop-session collapse made systemd SIGKILL an entire user control group and every pane with it.
 
-`tests/fm-watch-triage.test.sh` pins the behavior around that verdict: a killed endpoint and a dead server each wake as `gone` and never as a stale pane or a wedge, a husk shell names the working directory it fell back to, a live pane with a running agent still wedge-escalates with its unchanged wording, and an absence wakes once per episode and is absorbed after a terminal outcome.
+`tests/fm-watch-triage.test.sh` pins the behavior around that verdict: a killed endpoint and a dead server each wake as `gone` and never as a stale pane or a wedge, a husk shell names the working directory it fell back to - the firstmate root and the task's recorded project checkout both as the unisolated-work hazard they are - a live pane with a running agent still wedge-escalates with its unchanged wording, an absence wakes once per episode and is absorbed after a terminal outcome, and a declared pause whose agent exited into a husk shell keeps its `FM_PAUSE_RESURFACE_SECS` recheck instead of being silently claimed by the absorb.
+That last case needs the fake pane command set to a real shell: with no pane command the backend reads `unreadable`, and only a shell reads `dead`, which is the shape a real husk has.
+
+Detection is only half the contract, because a queued wake that no harness recognizes is never delivered.
+Each harness recognizer is exercised against the kind rather than trusted: `tests/fm-claude-stop-autoarm.test.sh` runs the real Stop hook over a watcher close carrying a `gone:` line and requires the exit-2 rewake to carry that reason instead of a broken-watcher notice, `tests/fm-watch-arm.test.sh` drives a real killed endpoint through a real arm cycle, `tests/fm-daemon.test.sh` requires the away-mode daemon to escalate it rather than self-handle it, and `tests/fm-pi-watch-extension.test.sh` runs every kind through the real close classifier of both in-process plugins, Pi's and OpenCode's - the two recognizers that cannot read the shared `FM_WAKE_REASON_PREFIX_RE`.
 
 ## Turn-end guard
 

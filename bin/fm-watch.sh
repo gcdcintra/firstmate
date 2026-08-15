@@ -402,14 +402,20 @@ clear_wedge_tracking() {  # <window>
 # backend with no recovery classifier behaving as it does today. This check
 # adds a signal; it removes none.
 #
-# Two absences are already accounted for and are absorbed to the triage log
-# rather than woken on: one after the worker reported a terminal outcome, and
-# one under a declared pause or captain hold, whose own bounded recheck cadence
-# already treats an exited agent as still waiting. endpoint_absence_expected
-# owns that pair.
+# Two absences are already accounted for and are logged rather than woken on:
+# one after the worker reported a terminal outcome, and one under a declared
+# pause or captain hold, whose own bounded recheck cadence already treats an
+# exited agent as still waiting. endpoint_absence_expected owns that pair, and
+# naming which of the two applied is its job because the triage log is the only
+# place an absorb is ever visible. Neither is claimed: an absence this check
+# declines to report stays on the path it would have taken, or absorbing it here
+# would silently cancel the very cadence that made it safe to absorb.
 
 # 0 when this window's absence is already accounted for, so reporting it as a
-# fault would be wrong rather than merely noisy.
+# fault would be wrong rather than merely noisy. Prints WHICH of the two cases
+# applied: the absorb is only ever visible in the triage log, and a pause
+# absorbed under the wrong cause sends the next person debugging it at the wrong
+# question.
 endpoint_absence_expected() {  # <window>
   local w=$1 task last
   task=$(window_to_task "$w" "$STATE")
@@ -417,42 +423,56 @@ endpoint_absence_expected() {  # <window>
   last=$(last_status_line "$STATE/$task.status")
   # The worker reported a terminal outcome: firstmate may already be tearing
   # this endpoint down, and its disappearance is the expected next step.
-  status_is_terminal_verb "$last" && return 0
+  if status_is_terminal_verb "$last"; then
+    printf 'worker already reported a terminal outcome'
+    return 0
+  fi
   # A declared pause or captain hold already owns the exited-agent case on its
   # own bounded recheck cadence (pause_state_class, PAUSE_RESURFACE_SECS), and
   # deliberately treats a confidently-exited agent as still paused rather than
   # as a wedge. Claiming it here would convert a chosen long wait into a fault
   # report and change behavior this check is meant to leave alone.
-  status_is_paused_or_captain_held "$last"
+  status_is_paused_or_captain_held "$last" || return 1
+  printf 'declared pause or captain hold, which rechecks an exited agent on its own cadence'
 }
 
 # A trailing clause naming where a husk shell is sitting, when that is itself a
-# hazard. The primary checkout is called out by name because work started there
-# would not be isolated in a task worktree at all; any other drift off the
-# recorded worktree is reported more plainly. Silent when the backend cannot
-# resolve a cwd, or when the shell is where it belongs.
+# hazard. A primary checkout is called out by name because work started there
+# would not be isolated in a task worktree at all - the one thing the worktree
+# contract exists to prevent - and there are two of them: this firstmate home's
+# own root, and the task's recorded `project=` checkout, which is where crew
+# panes are created (bin/fm-spawn.sh) and therefore the fallback actually
+# observed. Any other drift off the recorded worktree is reported more plainly.
+# Silent when the backend cannot resolve a cwd, or when the shell is where it
+# belongs - checked first, so a task whose worktree IS its project checkout is
+# never accused of the drift it does not have.
 endpoint_cwd_note() {  # <window>
-  local w=$1 task meta cwd worktree
+  local w=$1 task meta cwd worktree project
   cwd=$(fm_backend_current_path "$(window_backend "$w")" "$w" 2>/dev/null) || return 0
   [ -n "$cwd" ] || return 0
-  if [ "$cwd" = "$FM_ROOT" ]; then
-    printf ', and its shell fell back to the primary checkout %s - anything started there would not be isolated in a task worktree' "$cwd"
-    return 0
-  fi
   task=$(window_to_task "$w" "$STATE")
   meta="$STATE/$task.meta"
   worktree=$(grep '^worktree=' "$meta" 2>/dev/null | cut -d= -f2- || true)
-  [ -n "$worktree" ] && [ "$cwd" != "$worktree" ] &&
+  [ -n "$worktree" ] && [ "$cwd" = "$worktree" ] && return 0
+  project=$(grep '^project=' "$meta" 2>/dev/null | cut -d= -f2- || true)
+  if [ "$cwd" = "$FM_ROOT" ] || { [ -n "$project" ] && [ "$cwd" = "$project" ]; }; then
+    printf ', and its shell fell back to the primary checkout %s - anything started there would not be isolated in a task worktree' "$cwd"
+    return 0
+  fi
+  [ -n "$worktree" ] &&
     printf ', and its shell is at %s rather than the task worktree %s' "$cwd" "$worktree"
   return 0
 }
 
-# Classify <window>'s endpoint and wake once per absence episode. Returns 0 when
-# this window's absence has been claimed - waking, or deliberately absorbed - so
-# the caller skips the wedge path that cannot describe it; 1 when the endpoint
-# is (or may still be) a working agent and normal triage should proceed.
+# Classify <window>'s endpoint and wake once per absence episode. Returns 0 ONLY
+# when this window's absence has been reported, so the caller skips the wedge
+# path that cannot describe it. Returns 1 when the endpoint is (or may still be)
+# a working agent, and equally when the absence is one of the two already
+# accounted for: an absence this check declines to report must leave the window
+# on exactly the path it would have taken, because the declared-pause and
+# captain-hold recheck cadence that owns that case only runs on that path.
 endpoint_absence_check() {  # <window>
-  local w=$1 verdict key seen prev count reason detail
+  local w=$1 verdict key seen prev count reason detail expected
   verdict=$(fm_backend_agent_state "$(window_backend "$w")" "$w" 2>/dev/null) || verdict=
   key=$(window_key "$w")
   case "$verdict" in
@@ -475,10 +495,17 @@ endpoint_absence_check() {  # <window>
   # One wake per episode: an absent endpoint does not come back on its own, and
   # a fleet-wide kill would otherwise re-wake for every dead window every poll.
   [ "$(cat "$STATE/.gone-$key" 2>/dev/null || true)" = "$verdict" ] && return 0
-  if endpoint_absence_expected "$w"; then
-    printf '%s' "$verdict" > "$STATE/.gone-$key"
-    triage_log "absorbed gone endpoint ($verdict; worker already reported a terminal outcome): $w"
-    return 0
+  if expected=$(endpoint_absence_expected "$w"); then
+    # Deliberately neither claimed nor marked delivered. Claiming it would skip
+    # the pause/captain-hold cadence that is the whole reason this case is
+    # absorbed, and marking it delivered would spend the episode's one wake on a
+    # wake that never fired - so a status that later moves off the accounted-for
+    # verb (`resolved:` is not terminal) could never wake gone. Logged on the
+    # poll that confirms the verdict, so the absorb is visible once per episode
+    # rather than on every poll for as long as the wait lasts.
+    [ "$count" -eq "$ENDPOINT_ABSENCE_CONFIRM_POLLS" ] &&
+      triage_log "absorbed gone endpoint ($verdict; $expected): $w"
+    return 1
   fi
   case "$verdict" in
     missing)

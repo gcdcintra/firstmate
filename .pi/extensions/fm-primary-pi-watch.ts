@@ -148,9 +148,16 @@ function markLoaded(): void {
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
 }
 
+// The wake-reason prefix set. bin/fm-classify-lib.sh's FM_WAKE_REASON_PREFIX_RE
+// is its one owner; this is the single unavoidable second copy, because an
+// extension loaded into Pi's process cannot source a bash library. A kind
+// missing here is not silence but a false alarm: an unrecognized close is
+// classified below as "watcher: FAILED", which would send a supervisor hunting
+// a broken watcher instead of the dead worker the watcher actually reported.
+// tests/fm-pi-watch-extension.test.sh pins every kind to delivery by behavior.
 function actionableLine(output: string): string {
   const lines = output.split(/\r?\n/);
-  return lines.find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line)) || "";
+  return lines.find((line) => /^(signal:|stale:|gone:|check:|heartbeat($|:))/.test(line)) || "";
 }
 
 function classifyClose(stdout: string, stderr: string, code: number | null, signal: NodeJS.Signals | null): CloseClassification {
