@@ -619,7 +619,9 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  # The crew is provably working on a static pane, and its pipeline activity is
+  # UNMEASURABLE (the fake's default), which credits the pane nothing - so this
+  # case keeps pinning the ladder itself rather than any tier's deferral.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · ci running'
 
   # Phase A: a high escalation threshold means the first sighting is absorbed.
@@ -1192,7 +1194,9 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  # The crew is provably working on a static pane, and its pipeline activity is
+  # UNMEASURABLE (the fake's default), which credits the pane nothing - so this
+  # case keeps pinning the ladder itself rather than any tier's deferral.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # Priming round: first sighting of this stale hash classifies and absorbs it
@@ -1290,7 +1294,7 @@ test_busy_pane_below_turn_age_bound_is_absorbed() {
   prime_turnend_seen "$state/busy-fresh.turn-ended"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -1321,7 +1325,7 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound() {
   # Phase A: past the bound, the stable-hash busy pane is absorbed but starts
   # the wedge timer (mirrors the existing provably-working-stale Phase A/B).
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -1334,7 +1338,7 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "a stable-hash busy pane did not wedge-escalate past the turn-age bound"
@@ -1363,7 +1367,7 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
   # Phase A: first sight past the bound absorbs and starts the wedge timer,
   # without ever needing the "genuinely stale" hash-match path.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -1378,7 +1382,7 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "a changing-hash busy pane did not wedge-escalate past the turn-age bound"
@@ -1408,7 +1412,7 @@ test_busy_pane_turn_end_touch_resets_age() {
   prime_turnend_seen "$state/busy-reset.turn-ended"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=3600 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=3600 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -1440,7 +1444,7 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
   # Priming round: first sighting past the turn-age bound absorbs and starts
   # the wedge timer, mirroring the existing provably-working wedge tests.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -1453,7 +1457,7 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
     echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-      FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
     wait_for_exit "$pid" 40 || fail "busy turn-age escalation round $n did not escalate: $(cat "$out")"
@@ -1595,7 +1599,7 @@ test_long_productive_turn_is_not_escalated_as_a_wedge() {
   # Phase A: no escalation is due yet, so the watcher just matures the window
   # by measuring the real process on each poll.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1611,7 +1615,7 @@ test_long_productive_turn_is_not_escalated_as_a_wedge() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1629,7 +1633,7 @@ test_long_productive_turn_is_not_escalated_as_a_wedge() {
   case "$deferrals" in ''|*[!0-9]*) deferrals=0 ;; esac
   [ "$deferrals" -eq 1 ] \
     || { cpu_reap_kids; fail "a pane deferring across several polls logged $deferrals deferral lines instead of one for the episode: $(cat "$state/.watch-triage.log" 2>/dev/null)"; }
-  [ -s "$state/.cpu-defer-since-$key" ] \
+  [ -s "$state/.wedge-defer-since-$key" ] \
     || { cpu_reap_kids; fail "the deferral episode recorded no start epoch to bound the pane's budget with"; }
   cpu_reap_kids
   pass "a worker inside a long productive turn is not escalated as a possible wedge while its CPU counter keeps moving, and its deferral is logged once per episode"
@@ -1659,7 +1663,7 @@ test_deferral_epoch_latches_and_is_never_refreshed() {
   # Phase A: mature the sampling window against the real process, with no
   # escalation due yet.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1675,19 +1679,19 @@ test_deferral_epoch_latches_and_is_never_refreshed() {
   echo $(( $(date +%s) - 3 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 \
     FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_numeric_file "$state/.cpu-defer-since-$key" 100; then
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 100; then
     cpu_reap_kids; reap "$pid"; fail "the watcher never opened a deferral episode to latch: $(cat "$out")"
   fi
-  epoch=$(cat "$state/.cpu-defer-since-$key")
+  epoch=$(cat "$state/.wedge-defer-since-$key")
   if ! wait_live "$pid" 45; then
     cpu_reap_kids; reap "$pid"; fail "a productive long turn was escalated while its budget was unspent: $(cat "$out")"
   fi
   reap "$pid"
-  later=$(cat "$state/.cpu-defer-since-$key" 2>/dev/null || true)
+  later=$(cat "$state/.wedge-defer-since-$key" 2>/dev/null || true)
   [ "$later" = "$epoch" ] \
     || { cpu_reap_kids; fail "the deferral epoch was refreshed across deferring polls ($epoch -> $later), so the budget could never latch"; }
 
@@ -1706,7 +1710,7 @@ test_deferral_epoch_latches_and_is_never_refreshed() {
   echo $(( $(date +%s) - 2 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 \
     FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS="$cap" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1739,7 +1743,7 @@ test_spent_deferral_budget_escalates_on_the_normal_cadence() {
   seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1752,13 +1756,13 @@ test_spent_deferral_budget_escalates_on_the_normal_cadence() {
 
   # This pane opened its deferral episode a full budget ago and is still
   # burning CPU - the spin-loop shape the predicate cannot tell from work.
-  echo $(( $(date +%s) - 3700 )) > "$state/.cpu-defer-since-$key"
+  echo $(( $(date +%s) - 3700 )) > "$state/.wedge-defer-since-$key"
   n=1
   while [ "$n" -le 3 ]; do
     echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-      FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
       FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
@@ -1799,7 +1803,7 @@ test_hung_worker_still_escalates_with_its_evidence() {
   seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1813,7 +1817,7 @@ test_hung_worker_still_escalates_with_its_evidence() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1841,7 +1845,7 @@ test_unmeasurable_worker_still_escalates() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1864,7 +1868,7 @@ test_cpu_progress_deferral_is_bounded() {
   seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1876,7 +1880,7 @@ test_cpu_progress_deferral_is_bounded() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
     FM_CPU_PROGRESS_WINDOW=2 FM_CPU_PROGRESS_MAX_DEFER_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -1956,7 +1960,7 @@ test_idle_at_prompt_stale_is_never_deferred() {
     || { unset FM_FAKE_CREW_STATE; fail "the idle-at-prompt escalation did not flag a possible wedge: $(cat "$out")"; }
   grep -F "no exact busy verdict" "$out" >/dev/null \
     || { unset FM_FAKE_CREW_STATE; fail "the escalation did not say why the CPU reading was not allowed to defer: $(cat "$out")"; }
-  [ ! -e "$state/.cpu-defer-since-$key" ] \
+  [ ! -e "$state/.wedge-defer-since-$key" ] \
     || { unset FM_FAKE_CREW_STATE; fail "a non-busy pane opened a deferral episode"; }
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
     || { unset FM_FAKE_CREW_STATE; fail "drain after the idle-at-prompt escalation failed"; }
@@ -1988,7 +1992,7 @@ test_long_turn_keeps_its_busy_verdict_and_still_defers() {
   # poll with no window yet reads `unknown` and would escalate for that reason
   # rather than for anything to do with the turn's age.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -2005,7 +2009,7 @@ test_long_turn_keeps_its_busy_verdict_and_still_defers() {
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -2015,7 +2019,7 @@ test_long_turn_keeps_its_busy_verdict_and_still_defers() {
   fi
   reap "$pid"
   [ ! -s "$out" ] || { cpu_reap_kids; fail "a long productive turn printed a wake reason: $(cat "$out")"; }
-  [ -s "$state/.cpu-defer-since-$key" ] \
+  [ -s "$state/.wedge-defer-since-$key" ] \
     || { cpu_reap_kids; fail "a four-hour-old turn did not defer, so the busy verdict did not survive the turn length"; }
   cpu_reap_kids
   pass "a turn hours old keeps its busy verdict, so the long-turn reproduction still defers"
@@ -2036,7 +2040,7 @@ test_spent_budget_reason_does_not_claim_ongoing_suppression() {
   # Phase A: mature the sampling window, so the escalation below is decided by
   # the spent budget rather than by an unmeasurable one.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
     FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -2050,11 +2054,11 @@ test_spent_budget_reason_does_not_claim_ongoing_suppression() {
   # Phase B: budget opened 4000s ago and the cap is 3600s, so it is spent. The
   # wedge timer's own age (500s) stays far below the cap, so nothing BUT the
   # spent budget can end the deferral here.
-  echo $(( $(date +%s) - 4000 )) > "$state/.cpu-defer-since-$key"
+  echo $(( $(date +%s) - 4000 )) > "$state/.wedge-defer-since-$key"
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
     FM_CPU_PROGRESS_MAX_DEFER_SECS=3600 FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -2900,3 +2904,373 @@ test_live_but_unresponsive_pane_still_wedge_escalates
 test_gone_endpoint_wakes_once_and_absorbs_after_a_terminal_outcome
 test_paused_husk_shell_keeps_its_bounded_recheck
 test_wait_for_exit_cannot_block_on_a_child_that_survives_sigterm
+
+# --- the ordered evidence hierarchy before a wedge escalation ---------------
+#
+# Observed 2026-08-15: workers were escalated as possible wedges while three
+# better signals sat unread. The one signal the alarm did consult - the CPU
+# counter of the worker's own PANE process - is measured on a process that is
+# CORRECT to be near-idle for most of a ship task's life, because during a
+# validation run the work happens in the pipeline's separate agent. These cases
+# pin the hierarchy that replaced it (bin/fm-wedge-evidence-lib.sh) in BOTH
+# directions: what it now absorbs, and - the part that matters more - every
+# genuine wedge shape it must still escalate, plus the demand-deep-inspection
+# ladder that caught the delegation wedge no signal could see.
+#
+# The CPU tier is deliberately left unmeasurable in these cases (no spinning
+# fixture, so the worker pid never resolves), which isolates the tier under test.
+
+pipeline_wedge_phase_a() {  # <dir> <window> <key> -> start the wedge timer, absorbed
+  local dir=$1 window=$2 key=$3 state="$1/state" fakebin="$1/fakebin" pid
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$dir/phase-a.out" &
+  pid=$!
+  wait_numeric_file "$state/.stale-since-$key" 40 \
+    || { reap "$pid"; fail "the busy-turn fixture never started a wedge timer: $(cat "$dir/phase-a.out")"; }
+  reap "$pid"
+}
+
+test_advancing_pipeline_run_defers_the_wedge() {
+  local dir state fakebin out window key pid
+  window="test:fm-pipe-active"
+  dir=$(cpu_wedge_case pipeline-active "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step document, active 34m, last activity 24s' \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; fail "an advancing pipeline run did not open a deferral episode: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "a worker idle by design during an advancing pipeline run was escalated: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "an advancing pipeline run printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "an advancing pipeline run queued a wake"; }
+  reap "$pid"
+  grep -F 'the attributed pipeline run is advancing' "$state/.watch-triage.log" >/dev/null \
+    || fail "the deferral did not record which evidence held the escalation back: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  pass "a worker idle by design while its attributed pipeline run advances is not escalated as a wedge"
+}
+
+test_parked_pipeline_run_still_escalates_and_names_the_overridden_busy_verdict() {
+  local dir state fakebin out window key pid
+  window="test:fm-pipe-parked"
+  dir=$(cpu_wedge_case pipeline-parked "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='parked the attributed pipeline run is parked at review waiting for this worker to answer it' \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a worker whose pipeline is parked on IT did not escalate: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "a parked pipeline run did not escalate as a possible wedge: $(cat "$out")"
+  grep -F "waiting for this worker to answer it" "$out" >/dev/null \
+    || fail "the escalation did not say the pipeline is waiting on this worker: $(cat "$out")"
+  grep -F "the harness still reports this turn busy (pi-ext)" "$out" >/dev/null \
+    || fail "the escalation did not name the authoritative busy verdict it overrode: $(cat "$out")"
+  pass "a run parked on the worker earns nothing, and the escalation names the busy verdict it overrode"
+}
+
+test_quiet_pipeline_run_still_escalates() {
+  local dir state fakebin out window key pid
+  window="test:fm-pipe-quiet"
+  dir=$(cpu_wedge_case pipeline-quiet "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='quiet the attributed pipeline run is at step review (active 2h) but its own activity clock reads quiet 22m' \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a stalled pipeline did not escalate: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "a quiet pipeline clock did not escalate as a possible wedge: $(cat "$out")"
+  grep -F "activity clock reads quiet" "$out" >/dev/null \
+    || fail "the escalation did not carry the quiet pipeline reading: $(cat "$out")"
+  pass "a pipeline whose own activity clock has gone quiet earns nothing and still escalates"
+}
+
+# The delegation shape (fm-crew-delegation-invisible-wedge): a worker blocked on
+# a helper process for hours while its pipeline carries on without it. Every
+# signal reads healthy, so tier 3 really does defer it - which is exactly why
+# the pipeline cap and the ladder must both survive. This case pins that the
+# deferral ends at the cap and that consecutive escalations still reach
+# demand-deep-inspection, the one rule that caught that wedge.
+test_pipeline_deferral_is_bounded_and_still_reaches_demand_deep_inspection() {
+  local dir state fakebin out window key pid n
+  window="test:fm-pipe-capped"
+  dir=$(cpu_wedge_case pipeline-capped "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  # The episode opened 4000s ago against a 3600s cap, so the pipeline's credit
+  # is spent while the wedge timer itself stays young - nothing BUT the spent
+  # budget can end the deferral here.
+  echo $(( $(date +%s) - 4000 )) > "$state/.wedge-defer-since-$key"
+
+  n=1
+  while [ "$n" -le 3 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step document, active 2h, last activity 12s' \
+      FM_WEDGE_PIPELINE_MAX_DEFER_SECS=3600 \
+      FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 60 \
+      || { reap "$pid"; fail "round $n: a pipeline past its deferral cap kept deferring: $(cat "$out")"; }
+    grep -F "escalation $n" "$out" >/dev/null \
+      || fail "round $n did not report escalation count $n: $(cat "$out")"
+    grep -F "the attributed pipeline run is at step document" "$out" >/dev/null \
+      || fail "round $n dropped the pipeline evidence from its escalation: $(cat "$out")"
+    # ...and that reading, carried alone, reads like healthy progress. The
+    # escalation has to say the allowance behind it latched, or it arrives
+    # carrying the exact sentence a supervisor dismisses it by.
+    grep -F "pipeline-activity deferral allowance is spent" "$out" >/dev/null \
+      || fail "round $n let an advancing-pipeline reading stand without naming its spent allowance: $(cat "$out")"
+    if [ "$n" -lt 3 ]; then
+      grep -F "demand-deep-inspection" "$out" >/dev/null \
+        && fail "round $n demanded deep inspection before the threshold: $(cat "$out")"
+    else
+      grep -F "demand-deep-inspection" "$out" >/dev/null \
+        || fail "round $n (threshold) did not demand deep inspection: $(cat "$out")"
+    fi
+    n=$((n + 1))
+  done
+  pass "pipeline deferral is bounded, and a worker blocked behind an advancing pipeline still reaches demand-deep-inspection"
+}
+
+# The other clock that ends the pipeline allowance, and the one that ends it
+# FIRST: the wedge timer starts before the deferral episode does and is only
+# reset by a wake, so a pane deferring on an advancing run reaches the cap on
+# its own age while the episode is still short of it. That makes this the first
+# alarm raised after an hour of silence - the one that most needs to say the
+# allowance is spent rather than reading like healthy progress.
+test_pipeline_allowance_spent_by_pane_age_says_so_in_the_escalation() {
+  local dir state fakebin out window key pid
+  window="test:fm-pipe-aged"
+  dir=$(cpu_wedge_case pipeline-aged "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  # No episode record at all, and a wedge timer already past the cap: the pane's
+  # own age is the only thing here that can end the deferral.
+  rm -f "$state/.wedge-defer-since-$key"
+  echo $(( $(date +%s) - 4000 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step document, active 2h, last activity 12s' \
+    FM_WEDGE_PIPELINE_MAX_DEFER_SECS=3600 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a pane aged past the pipeline cap kept deferring on its advancing run: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "a pane past the pipeline cap did not escalate as a possible wedge: $(cat "$out")"
+  grep -F "the attributed pipeline run is at step document" "$out" >/dev/null \
+    || fail "the escalation dropped the pipeline reading it still carries: $(cat "$out")"
+  grep -F "pipeline-activity deferral allowance is spent" "$out" >/dev/null \
+    || fail "the escalation read as healthy pipeline progress without naming the spent allowance: $(cat "$out")"
+  grep -F "past that allowance" "$out" >/dev/null \
+    || fail "the escalation did not name the clock that ended the allowance: $(cat "$out")"
+  [ ! -s "$state/.wedge-defer-since-$key" ] \
+    || fail "an escalating pane opened a deferral episode it was never granted: $(cat "$state/.wedge-defer-since-$key")"
+  pass "a pane aged past the pipeline cap escalates and names the spent allowance instead of reading like progress"
+}
+
+# Mechanism 3 of the report: a worker that did exactly what the briefs ask -
+# declared its wait and its expected duration - was escalated as a possible
+# wedge anyway, because neither busy-turn call site read the status verb at all.
+test_declared_wait_on_a_busy_turn_gets_the_long_recheck_cadence() {
+  local dir state fakebin out window key pid id
+  window="test:fm-pipe-declared"
+  dir=$(cpu_wedge_case pipeline-declared "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  printf 'paused: fix round in flight on the validation run, roughly 30-60 min\n' > "$state/$id.status"
+  printf '%s' "$(seen_sig "$state/$id.status")" > "$state/.seen-${id}_status"
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; fail "a declared wait on a busy turn did not open its recheck window: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "a well-formed declared wait was escalated as a possible wedge: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "a declared wait inside its recheck window printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  grep -F 'declared wait on the long recheck cadence' "$state/.watch-triage.log" >/dev/null \
+    || fail "the absorb did not record the declared wait as its reason: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  pass "a well-formed declared wait on a busy turn gets the long recheck cadence, not a wedge escalation"
+}
+
+# ...and the other half, which is what keeps that from becoming silence: the
+# declaration is a CLAIM. Its rechecks count on the same ladder as any
+# escalation, so an inaccurate declaration still reaches demand-deep-inspection -
+# and at that point the reason switches to the wedge form, because the away-mode
+# daemon force-escalates only on that segment.
+test_declared_wait_rechecks_count_on_the_ladder_and_reach_demand_deep_inspection() {
+  local dir state fakebin out window key pid id n
+  window="test:fm-pipe-declared-ladder"
+  dir=$(cpu_wedge_case pipeline-declared-ladder "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  printf 'paused: waiting on the review gate, roughly 30-60 min\n' > "$state/$id.status"
+  printf '%s' "$(seen_sig "$state/$id.status")" > "$state/.seen-${id}_status"
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+
+  n=1
+  while [ "$n" -le 3 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    # A 1s recheck cadence stands in for the production hour, so each round is
+    # due immediately and the ladder is the only thing that changes.
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=1 \
+      FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 60 \
+      || { reap "$pid"; fail "round $n: a declared wait past its recheck cadence produced no wake: $(cat "$out")"; }
+    grep -F "stale: $window" "$out" >/dev/null \
+      || fail "round $n did not surface a stale wake: $(cat "$out")"
+    if [ "$n" -lt 3 ]; then
+      grep -F "declared wait, recheck $n" "$out" >/dev/null \
+        || fail "round $n was not worded as a declared-wait recheck: $(cat "$out")"
+      grep -F "possible wedge" "$out" >/dev/null \
+        && fail "round $n mislabeled a declared-wait recheck as a possible wedge: $(cat "$out")"
+    else
+      grep -F "possible wedge" "$out" >/dev/null \
+        || fail "round $n (threshold) did not switch to the wedge form away mode force-escalates: $(cat "$out")"
+      grep -F "demand-deep-inspection" "$out" >/dev/null \
+        || fail "round $n (threshold) did not demand deep inspection: $(cat "$out")"
+    fi
+    n=$((n + 1))
+  done
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] \
+    || fail "declared-wait rechecks did not accumulate on the shared escalation ladder"
+  pass "declared-wait rechecks count on the same ladder, so an inaccurate declaration still reaches demand-deep-inspection"
+}
+
+# One deferral episode per pane, shared by every tier: a spent episode disables
+# the declared wait too, so tiers cannot be chained into a longer silence than
+# the longest single cap.
+test_spent_episode_disables_the_declared_wait_too() {
+  local dir state fakebin out window key pid id
+  window="test:fm-pipe-declared-spent"
+  dir=$(cpu_wedge_case pipeline-declared-spent "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  printf 'paused: waiting on the review gate, roughly 30-60 min\n' > "$state/$id.status"
+  printf '%s' "$(seen_sig "$state/$id.status")" > "$state/.seen-${id}_status"
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  echo $(( $(date +%s) - 4000 )) > "$state/.wedge-defer-since-$key"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS=3600 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a declared wait past its spent recheck allowance kept absorbing: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "a spent recheck allowance did not return the pane to the wedge cadence: $(cat "$out")"
+  grep -F "recheck allowance is spent" "$out" >/dev/null \
+    || fail "the escalation did not say the declaration's allowance was spent: $(cat "$out")"
+  pass "the shared deferral episode is spent once, so a declared wait cannot extend it past its own cap"
+}
+
+# The other half of the wrong-process case: a provably-working crew whose PANE
+# is legitimately static (waiting on CI, say) reaches the wedge timer through
+# the non-busy path, where the CPU tier is deliberately never consulted. The
+# pipeline tier applies there too, because it measures the pipeline rather than
+# the pane and so does not share the idle-prompt overlap that keeps the CPU tier
+# restricted. bin/fm-wedge-evidence-lib.sh's limits list owns the residual that
+# buys.
+test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case pipeline-nonbusy); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-pipe-nonbusy"
+  printf 'idle waiting on ci' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/pipe-nonbusy.meta"
+  printf 'working: still monitoring ci\n' > "$state/pipe-nonbusy.status"
+  sig=$(seen_sig "$state/pipe-nonbusy.status"); printf '%s' "$sig" > "$state/.seen-pipe-nonbusy_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle waiting on ci")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '1\n' > "$state/.count-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step ci, active 18m, last activity 31s' \
+    FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a non-busy provably-working stale did not defer on its advancing pipeline: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a crew whose pane is static while its pipeline advances was escalated: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a deferred non-busy stale printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a provably-working crew whose pane is static while its pipeline advances is deferred on the non-busy path too"
+}
+
+test_advancing_pipeline_run_defers_the_wedge
+test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline
+test_parked_pipeline_run_still_escalates_and_names_the_overridden_busy_verdict
+test_quiet_pipeline_run_still_escalates
+test_pipeline_deferral_is_bounded_and_still_reaches_demand_deep_inspection
+test_pipeline_allowance_spent_by_pane_age_says_so_in_the_escalation
+test_declared_wait_on_a_busy_turn_gets_the_long_recheck_cadence
+test_declared_wait_rechecks_count_on_the_ladder_and_reach_demand_deep_inspection
+test_spent_episode_disables_the_declared_wait_too

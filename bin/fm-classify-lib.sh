@@ -14,13 +14,17 @@
 # daemon keeps its escalation-digest seen-markers; the watcher keeps its .seen-*
 # signatures).
 #
-# The one exception is the absorb classification (crew_absorb_class and its
+# One exception is the absorb classification (crew_absorb_class and its
 # working/paused wrappers). It is NOT a pure status-file read: it reuses
 # bin/fm-crew-state.sh, which may make a bounded no-mistakes call, to decide
 # whether a crew that just stopped its turn or went stale is working, deliberately
 # paused, or neither. Callers run it ONLY on no-verb signal handling and first
 # sighting of a stale hash, never on every wake, so the per-wake triage stays
 # cheap.
+#
+# The other is fm_wedge_markers_clear, the one function here that WRITES. It owns
+# the marker set both supervisors reset together, which belongs with the other
+# watcher/daemon contracts below rather than copied into each consumer.
 
 # Directory of this library, used to locate the sibling fm-crew-state.sh reader.
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
@@ -116,6 +120,33 @@ FM_WAKE_REASON_PREFIX_RE='^(signal:|stale:|gone:|check:|heartbeat($|:))'
 # fm-decision-hold.sh has verified the corresponding captain-held backlog item.
 FM_CLASSIFY_RESOLVE_VERB_DEFAULT='resolved'
 FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT='captain-held'
+
+# The wedge marker set: a CONTRACT between the watcher and the away-mode daemon,
+# in the same sense as the reason segment above. A pane's wedge bookkeeping - the
+# escalation timer, the consecutive-escalation count, the rolling worker-CPU
+# anchor, the throttled pipeline-activity sample, and the deferral-episode epoch
+# shared by every evidence tier - is ONE set, reset together wherever a pane goes
+# genuinely active or moves onto the declared-pause cadence. bin/fm-watch.sh's
+# clear_wedge_tracking and bin/fm-supervise-daemon.sh's clear_pause_tracking are
+# both such resets, and both read this ONE definition rather than keeping a list
+# each: a member left behind by either one makes the watcher treat the next long
+# turn on that pane as one that had already spent its deferral, which denies
+# every soft tier at once rather than only the CPU one, because the epoch is
+# shared (bin/fm-wedge-evidence-lib.sh owns why).
+#
+# `.cpu-defer-since-<key>` is the pre-hierarchy name of that epoch, from when it
+# covered only CPU deferrals; it is removed here too so an upgraded home does not
+# keep a marker nothing reads.
+#
+# <key> is the caller's window-key transform - window_key in the watcher,
+# _stale_key in the daemon, the same `tr ':/.' '___'` on both sides - passed in so
+# this owns the marker NAMES without owning either consumer's key derivation.
+fm_wedge_markers_clear() {  # <state-dir> <window-key>
+  local state=$1 key=$2
+  rm -f "$state/.stale-since-$key" "$state/.wedge-escalations-$key" \
+    "$state/.cpu-$key" "$state/.wedge-defer-since-$key" \
+    "$state/.wedge-pipeline-$key" "$state/.cpu-defer-since-$key"
+}
 
 # Return the last non-blank line of a status file (empty if missing/blank).
 last_status_line() {

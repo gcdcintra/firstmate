@@ -164,7 +164,9 @@ Classify each wake this way:
   Nonterminal progress remains transient even when its prose contains a legacy free-text token or its seen-status marker already matches, so record a marker and self-handle.
   If the pane is still idle past `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a possible wedge.
   This bounds wedge-detection latency to the threshold plus a tick: a delay, never a loss.
-  This stale path is never deferred on CPU: the watcher reports the worker process's CPU reading in the escalation, but only a pane still inside a turn - busy with no completed turn - can have its wedge escalation held back, bounded by `FM_CPU_PROGRESS_MAX_DEFER_SECS`, which lengthens that one path's delay without making it lossy.
+  Before escalating, the watcher puts the pane through its ordered evidence hierarchy (`bin/fm-wedge-evidence-lib.sh`) and carries the whole reading into the reason, so an escalation you must dismiss can be dismissed by reading it.
+  Each tier that may hold an escalation back is capped against one shared per-pane deferral episode, which lengthens those paths' delay without making them lossy; the CPU tier in particular stays restricted to a pane still inside a turn - busy with no completed turn.
+  A declared wait below the deep-inspection threshold arrives as a recheck without the possible-wedge segment, so it classifies here as the pause it declares; at the threshold it switches to the wedge form below.
   A wedge escalation the watcher prints carries the shared possible-wedge reason segment (`FM_CLASSIFY_WEDGE_REASON_SEGMENT`, owned by `bin/fm-classify-lib.sh`) and is force-escalated ahead of the absorption above, because housekeeping's recheck drops a stale marker for a pane that still looks busy and a worker wedged mid-turn would otherwise never reach you.
   Healthy crewmates are autonomous and do not wait on firstmate mid-task.
 - `gone` -> always escalate. The watcher only sends this when the backend confidently reports the endpoint killed or left running a bare shell, which never clears on its own, and relaunching a worker is a supervision decision the daemon has no authority to make.

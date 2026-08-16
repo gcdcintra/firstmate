@@ -127,13 +127,26 @@ SH
 # A per-id override FM_FAKE_CREW_STATE_<sanitized-id> wins; otherwise the shared
 # FM_FAKE_CREW_STATE; otherwise an unknown verdict (NOT provably working), the
 # safe default so a test that forgets to set one surfaces rather than absorbs.
+#
+# The same fake answers the reader's --pipeline-activity mode, which the wedge
+# evidence hierarchy reads for the attributed pipeline run's own activity clock,
+# from FM_FAKE_PIPELINE_ACTIVITY (or a per-id FM_FAKE_PIPELINE_ACTIVITY_<id>).
+# Its default is `unknown`, which earns a pane nothing, so every pre-existing
+# case keeps escalating exactly as it did before that tier existed.
 make_fake_crew_state() {  # <fakebin>
   local fakebin=$1
   cat > "$fakebin/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
 set -u
 id=${1:-}
+mode=${2:-}
 key=$(printf '%s' "$id" | tr -c 'A-Za-z0-9' '_')
+if [ "$mode" = --pipeline-activity ]; then
+  var="FM_FAKE_PIPELINE_ACTIVITY_$key"
+  val=${!var:-${FM_FAKE_PIPELINE_ACTIVITY:-}}
+  printf '%s\n' "${val:-unknown fake default}"
+  exit 0
+fi
 var="FM_FAKE_CREW_STATE_$key"
 val=${!var:-${FM_FAKE_CREW_STATE:-}}
 printf '%s\n' "${val:-state: unknown · source: none · fake default}"

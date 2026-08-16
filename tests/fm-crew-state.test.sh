@@ -68,6 +68,9 @@ make_fakebin() {  # <dir> -> echoes fakebin path
   cat > "$fb/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 set -u
+# Every invocation's argv, when a case asks for it: which bounded CLI calls a
+# read actually pays for is part of that read's contract, not an internal.
+[ -n "${FM_FAKE_NM_CALLS:-}" ] && printf '%s\n' "$*" >> "$FM_FAKE_NM_CALLS"
 case "${1:-}" in
   axi)
     shift
@@ -185,8 +188,10 @@ reset_fakes() {
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
   FM_FAKE_STEP_LOGS=""
+  FM_FAKE_NM_CALLS=""
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS FM_FAKE_STEP_LOGS
+  export FM_FAKE_NM_CALLS
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -1658,5 +1663,279 @@ test_both_terminal_newest_passed_outranks_older_failed_row
 test_new_run_before_first_step_binds_by_head
 test_abandoned_active_run_after_local_rewrite_not_attributed
 test_single_live_run_with_gate_only_head_binds
+
+# --- (m) --pipeline-activity: the PIPELINE's own clock ----------------------
+#
+# The wedge alarm used to measure only the worker's pane process, which is
+# correct to be near-idle for the whole of a validation run because the work
+# happens in the pipeline's separate agent. This mode reports that other
+# process, reusing the SAME attribution as every case above so a sibling crew's
+# live run can never be credited to a quiet pane. Only `active` is evidence of
+# progress; every unmeasurable case is `unknown` and must earn a caller nothing.
+
+run_active_steps() {  # <branch> <step> <last-activity>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: running
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    $2,running,0,0
+  active_steps[1]{step,active_for,last_activity,agent_pid,round}:
+    $2,12m4s,$3,4242,round 1
+EOF
+}
+
+# The same table with its columns reordered, to prove the reader binds by column
+# NAME from the header rather than by position - a later CLI release that adds
+# or moves a column must yield an empty field (hence `unknown`) rather than a
+# confidently wrong one.
+run_active_steps_reordered() {  # <branch> <step> <last-activity>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: running
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+  active_steps[1]{round,agent_pid,last_activity,active_for,step}:
+    round 1,4242,$3,12m4s,$2
+EOF
+}
+
+run_pipeline_activity() {  # <case-dir> <id>
+  PATH="$1/fakebin:$PATH" FM_STATE_OVERRIDE="$1/state" "$CREW_STATE" "$2" --pipeline-activity
+}
+
+# Sets PA_DIR rather than echoing it: make_repo_on_branch exports the worktree
+# HEAD the run fixtures bind against, and an export inside a command
+# substitution would never reach the caller.
+PA_DIR=""
+pipeline_case() {  # <name> <id> <branch> [kind]
+  local name=$1 id=$2 branch=$3 kind=${4:-ship}
+  PA_DIR=$(new_case "$name")
+  make_repo_on_branch "$PA_DIR/wt" "$branch"
+  make_fakebin "$PA_DIR" >/dev/null
+  fm_write_meta "$PA_DIR/state/$id.meta" "window=fm:fm-$id" "worktree=$PA_DIR/wt" "kind=$kind" \
+    "harness=claude"
+}
+
+test_pipeline_activity_advancing_run_is_active() {
+  reset_fakes
+  local d out; pipeline_case pa-active pa-active fm/pa-active; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-active review 24s)"
+  out=$(run_pipeline_activity "$d" pa-active)
+  assert_contains "$out" "active " "an advancing run reports active"
+  assert_contains "$out" "step review" "the active class names the step it read"
+  assert_contains "$out" "last activity 24s" "the active class carries the clock it read"
+  pass "an attributed run whose activity clock is fresh reports active"
+}
+
+test_pipeline_activity_reads_columns_by_name() {
+  reset_fakes
+  local d out; pipeline_case pa-reorder pa-reorder fm/pa-reorder; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_active_steps_reordered fm/pa-reorder document 8s)"
+  out=$(run_pipeline_activity "$d" pa-reorder)
+  assert_contains "$out" "active " "a reordered active_steps table still reports active"
+  assert_contains "$out" "step document" "the step came from the named column, not a position"
+  assert_contains "$out" "last activity 8s" "the clock came from the named column, not a position"
+  pass "the active-step reader binds columns by name, so a reordered table is still read correctly"
+}
+
+test_pipeline_activity_quiet_clock_earns_nothing() {
+  reset_fakes
+  local d out; pipeline_case pa-quiet pa-quiet fm/pa-quiet; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-quiet review "quiet 12m")"
+  out=$(run_pipeline_activity "$d" pa-quiet)
+  assert_contains "$out" "quiet " "a quiet clock on a non-ci step reports quiet, not active"
+  assert_not_contains "$out" "active the" "a quiet clock is never reported as progress"
+  pass "an attributed run whose own clock has gone quiet is not reported as progress"
+}
+
+test_pipeline_activity_quiet_ci_monitor_is_active() {
+  reset_fakes
+  local d out; pipeline_case pa-ci pa-ci fm/pa-ci; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-ci ci "quiet 41m")"
+  out=$(run_pipeline_activity "$d" pa-ci)
+  assert_contains "$out" "active " "a quiet CI monitor is still active"
+  assert_contains "$out" "waits on the forge" "the ci exception says why quiet is expected there"
+  pass "a quiet CI monitor is active, because that step waits on the forge and writes no step log"
+}
+
+test_pipeline_activity_parked_run_earns_nothing() {
+  reset_fakes
+  local d out; pipeline_case pa-parked pa-parked fm/pa-parked; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_parked fm/pa-parked)"
+  out=$(run_pipeline_activity "$d" pa-parked)
+  assert_contains "$out" "parked " "a gate-parked run reports parked"
+  assert_contains "$out" "waiting for this worker" "parked names who the run is waiting on"
+  pass "a run parked at a gate reports parked, because it is waiting for this worker rather than working"
+}
+
+test_pipeline_activity_other_branch_run_is_not_credited() {
+  reset_fakes
+  local d out; pipeline_case pa-other pa-other fm/pa-other; d=$PA_DIR
+  # A sibling crew's live, advancing run. Bare `axi status` answers with it when
+  # this branch has none, so an unattributed read would credit its progress to
+  # this worker - the wrong-subject defect this whole change exists to remove.
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/some-other-crew review 3s)"
+  out=$(run_pipeline_activity "$d" pa-other)
+  assert_contains "$out" "unknown " "a run this work cannot claim measures nothing here"
+  assert_not_contains "$out" "active " "another crew's advancing run is never credited to this task"
+  assert_contains "$out" "another branch (fm/some-other-crew)" "the miss names whose run it saw instead"
+  pass "an advancing run belonging to another branch is never credited to this task"
+}
+
+# The three ways attribution can miss are three different facts about a pane, and
+# this sentence is spliced into the wedge escalation a supervisor reads. The
+# dominant one - a ship crew that has simply not started a run - must not be
+# reported as a run that failed to bind.
+test_pipeline_activity_names_which_attribution_missed() {
+  reset_fakes
+  local d out
+  pipeline_case pa-nobranch pa-nobranch fm/pa-nobranch; d=$PA_DIR
+  # An answer that names no run at all.
+  FM_FAKE_AXI_STATUS=$(run_active_steps fm/pa-nobranch review 3s | grep -v '^  branch:')
+  out=$(run_pipeline_activity "$d" pa-nobranch)
+  assert_contains "$out" "unknown " "an answer naming no run measures nothing"
+  assert_contains "$out" "without naming a run" "a crew with no run yet is described as exactly that"
+  assert_not_contains "$out" "another branch" "a crew with no run yet is not blamed on a sibling's run"
+
+  reset_fakes
+  pipeline_case pa-unbound pa-unbound fm/pa-unbound; d=$PA_DIR
+  # This branch's own run, but validating code this worktree cannot see: a
+  # rewritten or superseded head, which binds nothing here.
+  FM_FAKE_RUN_HEAD=0000000000000000000000000000000000000000
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-unbound review 3s)"
+  out=$(run_pipeline_activity "$d" pa-unbound)
+  assert_contains "$out" "unknown " "a run whose head binds nothing measures nothing here"
+  assert_contains "$out" "superseded or rewritten head" "an unbindable same-branch run is named as one"
+  assert_not_contains "$out" "active " "a run validating other code is never credited to this task"
+  pass "each way attribution can miss is reported as the distinct fact it is"
+}
+
+# The coarse runs-list fallback answers "does this branch have a run at all"
+# with a status word and no activity clock, so --pipeline-activity can only
+# report `unknown` from one - which is what it reports without it. Paying a
+# second bounded CLI call plus a git walk per same-branch row to reach the same
+# answer would double the worst case of a read the watcher makes on its
+# single-threaded poll for every aging pane. The ordinary crew-state path still
+# needs that fallback (case (e)), so this pins the cost, not the behavior.
+test_pipeline_activity_never_spends_the_coarse_runs_fallback() {
+  reset_fakes
+  local d out short; pipeline_case pa-nocoarse pa-nocoarse fm/pa-nocoarse; d=$PA_DIR
+  short=$(git -C "$d/wt" rev-parse --short HEAD)
+  # A sibling crew's run answers bare `axi status`, so attribution misses - and
+  # the runs list really does carry a bindable row for THIS branch, so the
+  # fallback would return something usable if it were consulted.
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/some-other-crew review 3s)"
+  FM_FAKE_RUNS_LIST="running    fm/pa-nocoarse  $short  2026-08-16 09:14"
+  FM_FAKE_NM_CALLS="$d/nm-calls"
+  out=$(run_pipeline_activity "$d" pa-nocoarse)
+  assert_contains "$out" "unknown " "an unattributable run measures nothing, so it is unknown"
+  assert_not_contains "$out" "active " "another crew's advancing run is never credited to this task"
+  grep -q '^axi status' "$d/nm-calls" \
+    || fail "--pipeline-activity did not make the one read it needs: $(cat "$d/nm-calls" 2>/dev/null)"
+  if grep -q '^runs' "$d/nm-calls"; then
+    fail "--pipeline-activity spent the coarse runs-list call whose answer it cannot use: $(cat "$d/nm-calls")"
+  fi
+  pass "--pipeline-activity does not pay for the coarse runs-list fallback it could never use"
+}
+
+# ...and the same fallback is still spent where its answer IS usable: the
+# ordinary crew-state read, whose cross-branch attribution depends on it.
+test_ordinary_read_still_spends_the_coarse_runs_fallback() {
+  reset_fakes
+  local d out short; pipeline_case pa-coarse-kept pa-coarse-kept fm/pa-coarse-kept; d=$PA_DIR
+  short=$(git -C "$d/wt" rev-parse --short HEAD)
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/some-other-crew review 3s)"
+  FM_FAKE_RUNS_LIST="running    fm/pa-coarse-kept  $short  2026-08-16 09:14"
+  FM_FAKE_NM_CALLS="$d/nm-calls"
+  out=$(run_crew_state "$d" pa-coarse-kept)
+  assert_contains "$out" "state: working" "the coarse row still attributes this branch's own run"
+  assert_contains "$out" "background run" "the working verdict came from the coarse row, not the sibling's TOON"
+  grep -q '^runs' "$d/nm-calls" \
+    || fail "the ordinary read stopped consulting the coarse runs list it depends on: $(cat "$d/nm-calls" 2>/dev/null)"
+  pass "the ordinary crew-state read still consults the coarse runs list, which its attribution depends on"
+}
+
+test_pipeline_activity_terminal_run_is_none() {
+  reset_fakes
+  local d out; pipeline_case pa-terminal pa-terminal fm/pa-terminal; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_passed fm/pa-terminal)"
+  out=$(run_pipeline_activity "$d" pa-terminal)
+  assert_contains "$out" "none " "a terminal run is not an active pipeline"
+  pass "a terminal run reports none rather than progress"
+}
+
+test_pipeline_activity_silent_cli_is_unknown() {
+  reset_fakes
+  local d out; pipeline_case pa-silent pa-silent fm/pa-silent; d=$PA_DIR
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  out=$(run_pipeline_activity "$d" pa-silent)
+  assert_contains "$out" "unknown " "a silent CLI is unknown, never a credit"
+  pass "a CLI that does not answer is unknown, so it earns a caller nothing"
+}
+
+test_pipeline_activity_run_without_active_steps_is_unknown() {
+  reset_fakes
+  local d out; pipeline_case pa-notable pa-notable fm/pa-notable; d=$PA_DIR
+  # An attributed, non-terminal run between steps publishes no active_steps
+  # table. Crediting it would be crediting a clock that was never read.
+  FM_FAKE_AXI_STATUS="$(run_running fm/pa-notable)"
+  out=$(run_pipeline_activity "$d" pa-notable)
+  assert_contains "$out" "unknown " "an attributed run with no readable clock is unknown"
+  pass "an attributed run publishing no active step is unknown rather than credited"
+}
+
+test_pipeline_activity_scout_is_none() {
+  reset_fakes
+  local d out; pipeline_case pa-scout pa-scout fm/pa-scout scout; d=$PA_DIR
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-scout review 5s)"
+  out=$(run_pipeline_activity "$d" pa-scout)
+  assert_contains "$out" "none " "a scout never drives a run of its own"
+  pass "a scout task reports none, matching the run lookup it already skips"
+}
+
+test_pipeline_activity_torn_down_worktree_is_none() {
+  reset_fakes
+  local d out rc; d=$(new_case pa-gone)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/pa-gone.meta" "window=fm:fm-pa-gone" "worktree=$d/no-such" "kind=ship"
+  out=$(run_pipeline_activity "$d" pa-gone); rc=$?
+  expect_code 0 "$rc" "torn-down worktree exits 0 in pipeline-activity mode"
+  assert_contains "$out" "none " "a torn-down worktree has no attributed run"
+  pass "a torn-down worktree reports none in pipeline-activity mode"
+}
+
+test_pipeline_activity_rejects_unknown_mode() {
+  reset_fakes
+  local rc
+  "$CREW_STATE" some-id --not-a-mode >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "an unknown mode is a usage error"
+  pass "an unrecognized mode is a usage error rather than a silently ignored flag"
+}
+
+test_pipeline_activity_advancing_run_is_active
+test_pipeline_activity_reads_columns_by_name
+test_pipeline_activity_quiet_clock_earns_nothing
+test_pipeline_activity_quiet_ci_monitor_is_active
+test_pipeline_activity_parked_run_earns_nothing
+test_pipeline_activity_other_branch_run_is_not_credited
+test_pipeline_activity_names_which_attribution_missed
+test_pipeline_activity_never_spends_the_coarse_runs_fallback
+test_ordinary_read_still_spends_the_coarse_runs_fallback
+test_pipeline_activity_terminal_run_is_none
+test_pipeline_activity_silent_cli_is_unknown
+test_pipeline_activity_run_without_active_steps_is_unknown
+test_pipeline_activity_scout_is_none
+test_pipeline_activity_torn_down_worktree_is_none
+test_pipeline_activity_rejects_unknown_mode
 
 echo "all fm-crew-state tests passed"

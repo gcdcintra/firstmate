@@ -52,8 +52,16 @@
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
 #
+# `--pipeline-activity` is a second, narrower read of the SAME attributed run:
+# instead of the crew's state it prints how the PIPELINE's own process is doing,
+# which is the one measurement of the process that actually works during a
+# validation run (see the emit_pipeline block below). It lives here rather than
+# in its own script because it must reuse this file's branch and code-identity
+# attribution; re-deriving that elsewhere is how a sibling crew's live run would
+# get credited to a wedged pane.
+#
 # Read-only and side-effect free. Always exits 0 on a successful read regardless
-# of state; exit 2 only on a usage error (no id).
+# of state; exit 2 only on a usage error (no id, or an unknown mode).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,7 +81,13 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-quota-kill-lib.sh"
 
 ID=${1:-}
-[ -n "$ID" ] || { echo "usage: fm-crew-state.sh <id>" >&2; exit 2; }
+[ -n "$ID" ] || { echo "usage: fm-crew-state.sh <id> [--pipeline-activity]" >&2; exit 2; }
+MODE=${2:-}
+case "$MODE" in
+  ''|--pipeline-activity) : ;;
+  *) echo "usage: fm-crew-state.sh <id> [--pipeline-activity]" >&2; exit 2 ;;
+esac
+pipeline_mode() { [ "$MODE" = --pipeline-activity ]; }
 
 META="$STATE/$ID.meta"
 LOG="$STATE/$ID.status"
@@ -95,9 +109,19 @@ emit() {  # <state> <source> [detail]
   exit 0
 }
 
+# The one line --pipeline-activity prints. Class vocabulary and the rule that
+# every unmeasurable case is `unknown` live with the emit block far below.
+emit_pipeline() {  # <class> <detail>
+  printf '%s %s\n' "$1" "$2"
+  exit 0
+}
+
 # --- meta resolution --------------------------------------------------------
 
-[ -f "$META" ] || emit unknown none "no metadata for $ID"
+if [ ! -f "$META" ]; then
+  pipeline_mode && emit_pipeline unknown "no durable record for $ID, so no run can be attributed to it"
+  emit unknown none "no metadata for $ID"
+fi
 
 meta_value() {  # <key>
   grep "^$1=" "$META" 2>/dev/null | tail -1 | cut -d= -f2- || true
@@ -110,6 +134,7 @@ HARNESS=$(meta_value harness)
 
 # A torn-down (or never-created) worktree has no current state to read.
 if [ -z "$WT" ] || [ ! -d "$WT" ]; then
+  pipeline_mode && emit_pipeline none "the task worktree is gone, so no run is attributed to it"
   emit unknown none "worktree gone (torn down?)"
 fi
 
@@ -491,6 +516,28 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
+      #
+      # --pipeline-activity never pays for it. A coarse row carries a status
+      # word and no activity clock, so that mode can only answer `unknown` from
+      # one - the same answer it gives here - and spending a second bounded call
+      # plus a git walk per same-branch row to reach it would double the worst
+      # case of a read the watcher makes on its single-threaded poll for every
+      # aging pane, on exactly the panes that have no attributable run.
+      #
+      # `unknown` for all three, because this mode stops one source short of
+      # proving there is no run - but the three misses are different facts about
+      # a pane, and this sentence is read inside a wedge escalation, so a crew
+      # that has simply not started a run must not be described as one whose run
+      # failed to bind.
+      if pipeline_mode; then
+        if [ -z "$run_branch" ]; then
+          emit_pipeline unknown "the pipeline CLI answered without naming a run, so there is no activity clock to read for this work"
+        elif [ "$run_branch" != "$CREW_BRANCH" ]; then
+          emit_pipeline unknown "the only run the pipeline CLI reports is for another branch ($run_branch), so no run of this work's own could be measured"
+        else
+          emit_pipeline unknown "the run the pipeline CLI reports for this branch is validating other code - a superseded or rewritten head - so its clock is not this work's"
+        fi
+      fi
       COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
@@ -498,6 +545,114 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       fi
     fi
   fi
+fi
+
+# --- pipeline activity mode -------------------------------------------------
+#
+# The pipeline's OWN activity clock. During a validation run the crew's pane
+# process is correct to be near-idle - it is blocked in one `axi run`/`axi
+# respond` call while the work happens in the pipeline's separate agent - so
+# every measurement taken on that pane is measuring the wrong subject. The
+# installed CLI already publishes the right one: for a step whose status is
+# running or fixing, `axi status` emits an `active_steps` table carrying
+# `step`, `active_for`, `last_activity`, `agent_pid` and the current round, and
+# marks a run waiting at a gate with `awaiting_agent: parked <duration>`.
+# `last_activity` is prefixed `quiet` once no step log or native-agent
+# lifecycle event has arrived for longer than the pipeline's own
+# `step_quiet_warning`.
+#
+# Prints one line, "<class> <detail>":
+#   active   an attributed run is advancing right now
+#   quiet    an attributed run's own activity clock has gone quiet past that
+#            warning window, so it is no longer evidence of progress
+#   parked   an attributed run is waiting for THIS worker to answer a gate; a
+#            quiet worker is then the fault, never an explanation for one
+#   none     no run is attributed to this work, or its run is terminal
+#   unknown  nothing could be measured - no CLI, no answer, coarse attribution
+#            only, or an unreadable table
+# Only `active` is evidence of progress. Every other class, `unknown`
+# especially, must earn a caller nothing, so an unreadable pipeline degrades
+# toward noise and never toward blindness.
+#
+# Read the first `active_steps` row by COLUMN NAME from the table header rather
+# than by position, so a column added or reordered by a later CLI release
+# yields an empty field (hence `unknown`) instead of a confidently wrong one.
+nm_active_step_field() {  # <column-name>
+  printf '%s\n' "$RUN_OUT" | awk -v want="$1" '
+    $0 ~ /^[[:space:]]*active_steps\[[0-9]+\]\{[^}]*\}:[[:space:]]*$/ {
+      hdr = $0
+      sub(/^[^{]*\{/, "", hdr)
+      sub(/\}.*$/, "", hdr)
+      ncol = split(hdr, cols, ",")
+      idx = 0
+      for (i = 1; i <= ncol; i++) {
+        c = cols[i]
+        gsub(/^[ \t]+|[ \t]+$/, "", c)
+        if (c == want) idx = i
+      }
+      if (idx == 0) exit
+      if (getline row <= 0) exit
+      nval = split(row, vals, ",")
+      if (idx > nval) exit
+      v = vals[idx]
+      gsub(/^[ \t]+|[ \t]+$/, "", v)
+      gsub(/^"|"$/, "", v)
+      print v
+      exit
+    }'
+}
+
+if pipeline_mode; then
+  if [ "$KIND" != ship ]; then
+    emit_pipeline none "a $KIND task never drives a validation run of its own"
+  fi
+  if ! command -v no-mistakes >/dev/null 2>&1; then
+    emit_pipeline unknown "the pipeline CLI is not installed here, so its activity cannot be measured"
+  fi
+  if [ -z "$CREW_BRANCH" ]; then
+    emit_pipeline none "the task worktree is at a detached HEAD, so no run can be attributed to it"
+  fi
+  # Every other way to reach here without an attributed run already emitted
+  # above: an answering CLI whose run this work cannot claim exits at the
+  # three-way miss, so no run is left for this block but an absent answer - and
+  # nothing unattributed can reach the field parsing below.
+  if [ "$HAVE_RUN" != 1 ]; then
+    emit_pipeline unknown "the pipeline CLI did not answer within ${NM_TIMEOUT}s"
+  fi
+  PA_OUTCOME=$(strip_quotes "$(nm_field outcome)")
+  [ -n "$PA_OUTCOME" ] && emit_pipeline none "the attributed pipeline run is terminal ($PA_OUTCOME)"
+  PA_STATUS=$(strip_quotes "$(nm_field status)")
+  PA_AWAITING=$(printf '%s\n' "$RUN_OUT" | grep -E '^[[:space:]]*awaiting_agent:' | head -1 || true)
+  PA_GATE_STATUS=$(nm_gate_status)
+  PA_HAS_GATE=0
+  nm_has_gate && PA_HAS_GATE=1
+  if [ -n "$PA_AWAITING" ] || [ "$PA_STATUS" = awaiting_approval ] || [ "$PA_STATUS" = fix_review ] \
+     || [ -n "$PA_GATE_STATUS" ] || [ "$PA_HAS_GATE" = 1 ]; then
+    PA_GATE=$(nm_gate_name)
+    [ -n "$PA_GATE" ] || PA_GATE=${PA_STATUS:-a gate}
+    emit_pipeline parked "the attributed pipeline run is parked at $PA_GATE waiting for this worker to answer it"
+  fi
+  case "$PA_STATUS" in
+    completed|failed|cancelled) emit_pipeline none "the attributed pipeline run is terminal ($PA_STATUS)" ;;
+  esac
+  PA_STEP=$(nm_active_step_field step)
+  [ -n "$PA_STEP" ] || emit_pipeline unknown "the attributed pipeline run reports no active step, so its activity clock cannot be read"
+  PA_FOR=$(nm_active_step_field active_for); [ -n "$PA_FOR" ] || PA_FOR=unknown
+  PA_LAST=$(nm_active_step_field last_activity); [ -n "$PA_LAST" ] || PA_LAST=unknown
+  case "$PA_LAST" in
+    quiet*)
+      # The CI step is the one place quiet is expected rather than telling: the
+      # monitor is waiting on the forge's checks and writes no step log while it
+      # does, which nm_ci_checks_state's marker vocabulary above already shows.
+      # Every other step's quiet is a real liveness clue and earns nothing.
+      [ "$PA_STEP" = ci ] && emit_pipeline active \
+        "the attributed pipeline run is monitoring CI (step $PA_STEP, active $PA_FOR, last activity $PA_LAST) - a CI monitor waits on the forge and writes no step log while it does"
+      emit_pipeline quiet \
+        "the attributed pipeline run is at step $PA_STEP (active $PA_FOR) but its own activity clock reads $PA_LAST"
+      ;;
+  esac
+  emit_pipeline active \
+    "the attributed pipeline run is at step $PA_STEP, active $PA_FOR, last activity $PA_LAST"
 fi
 
 # --- run-step authoritative path -------------------------------------------

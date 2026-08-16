@@ -2465,6 +2465,31 @@ SH
   pass "bootstrap isolates incomplete poll migration from unrelated recovery sweeps"
 }
 
+# Wait for a signaled watcher's OWN exit, on the tick and grace tests/lib.sh's
+# child-stop contract owns. 0 once it is gone, 1 if it outlived the grace.
+#
+# Escalating to SIGKILL the way fm_wake_terminate does is deliberately NOT done
+# here: the two assertions below exist to prove that SIGTERM alone stops the
+# watcher and drains its check descendants, and a helper that kills would report
+# success whatever the watcher did.
+#
+# The grace is deliberately generous rather than snug. A healthy watcher's TERM
+# latency is bounded below by its poll AND by its EXIT trap, which drains the
+# check's process group through its own bounded TERM-then-KILL sequence, and a
+# loaded CI runner stretches both. The 0.02s-tick budgets these loops used spent
+# under three seconds on that - measured latency here is 50-180ms, but the margin
+# was thin enough that one runner stall failed a whole shard. is_live_non_zombie
+# rather than a bare `kill -0` for the same reason lib.sh gives: kill -0 succeeds
+# against a reaped-but-unwaited zombie, which is not a running watcher.
+wait_for_signaled_exit() {  # <pid>
+  local pid=$1 i=0
+  while [ "$i" -lt 150 ] && is_live_non_zombie "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$pid"
+}
+
 test_custom_snapshot_cleanup_on_signal() {
   local dir state child_pid_file pid child_pid i rc
   dir=$(make_case custom-snapshot-signal)
@@ -2506,12 +2531,7 @@ SH
     || fail "watcher did not create the custom check snapshot"
   child_pid=$(cat "$child_pid_file")
   kill -TERM "$pid" 2>/dev/null || fail "could not signal watcher during custom check"
-  i=0
-  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do
-    sleep 0.02
-    i=$((i + 1))
-  done
-  if kill -0 "$pid" 2>/dev/null; then
+  if ! wait_for_signaled_exit "$pid"; then
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     fail "signaled watcher did not exit promptly"
@@ -2583,12 +2603,7 @@ SH
       || fail "$backend watcher did not complete the direct custom check"
     child_pid=$(cat "$child_pid_file")
     kill -TERM "$watcher_pid" 2>/dev/null || fail "could not stop $backend watcher"
-    i=0
-    while kill -0 "$watcher_pid" 2>/dev/null && [ "$i" -lt 150 ]; do
-      sleep 0.02
-      i=$((i + 1))
-    done
-    if kill -0 "$watcher_pid" 2>/dev/null; then
+    if ! wait_for_signaled_exit "$watcher_pid"; then
       kill -KILL "$watcher_pid" 2>/dev/null || true
       wait "$watcher_pid" 2>/dev/null || true
       kill -KILL "$child_pid" 2>/dev/null || true
