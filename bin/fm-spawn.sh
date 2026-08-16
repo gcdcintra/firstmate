@@ -1461,7 +1461,7 @@ if [ "$KIND" != secondmate ]; then
       cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}],"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"$j_pretool"}]}],"PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"$j_posttool"}]}]}}
 EOF
-      rm -rf "$STATE_REAL/$ID.delegating"
+      "$FM_ROOT/bin/fm-delegation-event.sh" clear "$STATE_REAL" "$ID" >/dev/null 2>&1 || true
       exclude_path '.claude/settings.local.json'
       ;;
     opencode*)

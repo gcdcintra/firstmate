@@ -65,7 +65,7 @@ A descendant scan would have missed the observed incident entirely; the tool lay
 It classifies the tool NAME by shape rather than against a fixed list.
 The tracked Claude PreToolUse matcher is `.*`, so every Claude tool name reaches the script and the script is the single owner of classification.
 A stem-enumerating matcher would reintroduce the fail-open-by-enumeration problem this guard exists to solve, because any future tool name outside the matcher would be silently missed before the script could inspect it.
-The shape test itself - the stem list, the normalization, and the MCP exclusion below - is owned by [`bin/fm-delegation-lib.sh`](../bin/fm-delegation-lib.sh), because firstmate has a second consumer of the same classification: the crew-side visibility record described under "The crew-side question" below.
+The shape test itself - the stem list, the normalization, and the MCP exclusion below - is owned by [`bin/fm-delegation-lib.sh`](../bin/fm-delegation-lib.sh), because firstmate has a second consumer of the same classification: the crew-side visibility record described under "The crew-side question" above.
 The two consumers share the shape and keep their own exclusions.
 
 Three exclusions keep this guard's use of the shape test from producing false positives.

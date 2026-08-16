@@ -3508,7 +3508,7 @@ test_a_delegation_block_escalates_even_while_the_worker_process_burns_cpu() {
 # deferral hides the delegation it deferred over. Proving it against the knob
 # rather than against a historical commit keeps the proof runnable in CI
 # forever instead of pinned to a hash that shallow clones may not carry.
-delegation_declared_wait_case() {  # <name> <window> <block-secs> -> echoes dir
+delegation_declared_wait_case() {  # <name> <window> <block-secs> -> sets DELEGATION_CASE_DIR
   local name=$1 window=$2 block=$3 dir state fakebin out key id pid
   dir=$(cpu_wedge_case "$name" "$window")
   state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
@@ -3539,23 +3539,23 @@ delegation_declared_wait_case() {  # <name> <window> <block-secs> -> echoes dir
   reap "$pid"
   grep -F 'declared wait on the long recheck cadence' "$state/.watch-triage.log" >/dev/null \
     || fail "$name: the absorb did not record the declared wait as its reason: $(cat "$state/.watch-triage.log" 2>/dev/null)"
-  printf '%s\n' "$dir"
+  DELEGATION_CASE_DIR=$dir
 }
 
 test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation() {
-  local dir state
+  local state
 
   # The failure direction: with the veto off, the deferral says only that a wait
   # was declared and never mentions the helper the worker is actually stuck on.
-  dir=$(delegation_declared_wait_case delegation-declared-noveto "test:fm-deleg-dw-off" 999999)
-  state="$dir/state"
+  delegation_declared_wait_case delegation-declared-noveto "test:fm-deleg-dw-off" 999999
+  state="$DELEGATION_CASE_DIR/state"
   grep -F 'inside the Agent tool call for' "$state/.watch-triage.log" >/dev/null \
     && fail "the veto-off half named the open delegation, so this case cannot prove the failure direction: $(cat "$state/.watch-triage.log")"
 
   # With the veto live the cadence is unchanged - still deferred, still silent,
   # still on the declared-wait reason - and the delegation is now named.
-  dir=$(delegation_declared_wait_case delegation-declared-veto "test:fm-deleg-dw-on" 900)
-  state="$dir/state"
+  delegation_declared_wait_case delegation-declared-veto "test:fm-deleg-dw-on" 900
+  state="$DELEGATION_CASE_DIR/state"
   grep -F 'inside the Agent tool call for 7200s' "$state/.watch-triage.log" >/dev/null \
     || fail "the deferral hid the open delegation it deferred over: $(cat "$state/.watch-triage.log")"
   grep -F 'blocked behind a helper of its own' "$state/.watch-triage.log" >/dev/null \
