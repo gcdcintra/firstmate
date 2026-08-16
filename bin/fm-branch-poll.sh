@@ -288,6 +288,11 @@ EOF
     phrase='was already red when the watch started'
   elif [ "$prev_state" = green ]; then
     phrase='went red'
+  elif [ "$prev_sha" = "$sha" ]; then
+    # Same red commit, reached here only because its previous wake was never
+    # acknowledged. Calling that a new commit would be a plain falsehood about
+    # the suspect, which is the one thing this wake exists to get right.
+    phrase='is still red, repeating a report that was never delivered'
   else
     phrase='is red at a new commit'
   fi

@@ -116,6 +116,27 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the current channel reference, [`verification/supervision.md`](verification/supervision.md#wedge-alarm-channels) for active evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Default-branch watch (config/branch-watch / state/branch-watch)
+
+Firstmate follows a task's own pull request until it is green and then stops, so nothing looked at the branch that work merges onto once it landed.
+The default-branch watch closes that gap: on its own slower cadence the watcher sweeps every clone under this home's `projects/`, reads the default branch's latest settled checks, and wakes once per commit that settles red.
+`bin/fm-branch-poll.sh` is the single owner of the sweep, the assessment model, the wake wording, and the exact limits of what it covers; read its header before changing any of them.
+
+The wake always carries the failing job's step count and duration beside the conclusion, because a red default branch has two causes the conclusion field cannot tell apart: a check that ran and failed, and a check that never started at all.
+`bin/fm-spawn.sh` reads the same recorded verdict and names an already-red default branch before a worker starts, as an advisory that never blocks the launch.
+
+The watch is on by default, because a safety net that has to be armed reproduces the gap it exists to close, and because the sweep only reads - it never writes to a project or acts on the forge.
+Set the local, gitignored `config/branch-watch` file to `off` to disable it entirely; an absent, unreadable, or unrecognized value leaves it on.
+This preference is local to each home and is not part of secondmate inherited configuration, since each home watches its own clones with its own supervisor.
+`FM_BRANCH_WATCH_INTERVAL` (seconds, default 900) sets the sweep cadence and `FM_BRANCH_WATCH_LIMIT` (default 30) how many recent runs each sweep reads.
+
+What the watch does not cover, so its silence is never mistaken for a clean branch: a project with no `origin` remote and a project whose `origin` is not GitHub are both skipped, since repository resolution refuses rather than guessing; a fork is watched as itself, because `origin` is the only remote read, so it never answers for its upstream; branches other than the default one are not watched at all; GitLab has no equivalent run query wired here even though the merge poll supports it; and the verdict describes one commit, so a workflow whose newest run only ever ran on an older commit is not carried forward onto it.
+The wake reports the breakage and never acts on it: reverting or force-pushing a default branch is a strong, outward action on a merge that may not be this fleet's, so `AGENTS.md` section 8 keeps that decision with the captain.
+
+`state/branch-watch/<project>` holds one private per-project verdict record, and `state/.last-branch-watch` is the sweep's own cadence marker.
+`bin/fm-branch-watch-lib.sh` owns that record's layout and validation, including the surfaced flag that keeps a red verdict pending until its wake has reached the durable queue.
+Run `bin/fm-branch-poll.sh --status` to read the current verdict per project.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and pins `commands.lint` to `bin/fm-lint.sh` so local lint matches CI.

@@ -238,7 +238,11 @@ pass "a branch already red at the first sweep wakes once as a first observation"
 OUT=$(poll "$H" "$BIN")
 assert_contains "$OUT" "suspect=${RED_SHA:0:7}" \
   "an unacknowledged red verdict must be re-emitted, not swallowed"
-pass "a red verdict whose wake was never acknowledged is re-emitted on the next sweep"
+assert_contains "$OUT" "repeating a report that was never delivered" \
+  "a re-emitted verdict must say so rather than claim a new suspect commit"
+assert_not_contains "$OUT" "at a new commit" \
+  "the same red commit must never be described as a new one"
+pass "a red verdict whose wake was never acknowledged is re-emitted, and says it is a repeat"
 
 poll "$H" "$BIN" --ack
 OUT=$(poll "$H" "$BIN")

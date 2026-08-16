@@ -85,6 +85,16 @@ fm_bw_sha_valid() {
   [[ "${1-}" =~ ^[0-9a-f]{40}$ ]]
 }
 
+# A forge run id, or "-" when the verdict is green and no run is under suspicion.
+fm_bw_run_valid() {
+  local run=${1-}
+  case "$run" in
+    -) return 0 ;;
+    ''|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#run}" -le 32 ]
+}
+
 fm_bw_short() {
   local sha=${1-}
   case "$sha" in
@@ -140,8 +150,7 @@ fm_bw_read() {
   fm_bw_branch_valid "$branch" || return 1
   case "$verdict" in green|red) ;; *) return 1 ;; esac
   fm_bw_sha_valid "$sha" || return 1
-  case "$run" in -|[1-9]*) ;; *) return 1 ;; esac
-  case "$run" in *[!0-9-]*) return 1 ;; esac
+  fm_bw_run_valid "$run" || return 1
   [ "$last_green" = - ] || fm_bw_sha_valid "$last_green" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
@@ -162,10 +171,17 @@ fm_bw_read() {
 fm_bw_write() {
   local state=$1 project=$2 repo=$3 branch=$4 verdict=$5 sha=$6 run=$7 last_green=$8 surfaced=$9 observed=${10}
   local dir file tmp
+  # Validate exactly what fm_bw_read demands, so a record this writes can never
+  # be one the reader then refuses: a project whose cursor is unreadable reads
+  # as never-observed and would re-announce its red on every single sweep.
   fm_bw_project_valid "$project" || return 1
   case "$verdict" in green|red) ;; *) return 1 ;; esac
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
+  fm_bw_branch_valid "$branch" || return 1
   fm_bw_sha_valid "$sha" || return 1
+  fm_bw_run_valid "$run" || return 1
+  [ "$last_green" = - ] || fm_bw_sha_valid "$last_green" || return 1
+  case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   dir=$(fm_bw_dir "$state")
   [ ! -L "$dir" ] || return 1
   mkdir -p "$dir" || return 1
