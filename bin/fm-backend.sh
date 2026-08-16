@@ -917,9 +917,26 @@ fm_backend_agent_pid() {  # <backend> <target>
 # printed on stdout, or a non-zero exit when this backend cannot resolve one.
 # Its only consumer is the endpoint-absence report in bin/fm-watch.sh, which
 # uses it to name the worktree-drift hazard on a pane whose agent died and left
-# a bare shell behind; a backend with no resolver simply omits that note rather
-# than blocking the wake. Only tmux exposes a pane's cwd through a verified
-# interface today.
+# a bare shell behind. A backend with no resolver here simply omits that one
+# clause: the gone wake itself is identical on every backend, and only the
+# directory sentence is missing.
+#
+# herdr is deliberately NOT dispatched, and this is a decision rather than an
+# oversight. herdr DOES have a verified cwd resolver -
+# fm_backend_herdr_current_path in bin/backends/herdr.sh, already used by
+# bin/fm-spawn.sh's worktree-discovery poll - but it reads the LIVE FOREGROUND
+# process's cwd, and the shape it is verified against is a treehouse subshell
+# on a working pane. The husk this path asks about is the opposite shape: the
+# foreground process is the dead agent's leftover shell. That read is plausible
+# but unverified for this shape, and pinning it down means driving Herdr
+# lifecycle behaviour, which has to happen inside the named isolated lab that
+# work requires so a probe can never reach a live sibling's pane. Deferred for
+# that reason rather than guessed at - wire it in only from there.
+#
+# zellij and cmux stay out for a different and permanent reason: both resolve a
+# cwd by injecting a pwd marker into the pane (bin/backends/zellij.sh,
+# bin/backends/cmux.sh), which is an active probe and wrong for a passive
+# watcher reading a pane whose agent has already died.
 fm_backend_current_path() {  # <backend> <target>
   local backend=$1 target=$2
   fm_backend_source "$backend" || return 1

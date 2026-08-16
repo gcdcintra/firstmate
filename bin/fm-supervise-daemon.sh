@@ -1255,9 +1255,18 @@ handle_wake() {  # <reason> <state>
     escalate)
       log "escalate: $reason -> $distilled"
       escalate_add "$state" "$distilled"
-      # A terminal-stale escalate must not leave a persistence marker behind, or
-      # housekeeping re-escalates the same pane as a false wedge later.
-      [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
+      # A terminal-stale or gone escalate must not leave a persistence marker
+      # behind, or housekeeping re-escalates the same pane as a false wedge
+      # later. For gone that false wedge is the precise alarm this wake kind
+      # exists to replace: a husk endpoint still captures, so the persistence
+      # recheck reads it as merely not-busy rather than gone, and an away
+      # captain would get the dead-worker report and then, a wedge window
+      # later, "possible wedge" for the same corpse.
+      case "$kind" in
+        stale) stale_marker_remove "$arg" "$state" ;;
+        gone)  stale_marker_remove "$arg" "$state"
+               pause_marker_remove "$arg" "$state" ;;
+      esac
       mark_escalated_seen "$kind" "$arg" "$state"
       [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
       ;;
