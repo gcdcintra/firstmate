@@ -2150,6 +2150,7 @@ SH
   [ "$lines" -le 2000 ] || { reap "$pid"; fail "triage log was not capped when wc emitted a spaced byte count (lines=$lines)"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "benign signal enqueued a wake while testing log capping"; }
   reap "$pid"
+  unset FM_FAKE_CREW_STATE
   pass "triage log capping handles wc byte counts with leading spaces"
 }
 
@@ -2468,6 +2469,7 @@ test_beacon_stays_fresh_while_absorbing() {
   [ "$(( now - m2 ))" -lt 10 ] || { reap "$pid"; fail "beacon went stale while absorbing (age $(( now - m2 ))s)"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "absorbing benign signals enqueued a wake"; }
   reap "$pid"
+  unset FM_FAKE_CREW_STATE
   pass "the liveness beacon stays fresh while the watcher absorbs benign wakes (fm-guard never false-alarms)"
 }
 
@@ -2491,6 +2493,7 @@ test_afk_present_reverts_watcher_to_one_shot() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the afk-mode signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null \
     || fail "afk-mode benign signal was not queued for the daemon to classify"
+  unset FM_FAKE_CREW_STATE
   pass "with .afk present the watcher reverts to one-shot so the daemon owns triage (no double-triage)"
 }
 
@@ -2673,8 +2676,13 @@ test_husk_shell_wakes_gone_and_names_primary_checkout() {
   out="$dir/watch.out"; window="test:fm-husk"; root="$dir/primary"
   mkdir -p "$root"
 
+  # The run that outlived its agent still reads as working, which is the shape a
+  # swept pane actually leaves behind: the validation kept running while the
+  # agent died. It also means the confirming poll, not a first-sighting stale
+  # surface, is what this case measures.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
     FM_FAKE_TMUX_CURRENT_COMMAND=bash FM_FAKE_TMUX_CURRENT_PATH="$root" FM_ROOT_OVERRIDE="$root" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
@@ -2701,6 +2709,7 @@ test_husk_shell_names_the_project_checkout_fallback() {
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
     FM_FAKE_TMUX_CURRENT_COMMAND=bash FM_FAKE_TMUX_CURRENT_PATH="$proj" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
@@ -2807,8 +2816,13 @@ test_paused_husk_shell_keeps_its_bounded_recheck() {
   printf '%s' "$(seen_sig "$state/absent.status")" > "$state/.seen-absent_status"
   printf 'dead:1' > "$state/.gone-seen-$key"
 
+  # No authoritative current state, which is what a corpse leaves: the pause
+  # classification then has to reach its dead-agent promotion to keep this window
+  # on the bounded cadence. A working or paused verdict would satisfy the
+  # assertion without ever exercising that promotion.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
     FM_FAKE_TMUX_CURRENT_COMMAND=bash \
+    FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_PAUSE_RESURFACE_SECS=60 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
