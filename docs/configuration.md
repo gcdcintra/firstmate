@@ -122,17 +122,18 @@ Firstmate follows a task's own pull request until it is green and then stops, so
 The default-branch watch closes that gap: on its own slower cadence the watcher sweeps every clone under this home's `projects/`, reads the default branch's latest settled checks, and wakes once per commit that settles red.
 `bin/fm-branch-poll.sh` is the single owner of the sweep, the assessment model, the wake wording, and the exact limits of what it covers; read its header before changing any of them.
 
-The wake always carries the failing job's step count and duration beside the conclusion, because a red default branch has two causes the conclusion field cannot tell apart: a check that ran and failed, and a check that never started at all.
+The wake always carries the failing job's step count and duration beside the conclusion - or says inline that the run detail could not be read - because a red default branch has two causes the conclusion field cannot tell apart: a check that ran and failed, and a check that never started at all.
 `bin/fm-spawn.sh` reads the same recorded verdict and names an already-red default branch before a worker starts, as an advisory that never blocks the launch.
 
 The watch is on by default, because a safety net that has to be armed reproduces the gap it exists to close, and because the sweep only reads - it never writes to a project or acts on the forge.
 Set the local, gitignored `config/branch-watch` file to `off` to disable it entirely; an absent, unreadable, or unrecognized value leaves it on.
 This preference is local to each home and is not part of secondmate inherited configuration, since each home watches its own clones with its own supervisor.
-`FM_BRANCH_WATCH_INTERVAL` (seconds, default 900) sets the sweep cadence, `FM_BRANCH_WATCH_LIMIT` (default 30) how many recent runs each sweep reads, and `FM_BRANCH_WATCH_BUDGET` (seconds, default 25) how long one pass may go on starting projects before it stops and reports.
+`FM_BRANCH_WATCH_INTERVAL` (seconds, default 900) sets the sweep cadence, `FM_BRANCH_WATCH_LIMIT` (default 30) how many recent runs each sweep reads, and `FM_BRANCH_WATCH_BUDGET` (seconds, 25 under a default watcher, which derives it from `FM_CHECK_TIMEOUT`) how long one pass may go on starting projects before it stops and reports.
 
 A pass costs one forge query per clone, so past a certain fleet size it cannot reach everything at once.
 It handles that by rotating rather than by truncating: the next pass resumes at the project after the last one it attempted and wraps around, so the fleet is covered on a ring instead of the same tail being dropped every time.
-A pass that did not reach everything says so and names the projects it missed, and always alongside any red report from that same pass; `bin/fm-branch-poll.sh --status` prints the current gap on demand.
+A pass that did not reach everything says so and names the projects it missed, and does so alongside any red report from that same pass; `bin/fm-branch-poll.sh --status` prints the current gap on demand.
+The exception is a pass killed by the watcher's per-check timeout rather than stopping on its own budget: a red it already printed still arrives, without that coverage clause, and `--status` is what states the gap that pass left.
 A project whose forge query will not answer - a renamed repository, a lapsed token grant - counts as unassessed rather than as covered, and is named separately from the ones a pass simply did not get to, because rotation reaches those next pass and cannot help these at all.
 It still produces no verdict of its own: silence about a red or green that could not be obtained is right, and only the coverage accounting changes.
 That notice is not repeated on every sweep of a fleet that is simply large: it fires when the set of clones changes, whenever a pass needs more passes to cover the fleet than any figure already reported - so coverage that degrades from two passes to fourteen is stated rather than left sitting behind a disclosure that was true when it was written - and whenever a clone starts failing its query that was never reported failing - or whose earlier failure has been forgotten after it answered several consecutive queries - which is a gap that can widen while the pass count sits still.
@@ -523,6 +524,9 @@ FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartb
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
+FM_BRANCH_WATCH_INTERVAL=900   # seconds between default-branch sweeps ("Default-branch watch" above)
+FM_BRANCH_WATCH_LIMIT=30       # recent runs one sweep reads per project
+FM_BRANCH_WATCH_BUDGET=25      # defaults to FM_CHECK_TIMEOUT minus 5, floor 5; seconds one sweep may go on starting projects before it stops and reports what it left unassessed
 FM_PROCEVENT_MAX_OUTPUT_BYTES=1048576   # bound on one captured process-to-event result
 FM_PROCEVENT_CLAIM_ROOT=                # machine-wide source claim root; default $XDG_STATE_HOME/firstmate/procevent-claims
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision

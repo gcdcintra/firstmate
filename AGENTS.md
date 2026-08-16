@@ -378,7 +378,7 @@ Handle actionable wakes as follows:
 3. For `gone:`, the endpoint was confidently killed or left agent-less, so it will never clear on its own and is never a wedge; load `stuck-crewmate-recovery`, and check what the worker had already committed before relaunching, because a killed worker's branch and running validation usually survive it.
 4. For `check:`, act on the named poll result, including merges, X-mode events, and process-to-event source results.
    A `branch-red` result means a project's default branch settled red: relay it with the suspect merge and the inline evidence that separates a check that ran and failed from one that never started, and never revert or force-push in response, because the breaking merge may not be this fleet's to undo.
-   A `branch-watch-incomplete` result names the clones that sweep did not reach, so nothing it reports may be relayed as covering them; the next pass resumes there.
+   A `branch-watch-incomplete` result names the clones that sweep left unassessed, so nothing it reports may be relayed as covering them: the next pass resumes at the ones it never reached, while the ones whose forge query failed stay unassessed until that query works again.
 5. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
