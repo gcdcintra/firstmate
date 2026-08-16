@@ -12,7 +12,9 @@
 #   fm-delegation-event.sh clear <state-dir> <task-id>
 #
 # open  records one open call, but only when the tool name is delegation-shaped.
-# close retires exactly the call whose id it is given.
+# close retires exactly the call whose id it is given, and never removes the
+#       record directory - clear and teardown own that. An empty directory
+#       reports nothing open.
 # clear retires every open call. A turn-end or session-end hook calls it, and so
 #       does bin/fm-send.sh on a firstmate interrupt, for which Claude fires no
 #       hook of its own: together they bound a record whose closing hook never
@@ -97,10 +99,6 @@ KEY=$(fm_delegation_call_key "$CALL")
 
 if [ "$MODE" = close ]; then
   rm -f "$DIR/$KEY" 2>/dev/null || true
-  # An empty directory is retired so a torn-down or long-idle task leaves none
-  # behind; a still-open sibling call keeps it, and rmdir refuses rather than
-  # removing one.
-  rmdir "$DIR" 2>/dev/null || true
   exit 0
 fi
 

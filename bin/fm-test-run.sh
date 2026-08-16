@@ -918,6 +918,14 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       printf '%s\n' watcher-wake-lock
       ;;
+    bin/fm-delegation-lib.sh)
+      # Two consumers in different families: the shape test and the record
+      # contract have their own unit suites, and bin/fm-watch.sh sources this
+      # file for fm_delegation_open_age, which is the delegation veto in the
+      # wedge hierarchy.
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' watcher-wake-lock
+      ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
       printf '%s\n' pr-forge

@@ -3330,7 +3330,7 @@ test_without_the_veto_the_delegation_shape_is_still_deferred() {
 # accurate; what changes is that it is no longer allowed to speak for a worker
 # that is not the one doing that work.
 test_an_aged_delegation_denies_the_pipeline_tier_and_names_the_shape() {
-  local dir state fakebin out window key id pid
+  local dir state fakebin out window key id pid aged
   window="test:fm-deleg-veto"
   dir=$(cpu_wedge_case delegation-veto "$window")
   state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
@@ -3352,8 +3352,9 @@ test_an_aged_delegation_denies_the_pipeline_tier_and_names_the_shape() {
     || { reap "$pid"; fail "a worker blocked inside a delegation call kept deferring on its pipeline: $(cat "$out")"; }
   grep -F "possible wedge" "$out" >/dev/null \
     || fail "the delegation block did not escalate as a possible wedge: $(cat "$out")"
-  grep -F "inside the Agent tool call for 7200s" "$out" >/dev/null \
-    || fail "the escalation did not name the open delegation call: $(cat "$out")"
+  aged=$(grep -Eo 'inside the Agent tool call for [0-9]+s' "$out" | head -1 | tr -cd '0-9')
+  [ -n "$aged" ] && [ "$aged" -ge 7200 ] \
+    || fail "the escalation did not name the open delegation call at its seeded age: $(cat "$out")"
   grep -F "blocked behind a helper of its own" "$out" >/dev/null \
     || fail "the escalation did not name the shape: $(cat "$out")"
   # The pipeline reading is still carried - it is real evidence - but it must
@@ -3543,7 +3544,7 @@ delegation_declared_wait_case() {  # <name> <window> <block-secs> -> sets DELEGA
 }
 
 test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation() {
-  local state
+  local state aged
 
   # The failure direction: with the veto off, the deferral says only that a wait
   # was declared and never mentions the helper the worker is actually stuck on.
@@ -3556,7 +3557,8 @@ test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation
   # still on the declared-wait reason - and the delegation is now named.
   delegation_declared_wait_case delegation-declared-veto "test:fm-deleg-dw-on" 900
   state="$DELEGATION_CASE_DIR/state"
-  grep -F 'inside the Agent tool call for 7200s' "$state/.watch-triage.log" >/dev/null \
+  aged=$(grep -Eo 'inside the Agent tool call for [0-9]+s' "$state/.watch-triage.log" | head -1 | tr -cd '0-9')
+  [ -n "$aged" ] && [ "$aged" -ge 7200 ] \
     || fail "the deferral hid the open delegation it deferred over: $(cat "$state/.watch-triage.log")"
   grep -F 'blocked behind a helper of its own' "$state/.watch-triage.log" >/dev/null \
     || fail "the deferral named the call but not the shape it makes: $(cat "$state/.watch-triage.log")"

@@ -90,8 +90,8 @@ test_a_nested_helper_tool_call_cannot_retire_the_outer_delegation() {
   printf '{"tool_name":"Agent","tool_use_id":"toolu_outer"}' | "$EVENT" close "$state" t
   fm_delegation_open_age "$state" t >/dev/null \
     && fail "the outer delegation survived its own matching close"
-  [ ! -d "$state/t.delegating" ] \
-    || fail "the last open call was retired but its directory was left behind"
+  [ -d "$state/t.delegating" ] \
+    || fail "a close removed the record directory, which a concurrent open needs to survive"
   pass "a nested helper tool call cannot retire or refresh the outer delegation"
 }
 
@@ -103,7 +103,9 @@ test_the_oldest_open_call_is_the_one_reported() {
   printf '{"tool_name":"Workflow","tool_use_id":"second"}' | "$EVENT" open "$state" t
   age_record "$state" t second 30
   open=$(fm_delegation_open_age "$state" t) || fail "two open calls reported none"
-  [ "$open" = "4000 Agent" ] \
+  [ "${open#* }" = Agent ] \
+    || fail "a short concurrent call displaced the long one as the reported call: $open"
+  [ "${open%% *}" -ge 4000 ] \
     || fail "a short concurrent call restated the long one as fresh: $open"
   # Retiring the long one leaves the short one, still measured on its own clock.
   printf '{"tool_name":"Agent","tool_use_id":"first"}' | "$EVENT" close "$state" t
@@ -125,6 +127,32 @@ test_a_reopened_call_id_never_restates_its_own_clock() {
   pass "a repeated open for the same call id never restates its clock"
 }
 
+# Claude issues parallel tool calls in one assistant block, so a sibling's
+# PostToolUse can land in the window between a delegation open's mkdir and its
+# write. If that close removed the record directory, the open's write would fail
+# into its own `|| true` and the delegation would leave NO record for its entire
+# lifetime - the exact blindness this record exists to remove, and worse than a
+# lost close, which only costs a deferral the pane would have been granted.
+# The window is eliminated rather than narrowed: close never removes the
+# directory, and clear and teardown own that.
+test_a_sibling_close_cannot_strand_a_concurrent_open() {
+  local state open
+  state=$(fresh_state race)
+  # The state a delegation open is in after its mkdir and before its write.
+  mkdir -p "$state/t.delegating"
+  printf '{"tool_name":"Read","tool_use_id":"sibling"}' | "$EVENT" close "$state" t
+  [ -d "$state/t.delegating" ] \
+    || fail "a sibling close removed the directory a concurrent open was populating"
+  printf '{"tool_name":"Agent","tool_use_id":"outer"}' | "$EVENT" open "$state" t
+  [ -f "$state/t.delegating/outer" ] \
+    || fail "the delegation open lost its record to a concurrent sibling close"
+  open=$(fm_delegation_open_age "$state" t) \
+    || fail "a delegation that raced a sibling close reported nothing open"
+  [ "${open#* }" = Agent ] \
+    || fail "the stranded-open case reported the wrong call: $open"
+  pass "a delegation open concurrent with a sibling close still leaves its record"
+}
+
 test_clear_retires_every_open_call() {
   local state
   state=$(fresh_state clear)
@@ -142,7 +170,7 @@ test_clear_retires_every_open_call() {
 # record that cannot be read must therefore answer "nothing open", never "open
 # forever".
 test_unreadable_records_report_nothing_open() {
-  local state
+  local state open
   state=$(fresh_state unreadable)
   fm_delegation_open_age "$state" t >/dev/null \
     && fail "a task with no directory at all reported an open call"
@@ -162,8 +190,10 @@ test_unreadable_records_report_nothing_open() {
     && fail "a record stamped in the future was measured anyway"
   # One good record among the unusable ones is still reported.
   printf 'v1 ts=%s tool=Agent\n' "$(( $(date +%s) - 700 ))" > "$state/t.delegating/good"
-  [ "$(fm_delegation_open_age "$state" t)" = "700 Agent" ] \
+  open=$(fm_delegation_open_age "$state" t) \
     || fail "a readable record was lost among unreadable ones"
+  [ "${open#* }" = Agent ] && [ "${open%% *}" -ge 700 ] \
+    || fail "a readable record was lost among unreadable ones: $open"
   pass "every unreadable record reports nothing open rather than a phantom block"
 }
 
@@ -202,6 +232,7 @@ test_delegation_shaped_calls_are_recorded_and_ordinary_ones_are_not
 test_a_nested_helper_tool_call_cannot_retire_the_outer_delegation
 test_the_oldest_open_call_is_the_one_reported
 test_a_reopened_call_id_never_restates_its_own_clock
+test_a_sibling_close_cannot_strand_a_concurrent_open
 test_clear_retires_every_open_call
 test_unreadable_records_report_nothing_open
 test_every_invocation_is_silent_and_succeeds
