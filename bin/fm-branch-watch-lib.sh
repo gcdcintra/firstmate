@@ -33,19 +33,29 @@
 # when nothing ever carried it, which is that same swallowed red by another
 # route.
 #
-# The sweep's own cursor is a second record, state/branch-watch/.sweep, six
+# The sweep's own cursor is a second record, state/branch-watch/.sweep, seven
 # lines and one per line:
-#   1  fm-branch-sweep-v1     version tag; anything else is refused, not guessed
+#   1  fm-branch-sweep-v2     version tag; anything else is refused, not guessed
 #   2  resume                 last project the previous pass ATTEMPTED, or "-"
 #   3  unreached              projects that pass never reached, space-joined, or "-"
 #   4  fleet                  the project list whose truncation was last reported
 #   5  yes|no                 whether line 4's truncation notice was surfaced
-#   6  observed               unix epoch of the observation
+#   6  watermark              the worst pass count DELIVERED for line 4's fleet, or "-"
+#   7  observed               unix epoch of the observation
 # Line 2 is what makes a fleet too large for one pass lose a rotating slice
 # instead of the same tail forever, so it is written before each attempt rather
 # than after: a pass killed mid-project must not send every later pass back into
-# the same stall. Line 4 is the suppression key, and line 5 is the same
-# durability boundary as field 9 above.
+# the same stall. Line 3 always describes the pass that is running, so a pass
+# killed before it could report still leaves an honest gap behind rather than
+# the previous pass's cleaner one.
+#
+# Lines 4 and 6 together are the suppression key, and line 5 is the same
+# durability boundary as field 9 above. Line 6 holds a count of passes, not a
+# timestamp or a flag: coverage that gets WORSE than anything already delivered
+# is news and speaks up again, coverage that merely recovers is not. It is
+# raised only by the acknowledgement, never by the write that produces the
+# notice, because it records what a caller actually delivered - raising it any
+# earlier would let an undelivered level silence the level that follows it.
 #
 # The record is data, never authority: nothing here is interpolated into shell
 # source, and every field is revalidated on read rather than trusted from disk.
@@ -64,7 +74,7 @@ FM_BW_LAST_GREEN=
 FM_BW_SURFACED=
 FM_BW_OBSERVED=
 
-FM_BW_SWEEP_VERSION=fm-branch-sweep-v1
+FM_BW_SWEEP_VERSION=fm-branch-sweep-v2
 # The sweep's own record is addressed by a key that is deliberately outside the
 # project-name charset, so the truncation notice can never share a durable wake
 # key with a project called anything at all - two records under one key collapse
@@ -74,6 +84,7 @@ FM_BW_SWEEP_RESUME=
 FM_BW_SWEEP_UNREACHED=
 FM_BW_SWEEP_FLEET=
 FM_BW_SWEEP_SURFACED=
+FM_BW_SWEEP_WATERMARK=
 FM_BW_SWEEP_OBSERVED=
 
 # A project name addresses a directory under <home>/projects and a file under
@@ -116,6 +127,20 @@ fm_bw_list_valid() {
     esac
     fm_bw_project_valid "$name" || return 1
   done
+}
+
+fm_bw_list_count() {
+  local list=${1-} rest n=0
+  [ "$list" != - ] && [ -n "$list" ] || { printf '0\n'; return 0; }
+  rest=$list
+  while [ -n "$rest" ]; do
+    n=$((n + 1))
+    case "$rest" in
+      *' '*) rest=${rest#* } ;;
+      *) rest= ;;
+    esac
+  done
+  printf '%s\n' "$n"
 }
 
 # Enabled unless config/branch-watch says "off". A watchdog whose configuration
@@ -267,12 +292,24 @@ fm_bw_write() {
     "$run" "$last_green" "$surfaced" "$observed")"
 }
 
+# A pass count: how many passes this fleet needs at the coverage last seen.
+# "-" means none has been delivered yet, which reads as "surface the next one".
+fm_bw_watermark_valid() {
+  local mark=${1-}
+  case "$mark" in
+    -) return 0 ;;
+    ''|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#mark}" -le 12 ]
+}
+
 fm_bw_sweep_read() {
-  local state=$1 file version resume unreached fleet surfaced observed extra
+  local state=$1 file version resume unreached fleet surfaced watermark observed extra
   FM_BW_SWEEP_RESUME=
   FM_BW_SWEEP_UNREACHED=
   FM_BW_SWEEP_FLEET=
   FM_BW_SWEEP_SURFACED=
+  FM_BW_SWEEP_WATERMARK=
   FM_BW_SWEEP_OBSERVED=
   file=$(fm_bw_sweep_path "$state")
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -282,6 +319,7 @@ fm_bw_sweep_read() {
   IFS= read -r unreached <&6 || { exec 6<&-; return 1; }
   IFS= read -r fleet <&6 || { exec 6<&-; return 1; }
   IFS= read -r surfaced <&6 || { exec 6<&-; return 1; }
+  IFS= read -r watermark <&6 || { exec 6<&-; return 1; }
   IFS= read -r observed <&6 || { exec 6<&-; return 1; }
   if IFS= read -r extra <&6; then
     exec 6<&-
@@ -293,17 +331,19 @@ fm_bw_sweep_read() {
   fm_bw_list_valid "$unreached" || return 1
   fm_bw_list_valid "$fleet" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
+  fm_bw_watermark_valid "$watermark" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   FM_BW_SWEEP_RESUME=$resume
   FM_BW_SWEEP_UNREACHED=$unreached
   FM_BW_SWEEP_FLEET=$fleet
   FM_BW_SWEEP_SURFACED=$surfaced
+  FM_BW_SWEEP_WATERMARK=$watermark
   FM_BW_SWEEP_OBSERVED=$observed
 }
 
-# fm_bw_sweep_write <state> <resume> <unreached> <fleet> <surfaced> <observed>
+# fm_bw_sweep_write <state> <resume> <unreached> <fleet> <surfaced> <watermark> <observed>
 fm_bw_sweep_write() {
-  local state=$1 resume=$2 unreached=$3 fleet=$4 surfaced=$5 observed=$6
+  local state=$1 resume=$2 unreached=$3 fleet=$4 surfaced=$5 watermark=$6 observed=$7
   local dir file
   # Validate exactly what fm_bw_sweep_read demands. A cursor this writes but the
   # reader then refuses would restart every pass at the beginning, which quietly
@@ -312,9 +352,28 @@ fm_bw_sweep_write() {
   fm_bw_list_valid "$unreached" || return 1
   fm_bw_list_valid "$fleet" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
+  fm_bw_watermark_valid "$watermark" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   dir=$(fm_bw_dir "$state")
   file=$(fm_bw_sweep_path "$state")
-  fm_bw_publish "$dir" "$file" "$(printf '%s\n%s\n%s\n%s\n%s\n%s' \
-    "$FM_BW_SWEEP_VERSION" "$resume" "$unreached" "$fleet" "$surfaced" "$observed")"
+  fm_bw_publish "$dir" "$file" "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+    "$FM_BW_SWEEP_VERSION" "$resume" "$unreached" "$fleet" "$surfaced" \
+    "$watermark" "$observed")"
+}
+
+# How many passes a fleet of <fleet> needs when a pass reaches all but
+# <unreached> of it. A pass that reached none of it - which also covers a record
+# whose two lists cannot be reconciled - has no finite answer and is reported as
+# one worse than the worst finite one, so it always counts as degraded rather
+# than dividing by zero or passing for complete.
+fm_bw_pass_count() {
+  local fleet=${1-} unreached=${2-} total missed reached
+  total=$(fm_bw_list_count "$fleet")
+  missed=$(fm_bw_list_count "$unreached")
+  reached=$((total - missed))
+  if [ "$total" -le 0 ] || [ "$reached" -le 0 ]; then
+    printf '%s\n' "$((total + 1))"
+    return 0
+  fi
+  printf '%s\n' "$(( (total + reached - 1) / reached ))"
 }

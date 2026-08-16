@@ -33,6 +33,11 @@
 #     not reach, and does not repeat that notice on every sweep;
 #   - a corrupt or unknown resume position restarts at the beginning rather than
 #     skipping projects;
+#   - coverage degrading past the figure already reported surfaces again, while
+#     the same level, a recovery, and an oscillation back up stay quiet, and a
+#     pass that reached nothing counts as worse than any finite figure;
+#   - a pass killed before it could report leaves the gap it actually had rather
+#     than the previous pass's cleaner one;
 #   - green records silently and clears the pre-launch advisory;
 #   - config/branch-watch "off", a clone with no origin, and a non-GitHub origin
 #     are all silent.
@@ -87,7 +92,7 @@ add_project() {
 # past its own budget the way a real fleet's forge round-trips do.
 FAKE_SUBJECT='Merge pull request #36 from acme/nf-9'
 fake_gh() {
-  local home=$1 runs=$2 jobs=$3 delay=${4:-0} fakebin
+  local home=$1 runs=$2 jobs=$3 delay=${4:-0} slow=${5:-} fakebin
   fakebin=$(fm_fakebin "$home")
   cat > "$fakebin/gh" <<SH
 #!/usr/bin/env bash
@@ -103,7 +108,9 @@ case "\$1" in
     case "\$2" in
       list)
         [ "$runs" != fail ] || exit 1
-        [ "$delay" = 0 ] || sleep "$delay"
+        case "\$*" in
+          *"$slow"*) [ "$delay" = 0 ] || sleep "$delay" ;;
+        esac
         cat "$runs"
         exit 0
         ;;
@@ -174,6 +181,25 @@ one_pass_bin() {
   fake_gh "$1" "$2" "$3" 1.1
 }
 ONE_PASS_BUDGET=1
+
+# stall_at_bin <home> <runs-file> <jobs-file> <project>: a fake gh where only
+# <project> is slow, and slow by more than the whole budget. Every project before
+# it in the pass order costs nothing, so the pass reaches exactly up to and
+# including <project> and stops - which is how these cases choose a coverage
+# level outright instead of racing the clock for one. The budget is 2s against a
+# 2.2s stall so neither side of the deadline check can land ambiguously: the
+# fast prefix is always under it, and one stall is always past it.
+stall_at_bin() {
+  fake_gh "$1" "$2" "$3" 2.2 "$4"
+}
+STALL_BUDGET=2
+
+# sweep_field <home> <line>: one line of the sweep cursor, which is this
+# feature's own persisted record format (bin/fm-branch-watch-lib.sh documents the
+# seven lines); line 3 is the coverage gap and line 6 the delivered watermark.
+sweep_field() {
+  sed -n "${2}p" "$1/state/branch-watch/.sweep" 2>/dev/null || true
+}
 
 # --- green to red names the project and the suspect merge -------------------
 
@@ -459,12 +485,12 @@ assert_contains "$OUT" "sweep: the last pass did not reach bravo charlie" \
   "--status must report the coverage gap on demand"
 pass "the coverage gap of the last pass is readable through --status"
 
-# --- the truncation notice repeats per fleet, not per sweep -----------------
+# --- the truncation notice repeats on news, not on every sweep --------------
 #
 # Rotation changes which projects are missed on every single pass by
 # construction, so a notice keyed on that set would wake once per sweep forever.
-# What changes when a home starts, or stops, being too large to sweep in one
-# pass is the fleet, and that is what may speak up again.
+# The news is the fleet changing, or its coverage getting worse than any figure
+# already delivered; a fleet that is simply large stays quiet.
 
 H=$(new_home)
 add_project "$H" alpha >/dev/null
@@ -487,7 +513,125 @@ add_project "$H" delta >/dev/null
 OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
 assert_contains "$OUT" "branch-watch-incomplete" \
   "a change to the fleet being missed must surface again"
-pass "a truncated pass with nothing red surfaces once per fleet, not once per sweep"
+pass "a truncated pass with nothing red surfaces on news, not on every sweep"
+
+# --- coverage that gets worse speaks up again -------------------------------
+#
+# A disclosure that was true when it was written is still read as true later. A
+# fleet told "covered within 2 passes" that quietly slides to 4 leaves the reader
+# trusting a number that no longer holds, so a worse figure than any already
+# delivered is news; the same figure again, or a better one, is not.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+
+# Pass 1 stalls on bravo, so it reaches alpha and bravo: 2 of 4, covered in 2.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "reached 2 of 4 projects" "the stall must decide the coverage level, not the clock"
+assert_contains "$OUT" "covering the fleet within 2 passes" "a new fleet states its pass count"
+poll "$H" "$BIN" --ack :sweep
+
+# Pass 2 resumes at charlie and stalls there: 1 of 4, so the fleet now needs 4
+# passes where 2 was reported. That is the degradation, and it must be said.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" charlie)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "reached 1 of 4 projects" "the pass must reach only the stalled project"
+assert_contains "$OUT" "covering the fleet within 4 passes" \
+  "coverage degrading past what was reported must surface with the worse figure"
+poll "$H" "$BIN" --ack :sweep
+pass "coverage degrading past the figure already reported surfaces again"
+
+# Pass 3 resumes at delta and stalls there: 1 of 4 again. Same figure, already
+# delivered, so nothing new to say.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" delta)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "the same degraded coverage must not surface twice, got: $OUT"
+pass "the same degraded coverage level does not surface again"
+
+# Pass 4 resumes at alpha and stalls on bravo: back to 2 of 4. Recovery is not
+# news, and the watermark must not fall back to it.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "coverage recovering must not surface, got: $OUT"
+[ "$(sweep_field "$H" 6)" = 4 ] || \
+  fail "recovery must not lower the worst coverage reported, got $(sweep_field "$H" 6)"
+pass "coverage recovering does not surface, and does not lower the watermark"
+
+# Pass 5 resumes at charlie and stalls there: 1 of 4, the worst level again.
+# Already delivered once, so an oscillation back up to it stays quiet.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" charlie)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "oscillating back to an already reported level must stay quiet, got: $OUT"
+pass "oscillation back across a pass-count boundary stays quiet once the worst level was reported"
+
+# A fleet that is not the one the watermark was measured on starts again.
+add_project "$H" echo-svc >/dev/null
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" delta)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-watch-incomplete" \
+  "a fleet change must reset the watermark and surface again"
+pass "a change to the fleet resets the watermark and surfaces again"
+
+# --- a pass that reached nothing is the worst coverage there is -------------
+#
+# The sweep always attempts its first project, so this state is reachable
+# through the record rather than through a pass: a cursor whose unreached list is
+# the whole fleet describes a pass that got nowhere. It must be read as worse
+# than any finite figure, never as one pass and never as complete.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+mkdir -p "$H/state/branch-watch"
+printf 'fm-branch-sweep-v2\ndelta\n%s\n%s\nno\n-\n1\n' \
+  "alpha bravo charlie delta" "alpha bravo charlie delta" > "$H/state/branch-watch/.sweep"
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" alpha)
+poll "$H" "$BIN" --ack :sweep
+[ "$(sweep_field "$H" 6)" = 5 ] \
+  || fail "a pass that reached no project must record worse than any finite figure, got $(sweep_field "$H" 6)"
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "a level better than reaching nothing must not surface, got: $OUT"
+pass "a pass that reached no project counts as worse than any coverage the fleet can have"
+
+# --- a pass that is killed leaves an honest gap behind it -------------------
+#
+# The trailing report is what names the gap, and a killed pass never gets to
+# print one. Whatever the cursor says mid-pass is therefore what --status will
+# claim, so it must describe THIS pass rather than carrying the last one's
+# cleaner answer forward.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+runs_file "$TMP_ROOT/runs-green" "$GREEN_SHA|completed|success|899|https://forge/runs/899|CI"
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN" >/dev/null
+OUT=$(poll "$H" "$BIN" --status)
+assert_contains "$OUT" "sweep: the last pass reached every project" \
+  "a complete pass must report complete coverage"
+
+# Now kill a pass mid-flight, the way the watcher's per-check timeout does.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
+FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN" >/dev/null &
+POLL_PID=$!
+sleep 1
+kill -KILL "$POLL_PID" 2>/dev/null || true
+wait "$POLL_PID" 2>/dev/null || true
+OUT=$(poll "$H" "$BIN" --status)
+assert_not_contains "$OUT" "reached every project" \
+  "a pass killed before its report must never be read as having reached every project"
+assert_contains "$OUT" "sweep: the last pass did not reach" \
+  "a killed pass must leave the projects it had not attempted behind it"
+assert_contains "$OUT" "bravo" "the project it died on must be named as not reached"
+assert_contains "$OUT" "charlie" "the projects behind it must be named as not reached"
+pass "a pass killed before it could report leaves an honest coverage gap, not a clean one"
 
 # --- an unusable resume position restarts, and never skips -------------------
 
@@ -509,7 +653,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v1\nzulu\n-\n-\nyes\n1\n' > "$H/state/branch-watch/.sweep"
+printf 'fm-branch-sweep-v2\nzulu\n-\n-\nyes\n-\n1\n' > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
 assert_present "$H/state/branch-watch/alpha" \
@@ -600,7 +744,7 @@ UMASK_BEFORE=$(umask)
 fm_bw_write "$H/state" p acme/p main red "$RED_SHA" 900 "$GREEN_SHA" no 1 \
   || fail "writing a verdict must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_write must restore the caller's umask, got $(umask)"
-fm_bw_sweep_write "$H/state" p - - yes 1 || fail "writing the sweep cursor must succeed"
+fm_bw_sweep_write "$H/state" p - - yes - 1 || fail "writing the sweep cursor must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_sweep_write must restore the caller's umask, got $(umask)"
 [ -n "$(find "$H/state/branch-watch/p" -perm 0600 2>/dev/null)" ] \
   || fail "the verdict record must still be written private to its owner"
