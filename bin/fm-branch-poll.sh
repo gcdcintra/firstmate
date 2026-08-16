@@ -323,11 +323,11 @@ run_status() {
   local project found=0
   while IFS= read -r project; do
     [ -n "$project" ] || continue
+    found=1
     if ! fm_bw_read "$STATE" "$project"; then
       printf '%s: no default-branch verdict recorded yet\n' "$project"
       continue
     fi
-    found=1
     printf '%s (%s): %s at %s' "$project" "$FM_BW_BRANCH" "$FM_BW_STATE" "$(fm_bw_short "$FM_BW_SHA")"
     [ "$FM_BW_STATE" = green ] || printf ', last green %s, run %s, surfaced=%s' \
       "$(fm_bw_short "$FM_BW_LAST_GREEN")" "$FM_BW_RUN" "$FM_BW_SURFACED"
