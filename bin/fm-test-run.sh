@@ -866,8 +866,19 @@ families_for_changed_path() {
       printf '%s\n' backend-dispatch
       printf '%s\n' real-herdr-gated
       ;;
+    bin/fm-classify-lib.sh)
+      # Consumers in one family plus one unclassified suite: the watcher and the
+      # away-mode daemon read the classifiers, while bin/fm-claude-stop-autoarm.sh
+      # reads FM_WAKE_REASON_PREFIX_RE to decide whether a watcher close is an
+      # actionable wake. That Stop-hook suite has no family of its own, so it is
+      # named directly rather than reached through one - otherwise a change to
+      # the shared prefix would never exercise the last hop before a wake
+      # reaches the primary harness.
+      printf '%s\n' watcher-wake-lock
+      printf '%s\n' "__script__:fm-claude-stop-autoarm.test.sh"
+      ;;
     bin/fm-watch*|bin/fm-wake*|\
-    bin/fm-classify-lib.sh|bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
+    bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
       printf '%s\n' watcher-wake-lock
       ;;
     bin/fm-afk*)
