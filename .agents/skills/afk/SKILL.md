@@ -167,6 +167,8 @@ Classify each wake this way:
   This stale path is never deferred on CPU: the watcher reports the worker process's CPU reading in the escalation, but only a pane still inside a turn - busy with no completed turn - can have its wedge escalation held back, bounded by `FM_CPU_PROGRESS_MAX_DEFER_SECS`, which lengthens that one path's delay without making it lossy.
   A wedge escalation the watcher prints carries the shared possible-wedge reason segment (`FM_CLASSIFY_WEDGE_REASON_SEGMENT`, owned by `bin/fm-classify-lib.sh`) and is force-escalated ahead of the absorption above, because housekeeping's recheck drops a stale marker for a pane that still looks busy and a worker wedged mid-turn would otherwise never reach you.
   Healthy crewmates are autonomous and do not wait on firstmate mid-task.
+- `gone` -> always escalate. The watcher only sends this when the backend confidently reports the endpoint killed or left running a bare shell, which never clears on its own, and relaunching a worker is a supervision decision the daemon has no authority to make.
+  Escalating it also drops the pane's stale and pause markers, because a husk endpoint still captures and housekeeping would otherwise re-escalate the same corpse as a possible wedge a wedge window later.
 - `heartbeat` -> self-handle. The daemon runs its own cheap bash fleet scan
   every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a
   captain-relevant status line the per-wake classifier might miss.
