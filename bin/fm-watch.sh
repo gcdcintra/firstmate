@@ -78,6 +78,17 @@
 #                          evidence still reads, until the pane goes genuinely
 #                          active again and clear_wedge_tracking resets it.
 #   check: <script>: <out> authenticated check output, always actionable
+#   check: branch-red: <project>/<branch> ...
+#                          a cloned project's DEFAULT branch settled red, with
+#                          the suspect commit, the last green commit, and the
+#                          failing job's step count and duration inline so a
+#                          check that ran and failed is told apart from one that
+#                          never started; bin/fm-branch-poll.sh owns the sweep
+#   check: branch-watch-incomplete: ...
+#                          that sweep could not reach every clone inside its
+#                          budget, naming the projects it did not reach; the
+#                          next pass resumes there, so this is a stated latency
+#                          and never a silent gap
 #   check: process-event result captured: <keys>
 #                          a durably captured process-to-event result is queued
 #                          and has not been surfaced yet; reported once per
@@ -168,6 +179,27 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+BRANCH_WATCH_INTERVAL=${FM_BRANCH_WATCH_INTERVAL:-900}  # seconds between default-branch sweeps
+# The default-branch sweep must read exactly the home THIS watcher supervises.
+# An ambient FM_HOME is not that home whenever a state override displaced it, so
+# the three roots the sweep reads are derived from the supervised state
+# directory and passed to it explicitly rather than left to its own defaults.
+BRANCH_WATCH_HOME=$(dirname "$STATE")
+BRANCH_WATCH_PROJECTS=${FM_PROJECTS_OVERRIDE:-$BRANCH_WATCH_HOME/projects}
+BRANCH_WATCH_CONFIG=${FM_CONFIG_OVERRIDE:-$BRANCH_WATCH_HOME/config}
+# The sweep's cost grows with the fleet, so it must stop starting projects while
+# it still has time to exit cleanly and report what it did not reach. A sweep
+# that only ever stopped by being killed here could never report anything at all.
+# This is only the default the per-check budget implies: an explicit
+# FM_BRANCH_WATCH_BUDGET still wins, the same way FM_BRANCH_WATCH_LIMIT does.
+BRANCH_WATCH_BUDGET=25
+case "$CHECK_TIMEOUT" in
+  ''|*[!0-9]*) ;;
+  *)
+    BRANCH_WATCH_BUDGET=$((CHECK_TIMEOUT - 5))
+    [ "$BRANCH_WATCH_BUDGET" -ge 5 ] || BRANCH_WATCH_BUDGET=5
+    ;;
+esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -1299,6 +1331,54 @@ while :; do
       wake "$reason"
     fi
     touch "$STATE/.last-check"
+  fi
+
+  # Default-branch watch. Every other poll here follows a task; this one follows
+  # the branch those tasks merge ONTO, which nothing looked at once a pull
+  # request landed, so a merge that broke it stayed invisible until a human
+  # tripped over it. bin/fm-branch-poll.sh owns the sweep; it is read-only
+  # against the forge and never touches a project.
+  #
+  # Placed after the task checks and on its own slower marker for two reasons: a
+  # per-project forge query must not be paid at the per-task check rate, and a
+  # merge poll - which a firstmate turn is actively waiting on - must never be
+  # starved by this. Because wake() ends the process, a cycle that woke on a task
+  # check simply leaves .last-branch-watch untouched and sweeps next cycle.
+  if [ -d "$BRANCH_WATCH_PROJECTS" ] \
+    && [ "$(age_of "$STATE/.last-branch-watch")" -ge "$BRANCH_WATCH_INTERVAL" ]; then
+    touch "$STATE/.last-branch-watch"
+    FM_HOME="$BRANCH_WATCH_HOME" FM_STATE_OVERRIDE="$STATE" \
+      FM_PROJECTS_OVERRIDE="$BRANCH_WATCH_PROJECTS" FM_CONFIG_OVERRIDE="$BRANCH_WATCH_CONFIG" \
+      FM_BRANCH_WATCH_BUDGET="${FM_BRANCH_WATCH_BUDGET:-$BRANCH_WATCH_BUDGET}" \
+      run_check_capture "$SCRIPT_DIR/fm-branch-poll.sh" || exit 1
+    out=$FM_CHECK_RESULT
+    reason=
+    bw_acks=()
+    # One queue record per key the sweep emits - a project name for a red branch,
+    # ":sweep" for a pass that could not reach the whole fleet. The drain
+    # collapses records that share a kind and key and keeps only the newest, so a
+    # single shared key would let one project's red silently replace another's -
+    # and the sweep's own re-emit safety net could not recover it, because
+    # acknowledging the wake already marked both verdicts delivered.
+    while IFS=$(printf '\t') read -r bw_key bw_line; do
+      [ -n "$bw_key" ] && [ -n "$bw_line" ] || continue
+      fm_wake_append check "branch-watch:$bw_key" "check: $bw_line" || exit 1
+      bw_acks+=("$bw_key")
+      if [ -z "$reason" ]; then reason="check: $bw_line"; else reason="$reason ;; $bw_line"; fi
+    done <<EOF
+$out
+EOF
+    if [ "${#bw_acks[@]}" -gt 0 ]; then
+      # Only now is every one of these durably queued, so only now may the sweep
+      # mark them surfaced - and only THESE. A blanket acknowledgement would also
+      # mark a verdict from an earlier sweep delivered when nothing ever carried
+      # it, which swallows that red for good: the same expensive failure, reached
+      # by acknowledging instead of by colliding keys.
+      FM_HOME="$BRANCH_WATCH_HOME" FM_STATE_OVERRIDE="$STATE" \
+        FM_PROJECTS_OVERRIDE="$BRANCH_WATCH_PROJECTS" FM_CONFIG_OVERRIDE="$BRANCH_WATCH_CONFIG" \
+        run_check "$SCRIPT_DIR/fm-branch-poll.sh" --ack "${bw_acks[@]}"
+      wake "$reason"
+    fi
   fi
 
   # On the first changed signal, linger one grace period and re-scan before

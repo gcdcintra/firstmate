@@ -87,6 +87,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-busy-event.sh`       | The only writer of a task's semantic busy-state record; arms an incarnation and applies lifecycle events |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for composer capture, verified submit, and the submit-time busy check |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
+| `fm-branch-poll.sh`      | Sweep every clone's default branch and wake once per commit that settles red, with refusal-vs-failure evidence inline |
+| `fm-branch-watch-lib.sh` | Own the per-project default-branch verdict record, its validation, and its surfaced-wake boundary |
 | `fm-check-register.sh`   | Bind an intentional custom watcher check to its current bytes                       |
 | `fm-check-lib.sh`        | Validate custom-check registrations and prepare private execution snapshots          |
 | `fm-gh-lib.sh`           | Resolve and pin the repository for every `gh`/`gh-axi` pull-request and issue query, refusing when none can be established |

@@ -110,6 +110,38 @@ assert_meta_profile() {
   assert_grep "effort=$effort" "$meta" "meta missing effort=$effort"
 }
 
+# A worker branches from the project's default branch, so a default branch that
+# already settled red hands it a failing baseline and its first validation run
+# fails for a reason that is not its own. fm-spawn names that before the launch,
+# reading the verdict bin/fm-branch-poll.sh recorded. It must stay an advisory:
+# the task may be the very change that fixes the breakage, so a red branch can
+# never delay or block a spawn.
+test_red_default_branch_is_named_before_launch_without_blocking_it() {
+  local rec id out status
+  id=redbranch-z1
+  rec=$(make_spawn_case redbranch claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "spawn with no recorded verdict should succeed"
+  assert_not_contains "$out" "BRANCH_RED:" "no recorded verdict must produce no advisory"
+
+  mkdir -p "$HOME_DIR/state/branch-watch"
+  printf 'fm-branch-watch-v1\nproject\nacme/project\nmain\nred\n%s\n900\n%s\nyes\n1\n' \
+    2222222222222222222222222222222222222222 1111111111111111111111111111111111111111 \
+    > "$HOME_DIR/state/branch-watch/project"
+  rm -rf "$HOME_DIR/state/$id.meta"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "a red default branch must never block the spawn"
+  assert_contains "$out" "spawned $id" "the launch must still happen"
+  assert_contains "$out" "BRANCH_RED: project's default branch main last settled red at 2222222" \
+    "spawn must name an already-red default branch before the worker starts"
+  assert_contains "$out" "last green 1111111" "the advisory must name the last green commit"
+  pass "a recorded red default branch is named before launch and never blocks it"
+}
+
 test_no_profile_keeps_claude_profile_defaults() {
   local rec id out status expected launch
   id=profile-off-z1
@@ -668,6 +700,7 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
 }
 
 test_no_profile_keeps_claude_profile_defaults
+test_red_default_branch_is_named_before_launch_without_blocking_it
 test_relative_home_overrides_launch_with_absolute_cross_process_paths
 test_home_defaults_preserve_absolute_or_resolve_relative_paths
 test_absolute_override_spelling_is_preserved_in_launch_paths

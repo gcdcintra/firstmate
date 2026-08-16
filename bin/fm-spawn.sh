@@ -179,6 +179,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-worktree-owner-lib.sh
 . "$SCRIPT_DIR/fm-worktree-owner-lib.sh"
+# shellcheck source=bin/fm-branch-watch-lib.sh
+. "$SCRIPT_DIR/fm-branch-watch-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1766,6 +1768,17 @@ if [ "$KIND" = secondmate ]; then
       echo "CONFIG_REREAD: secondmate $ID: cleanup failed; pre-relaunch generations were force-cleared where possible (destination=$PROJ_ABS source=$FM_HOME)" >&2
     fi
   fi
+fi
+
+# A ship or scout task branches from the project's default branch, so a default
+# branch that already settled red hands this worker a failing baseline: its very
+# first validation run fails for a reason that is not its own, and the wasted
+# cycle starts here rather than at the failure. The verdict is already on disk
+# from the default-branch watch (bin/fm-branch-poll.sh), so naming it costs one
+# file read. It is an advisory only - it never blocks or delays the launch,
+# because the worker may be the very change that fixes the breakage.
+if [ "$KIND" != secondmate ] && fm_bw_read "$STATE" "$PROJ_NAME" && [ "$FM_BW_STATE" = red ]; then
+  echo "BRANCH_RED: $PROJ_NAME's default branch $FM_BW_BRANCH last settled red at $(fm_bw_short "$FM_BW_SHA") (last green $(fm_bw_short "$FM_BW_LAST_GREEN")); this task starts from a failing baseline" >&2
 fi
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"

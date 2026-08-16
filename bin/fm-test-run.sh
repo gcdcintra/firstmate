@@ -148,6 +148,7 @@ family_for_basename() {
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
       printf '%s\n' pure-contract-unit
       ;;
+    fm-branch-watch.test.sh|\
     fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
     fm-session-lock-ancestry.test.sh|\
     fm-supervision-events.test.sh|fm-turnend-guard.test.sh|fm-wake-daemon-lifecycle-e2e.test.sh|\
@@ -878,7 +879,18 @@ families_for_changed_path() {
       printf '%s\n' watcher-wake-lock
       printf '%s\n' "__script__:fm-claude-stop-autoarm.test.sh"
       ;;
-    bin/fm-watch*|bin/fm-wake*|\
+    bin/fm-branch-watch-lib.sh)
+      # Consumers in one family plus one unclassified suite: the watcher's
+      # default-branch sweep writes this record, while bin/fm-spawn.sh reads it
+      # to warn a worker that its baseline branch is already red. That spawn
+      # suite has no family of its own, so it is named directly rather than
+      # reached through one - otherwise a change to the record layout or to its
+      # validation would turn the advisory off by making every record unreadable
+      # and select no test that exercises the last hop before a worker launches.
+      printf '%s\n' watcher-wake-lock
+      printf '%s\n' "__script__:fm-spawn-dispatch-profile.test.sh"
+      ;;
+    bin/fm-watch*|bin/fm-wake*|bin/fm-branch-*|\
     bin/fm-daemon*|bin/fm-turnend-guard*|bin/fm-guard.sh)
       printf '%s\n' watcher-wake-lock
       ;;
