@@ -74,6 +74,17 @@
 #     its cap and its escalation wording own that residual.
 #   - A worker whose declared wait is inaccurate. Tier 2 believes the claim for
 #     one long window; the ladder ends it.
+#   - A worker STOPPED at its prompt while its attributed run keeps advancing -
+#     cut off mid-response, say. Tier 3 applies on every wedge path, not only
+#     the busy-turn one, because it measures the pipeline rather than the pane
+#     and so does not share the idle-prompt overlap that keeps tier 4 restricted.
+#     The cost is that this shape is deferred for up to the pipeline cap instead
+#     of surfacing on the ordinary cadence. It is caught the moment that run
+#     needs the worker - a run parked at a gate earns nothing - and by the
+#     ladder otherwise. That trade is deliberate: the alternative is a
+#     validating crew whose pane is legitimately static re-alarming every
+#     FM_STALE_ESCALATE_SECS for the whole run, which is what taught supervision
+#     to dismiss these alarms in the first place.
 #   - A harness that never produces an exact busy verdict - Codex and standalone
 #     Kimi - reaches tiers 2 and 3 but never tier 4, because tier 4 stays gated
 #     on the busy-turn path. That gap belongs to the busy-state contract in
@@ -147,6 +158,10 @@ fm_wedge_declared_wait() {  # <state-dir> <task>
   [ -n "$2" ] || return 1
   last=$(last_status_line "$1/$2.status")
   status_is_paused_or_captain_held "$last" || return 1
+  # A worker writes this line, so it is untrusted text that ends up inside a
+  # TAB-separated return value and a wake payload. Flatten any tab or control
+  # character rather than letting one split the caller's fields.
+  last=$(printf '%s' "$last" | tr -c '[:print:]' ' ')
   if [ "${#last}" -gt "$FM_WEDGE_DECLARED_WAIT_NOTE_MAX" ]; then
     last="${last:0:$FM_WEDGE_DECLARED_WAIT_NOTE_MAX}..."
   fi
@@ -179,7 +194,7 @@ fm_wedge_declared_wait() {  # <state-dir> <task>
 # <declared-wait-eligible> is 1 only where the caller has NOT already reconciled
 # the pane's declared wait against authoritative crew state, and defaults to 0
 # for the same reason <busy-path> does: a call site that forgets it escalates.
-fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-class> <cpu-detail> <deferred-for> <budget-usable> <budget-note> <age> <pipeline-cache>
+fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-class> <cpu-detail> <deferred-for> <budget-usable> <budget-note> <age> <pipeline-cache> <declared-wait-eligible>
   local state=$1 task=$2 busy_verdict=$3 busy_path=${4:-0} cpu_class=$5 cpu_detail=$6
   local deferred_for=$7 budget_usable=$8 budget_note=$9 age=${10} cache=${11}
   local declared_eligible=${12:-0}

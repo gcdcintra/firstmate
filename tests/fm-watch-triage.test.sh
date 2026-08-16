@@ -3175,7 +3175,49 @@ test_spent_episode_disables_the_declared_wait_too() {
   pass "the shared deferral episode is spent once, so a declared wait cannot extend it past its own cap"
 }
 
+# The other half of the wrong-process case: a provably-working crew whose PANE
+# is legitimately static (waiting on CI, say) reaches the wedge timer through
+# the non-busy path, where the CPU tier is deliberately never consulted. The
+# pipeline tier applies there too, because it measures the pipeline rather than
+# the pane and so does not share the idle-prompt overlap that keeps the CPU tier
+# restricted. bin/fm-wedge-evidence-lib.sh's limits list owns the residual that
+# buys.
+test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case pipeline-nonbusy); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-pipe-nonbusy"
+  printf 'idle waiting on ci' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/pipe-nonbusy.meta"
+  printf 'working: still monitoring ci\n' > "$state/pipe-nonbusy.status"
+  sig=$(seen_sig "$state/pipe-nonbusy.status"); printf '%s' "$sig" > "$state/.seen-pipe-nonbusy_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle waiting on ci")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '1\n' > "$state/.count-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step ci, active 18m, last activity 31s' \
+    FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a non-busy provably-working stale did not defer on its advancing pipeline: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a crew whose pane is static while its pipeline advances was escalated: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; unset FM_FAKE_CREW_STATE; fail "a deferred non-busy stale printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a provably-working crew whose pane is static while its pipeline advances is deferred on the non-busy path too"
+}
+
 test_advancing_pipeline_run_defers_the_wedge
+test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline
 test_parked_pipeline_run_still_escalates_and_names_the_overridden_busy_verdict
 test_quiet_pipeline_run_still_escalates
 test_pipeline_deferral_is_bounded_and_still_reaches_demand_deep_inspection
