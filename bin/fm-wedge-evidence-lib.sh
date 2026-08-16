@@ -46,6 +46,22 @@
 #      Last resort, unchanged from bin/fm-cpu-progress-lib.sh, and still offered
 #      only on the busy-turn path.
 #
+# THE VETO, which is not a tier because it does not compete with them. Tiers ask
+# "does something here excuse this pane"; the veto asks "is any of this evidence
+# even ABOUT this worker". An open delegation-shaped tool call older than
+# FM_WEDGE_DELEGATION_BLOCK_SECS (bin/fm-delegation-lib.sh) says the worker is
+# blocked behind a helper of its own, and that is the one condition under which
+# tiers 3 and 4 are measuring somebody else: the pipeline's agent, and a pane
+# process whose CPU says nothing either way once the work moved behind a helper.
+# So an aged open delegation denies both, and the escalation names the shape
+# instead of arriving carrying four healthy-looking readings.
+#
+# Tier 2 keeps its credit through the veto ON PURPOSE. A worker that declared
+# its wait has already told supervision what it is doing, which is the
+# visibility this whole change is for; taking its cadence away would teach the
+# next worker to stay silent instead. Its deferral names the open delegation
+# too, so the choice is inspectable rather than invisible.
+#
 # THE SAFETY RULES, which are what keep this from becoming a quieter watcher
 # that stops looking - a worse defect than the false alarms it removes:
 #   - No tier ever clears the escalation ladder. `.wedge-escalations-<key>`
@@ -61,15 +77,24 @@
 #   - Every unmeasurable case earns nothing. A missing CLI, a timeout, coarse
 #     attribution, an unreadable table, or a corrupt episode record all escalate
 #     exactly as they did before this library existed.
+#   - The veto inverts that direction, so it is held to the opposite rule: an
+#     unmeasurable delegation record must never FIRE one. No records, an
+#     unreadable record, a missing timestamp, or a clock that stepped backwards
+#     all leave the tiers exactly as they were.
 #
 # WHAT THIS STILL CANNOT SEE. Stated rather than implied, because each of these
 # is a shape that reads healthy here:
-#   - A worker blocked on a helper process while its pipeline advances. Tier 3
-#     credits the pipeline, which really is progressing; the worker is invisible
-#     behind the helper. It is caught only by the ladder, at
-#     FM_WEDGE_PIPELINE_MAX_DEFER_SECS plus FM_WEDGE_DEMAND_INSPECT_COUNT
-#     ordinary escalations, which is why that cap is deliberately half the CPU
-#     one rather than matched to it.
+#   - A worker blocked on a helper the veto cannot see, while its pipeline
+#     advances. The veto covers this shape only where the harness reports its
+#     tool calls (Claude today) and only where the helper was reached through a
+#     delegation-SHAPED tool name; a helper launched through Bash, or a worker
+#     on a harness with no per-task tool hooks, still reaches tier 3, still
+#     defers on a pipeline that really is progressing, and is still caught only
+#     by the cap plus the ladder. That is why FM_WEDGE_PIPELINE_MAX_DEFER_SECS
+#     stays deliberately half the CPU cap rather than matched to it.
+#   - A delegation whose closing hook never fires leaves its record until the
+#     turn ends. The cost is one pane denied a deferral it would have been
+#     granted, and every such escalation still carries its full evidence.
 #   - A wedge that keeps burning CPU. Tier 4 cannot tell a retry loop from work;
 #     its cap and its escalation wording own that residual.
 #   - A worker whose declared wait is inaccurate. Tier 2 believes the claim for
@@ -95,8 +120,8 @@
 #
 # Sourcing: set -u and set -e safe. Requires bin/fm-classify-lib.sh (for
 # last_status_line, status_is_paused_or_captain_held, FM_CREW_STATE_BIN and
-# FM_PAUSE_RESURFACE_SECS_DEFAULT) and bin/fm-wake-lib.sh (for fm_path_age)
-# already sourced.
+# FM_PAUSE_RESURFACE_SECS_DEFAULT), bin/fm-wake-lib.sh (for fm_path_age), and
+# bin/fm-delegation-lib.sh (for fm_delegation_open_age) already sourced.
 
 # Per-tier caps, all measured against the pane's ONE shared deferral episode.
 #
@@ -116,6 +141,16 @@ FM_WEDGE_CPU_MAX_DEFER_SECS=${FM_CPU_PROGRESS_MAX_DEFER_SECS:-7200}
 # an idle declared wait already uses, so a worker gets one answer to the same
 # declaration whether or not it happens to be holding a turn open.
 FM_WEDGE_DECLARED_WAIT_CADENCE=${FM_PAUSE_RESURFACE_SECS:-${FM_PAUSE_RESURFACE_SECS_DEFAULT:-3600}}
+# How long one delegation-shaped tool call may stay open before the veto fires.
+#
+# It is far shorter than any tier cap because it is not buying a pane time - it
+# is deciding whether the other evidence is about this worker at all, and past
+# this point it is not. 900s is chosen against the two populations this must
+# separate: an ordinary crew delegation (a bounded search, a focused read) that
+# finishes in minutes, and the observed block, which ran over two hours. Nothing
+# here interrupts, signals, or restarts a worker; the whole effect is that the
+# soft tiers stop deferring and the escalation says what it is looking at.
+FM_WEDGE_DELEGATION_BLOCK_SECS=${FM_WEDGE_DELEGATION_BLOCK_SECS:-900}
 # Shortest interval between two pipeline reads for one pane. The read is a
 # bounded CLI call, and an aging pane is polled every FM_POLL seconds, so an
 # unthrottled read would run it several times a minute for hours.
@@ -149,6 +184,21 @@ fm_wedge_pipeline_activity() {  # <task> <cache-file>
   esac
   printf '%s\n' "$out" > "$cache" 2>/dev/null || true
   printf '%s' "$out"
+}
+
+# fm_wedge_delegation_block: the veto's read. 0 and a phrase naming the open
+# call and its age when this worker has been inside one delegation-shaped tool
+# call for at least FM_WEDGE_DELEGATION_BLOCK_SECS. Returns 1 - no veto - for
+# every shorter call and for every case the record cannot answer.
+fm_wedge_delegation_block() {  # <state-dir> <task>
+  local open age tool
+  open=$(fm_delegation_open_age "$1" "$2") || return 1
+  age=${open%% *}
+  tool=${open#* }
+  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$age" -ge "$FM_WEDGE_DELEGATION_BLOCK_SECS" ] || return 1
+  printf 'this worker has been inside the %s tool call for %ss, so it is blocked behind a helper of its own - the pipeline clock below measures the PIPELINE'"'"'s agent and the CPU counter measures a pane that a running helper leaves quiet or busy either way, so neither is evidence about THIS worker and neither may defer it' \
+    "$tool" "$age"
 }
 
 # fm_wedge_declared_wait: tier 2's cheap read. 0 and the (trimmed) declaring
@@ -207,7 +257,10 @@ fm_wedge_spent_note() {  # <cap> <deferred-for> <age> <budget-usable> <budget-no
 #             episode. <tier> names which evidence held it back.
 #   recheck   a declared wait has reached its long cadence: surface it as a
 #             recheck rather than a wedge, and count it on the ladder.
-#   escalate  nothing credits this pane; escalate as a possible wedge.
+#   escalate  nothing credits this pane; escalate as a possible wedge. <tier> is
+#             `delegation` when the veto produced it, which the caller treats as
+#             grounds to demand deep inspection on this escalation rather than
+#             the third one, and `none` otherwise.
 # <evidence> is the full ordered sentence, and every decision that reaches a
 # wake carries it, so an alarm a supervisor must dismiss can be dismissed by
 # reading it rather than by spending a turn re-deriving the same four reads.
@@ -228,12 +281,15 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
   local deferred_for=$7 budget_usable=$8 budget_note=$9 age=${10} cache=${11}
   local declared_eligible=${12:-0}
   local declared='' has_declared=0 declared_credited=0
+  local blocked='' is_blocked=0
   local pipeline pclass pdetail decision tier
   local harness_clause declared_clause pipeline_clause cpu_clause evidence busy_source
 
   if [ "$declared_eligible" -eq 1 ]; then
     declared=$(fm_wedge_declared_wait "$state" "$task") && has_declared=1 || has_declared=0
   fi
+  # The veto, read before any tier so tier 2's own deferral can name it too.
+  blocked=$(fm_wedge_delegation_block "$state" "$task") && is_blocked=1 || is_blocked=0
 
   # Tier 2 first, because it decides the CADENCE and costs one status-file read.
   # Deferring here without touching tier 3 is what keeps a long declared wait
@@ -242,8 +298,9 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
      && [ "$deferred_for" -lt "$FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS" ]; then
     declared_credited=1
     if [ "$age" -lt "$FM_WEDGE_DECLARED_WAIT_CADENCE" ]; then
-      printf 'defer\tdeclared-wait\t%s' \
-        "the worker declared a wait, so this pane is on the ${FM_WEDGE_DECLARED_WAIT_CADENCE}s recheck cadence rather than the wedge cadence ($declared)"
+      evidence="the worker declared a wait, so this pane is on the ${FM_WEDGE_DECLARED_WAIT_CADENCE}s recheck cadence rather than the wedge cadence ($declared)"
+      [ "$is_blocked" -eq 0 ] || evidence="$evidence; $blocked"
+      printf 'defer\tdeclared-wait\t%s' "$evidence"
       return 0
     fi
   fi
@@ -255,6 +312,13 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
   if [ "$declared_credited" -eq 1 ]; then
     decision=recheck
     tier='declared-wait'
+  elif [ "$is_blocked" -eq 1 ]; then
+    # The veto. Tiers 3 and 4 are not consulted at all here, because on this
+    # pane they are readings of another process, and the tier name carries the
+    # shape out to the caller so the escalation can demand a real look at once
+    # rather than waiting for a third identical alarm to earn one.
+    decision=escalate
+    tier=delegation
   elif [ "$budget_usable" -eq 1 ] && [ "$pclass" = active ] \
        && [ "$deferred_for" -lt "$FM_WEDGE_PIPELINE_MAX_DEFER_SECS" ] \
        && [ "$age" -lt "$FM_WEDGE_PIPELINE_MAX_DEFER_SECS" ]; then
@@ -311,6 +375,14 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
   cpu_clause="$cpu_detail"
   if [ "$busy_path" -eq 0 ]; then
     :
+  elif [ "$is_blocked" -eq 1 ]; then
+    # Both spin-loop hints below would contradict the veto that leads this
+    # sentence, and on the in-process-subagent shape they would be exactly
+    # wrong: the CPU really is climbing, in the delegating turn, because the
+    # helper runs there. Carry the reading and let the veto explain it, rather
+    # than sending an alarm that offers two answers and points at the wrong one
+    # first.
+    :
   elif [ "$cpu_class" = progressing ] \
        && fm_wedge_cap_latched "$FM_WEDGE_CPU_MAX_DEFER_SECS" "$deferred_for" "$age" "$budget_usable"; then
     cpu_clause="$cpu_clause, but this pane's ${FM_WEDGE_CPU_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - $(fm_wedge_spent_note "$FM_WEDGE_CPU_MAX_DEFER_SECS" "$deferred_for" "$age" "$budget_usable" "$budget_note") - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent"
@@ -318,7 +390,11 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
     cpu_clause="$cpu_clause, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent"
   fi
 
+  # The veto leads. Every clause after it is a reading of something other than
+  # this worker, and a supervisor who meets those readings first has already
+  # been handed the confident wrong explanation this alarm exists to prevent.
   evidence="$harness_clause; $pipeline_clause"
+  [ "$is_blocked" -eq 0 ] || evidence="$blocked; $evidence"
   [ -n "$declared_clause" ] && evidence="$evidence; $declared_clause"
   evidence="$evidence; $cpu_clause"
   printf '%s\t%s\t%s' "$decision" "$tier" "$evidence"

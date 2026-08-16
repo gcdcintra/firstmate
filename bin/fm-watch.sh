@@ -128,8 +128,13 @@ mkdir -p "$STATE"
 # busy-turn path.
 # shellcheck source=bin/fm-cpu-progress-lib.sh
 . "$SCRIPT_DIR/fm-cpu-progress-lib.sh"
+# A crewmate's currently-open delegation-shaped tool calls: the signature of a
+# worker blocked behind a helper of its own, which no other signal here has.
+# shellcheck source=bin/fm-delegation-lib.sh
+. "$SCRIPT_DIR/fm-delegation-lib.sh"
 # The ORDER in which a wedge alarm consults evidence, and what each tier may
-# buy. Sourced after the classifier and the CPU measure because it reads both.
+# buy. Sourced after the classifier, the CPU measure, and the delegation record
+# because it reads all three.
 # shellcheck source=bin/fm-wedge-evidence-lib.sh
 . "$SCRIPT_DIR/fm-wedge-evidence-lib.sh"
 
@@ -330,6 +335,13 @@ recorded_windows() {
 # look instead of another routine supervision resume. Reset wherever a window's
 # pane/hash state resets to genuinely active (see the two rm-on-reset call sites
 # below).
+#
+# The same marker is also added on the FIRST escalation of a worker the evidence
+# hierarchy vetoed as blocked inside a delegation tool call
+# (FM_WEDGE_DELEGATION_BLOCK_SECS, bin/fm-delegation-lib.sh). That is an
+# addition to this count rule, never a substitute: the count is what forces a
+# real look when no single reading explains a pane, and it is what caught the
+# 2026-08-15 delegation block before any of this existed.
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
 # Bound on how long ANY tier of the evidence hierarchy may keep deferring ONE
@@ -352,6 +364,14 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # FM_WEDGE_DEMAND_INSPECT_COUNT - until it goes genuinely active again.
 # bin/fm-wedge-evidence-lib.sh owns the per-tier caps read against that one
 # epoch, and why the pipeline tier's is deliberately shorter than the CPU tier's.
+#
+# One condition bypasses that budget entirely rather than shortening it: a
+# worker that has sat inside one delegation-shaped tool call for
+# FM_WEDGE_DELEGATION_BLOCK_SECS (default 900) is blocked behind a helper, and
+# the pipeline and CPU readings are then measurements of other processes. That
+# veto is owned by bin/fm-wedge-evidence-lib.sh and its record by
+# bin/fm-delegation-lib.sh; it withholds deferral and names the shape, and it
+# never interrupts, signals, or restarts a worker.
 
 # The ONE spelling of a window's marker-key transform, used by every marker
 # site in this watcher, so the key contract that fm-supervise-daemon.sh's
@@ -679,6 +699,15 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
           reason="stale: $win (${age_phrase}${FM_CLASSIFY_WEDGE_REASON_SEGMENT}$n; $evidence)"
           if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
             reason="$reason (demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
+          elif [ "$tier" = delegation ]; then
+            # The count rule is untouched - this is a second, independent way to
+            # earn the same marker, and it never delays or replaces that one.
+            # The count exists because three identical alarms mean no single
+            # reading can be trusted to explain the pane; here one reading
+            # already names WHY the run-step and pane state cannot explain it,
+            # so waiting for two more identical alarms would only spend the
+            # minutes this shape has already proven it can waste.
+            reason="$reason (demand-deep-inspection: this worker is blocked inside a delegation tool call - do not re-absorb on the run-step/pane state alone)"
           fi
         fi
         fm_wake_append stale "$win" "$reason" || exit 1

@@ -235,6 +235,48 @@ tests/fm-crew-state.test.sh
 tests/fm-watch-triage.test.sh
 ```
 
+## Delegation tool-call lifecycle
+
+The open-delegation record ([`bin/fm-delegation-lib.sh`](../../bin/fm-delegation-lib.sh)) is the wedge alarm's only signal for a worker blocked behind a helper of its own.
+Three facts about the hook lifecycle decide its design, and all three were measured rather than assumed, on 2026-08-16 against `2.1.233 (Claude Code)`.
+
+A scratch project outside any firstmate home registered one logging hook per event across matcher `.*`, then ran:
+
+```sh
+claude -p "Use the Agent tool (subagent_type general-purpose) exactly once to count the files in this directory. Then reply DONE." \
+  --dangerously-skip-permissions --output-format text
+```
+
+Recorded log, epoch seconds and the payload's own `tool_use_id`:
+
+```text
+1786883486 EVENT=PRE tool=Agent id=toolu_01YS8wq6JyxsqTbxQF9PEWhU
+1786883489 EVENT=PRE tool=Bash id=toolu_01UDdSKSLk7FLau6f92n65Zx
+1786883489 EVENT=POST tool=Bash id=toolu_01UDdSKSLk7FLau6f92n65Zx
+1786883494 EVENT=PRE tool=Bash id=toolu_011iE61drYDXfrbC1uRSSLiU
+1786883495 EVENT=POST tool=Bash id=toolu_011iE61drYDXfrbC1uRSSLiU
+1786883498 EVENT=PRE tool=Read id=toolu_01DH7v7x5SjRJvCb8CwqXANa
+1786883498 EVENT=POST tool=Read id=toolu_01DH7v7x5SjRJvCb8CwqXANa
+1786883499 EVENT=PRE tool=Read id=toolu_01URw2RiLjqJyZK3A6nR3ZS3
+1786883499 EVENT=POST tool=Read id=toolu_01URw2RiLjqJyZK3A6nR3ZS3
+1786883499 EVENT=PRE tool=Read id=toolu_017eux6b7PvF74E127rm3Cqj
+1786883499 EVENT=POST tool=Read id=toolu_017eux6b7PvF74E127rm3Cqj
+1786883547 EVENT=POST tool=Agent id=toolu_01YS8wq6JyxsqTbxQF9PEWhU
+1786883553 EVENT=STOP tool=- id=-
+```
+
+1. The delegation call is bracketed: `PreToolUse` and `PostToolUse` both fire for `Agent`, 61 seconds apart, and both payloads carry the same `tool_use_id`.
+   That id is what the record keys on.
+2. The subagent's own tool calls fire the same two hooks, **nested inside** the outer call, in the delegating session.
+   A close matched on anything looser than the call id would therefore have retired the outer record 3 seconds in, at the helper's first `Bash`.
+   `tests/fm-delegation-event.test.sh` and `tests/fm-busy-adapter-wiring.test.sh` both pin that.
+3. Those nested hooks firing in the delegating session is also the direct evidence that Claude's subagent is **in-process**.
+   The delegating turn's own CPU therefore keeps climbing while the worker waits, which is why a process-table detector could not have seen the observed block and why the signature lives at the tool layer instead.
+
+`Stop` fired once at the end of the whole turn, after the delegation closed, which is what makes clearing the record on every turn-close hook a safe bound on a call whose close never fires.
+
+Per-harness coverage follows the same rule as the guard's own wiring table in [`../subagent-guard.md`](../subagent-guard.md): only Claude is wired, because only Claude's per-task tool-call hooks are verified here, and that document records why an unvalidated hook is worse than a missing one.
+
 ## Endpoint absence
 
 The `gone` wake distinguishes a killed endpoint from a wedged worker, which no pane-shaped heuristic can do: both hold a frozen frame and a flat CPU counter.

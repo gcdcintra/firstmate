@@ -34,20 +34,41 @@ The scope line is therefore: wrong tool reached for, deny; wrong amount of think
 The guard is also not a dispatch-quality check.
 It says nothing about whether the resulting brief, project, or delivery mode is correct.
 
+## The crew-side question, and why the answer is different
+
+On 2026-08-15 a crewmate delegated a review-gate response to a helper and sat blocked on it for over two hours while its own pipeline carried on without it and opened the PR.
+The obvious reading is that the fence above should simply extend to crewmates.
+It should not, and the reason is worth stating because the same suggestion will be made again.
+
+This guard exists because a primary's untracked work makes the whole guard stack **structurally inert**: no `state/<id>.meta` is written, so the in-flight branch of every guard counts zero.
+None of that is true of a crewmate.
+Its metadata, its pane, its brief, and its watcher coverage all still exist while it delegates; what fails is narrower and different - supervision cannot see *which agent* the worker's open turn is waiting on.
+That is a visibility defect, not a durability one, and it calls for a different instrument.
+
+Denying crew delegation outright would also cost something real and verified.
+The linked-worktree negative case in the validation record below exists precisely to prove that a crewmate keeps its delegation tools, and bounded delegation - a search, a focused read - is legitimate work a crewmate should be able to do.
+A tool-layer deny cannot tell that apart from a gate-response delegation at call time, because at call time the only difference is what the worker intends to do with the answer.
+
+So the crew side is answered in two narrower places instead.
+
+- **Elapsed time, measured**: the crewmate's own tool-call hooks record each open delegation-shaped call under [`bin/fm-delegation-lib.sh`](../bin/fm-delegation-lib.sh), and the wedge alarm treats a call still open past `FM_WEDGE_DELEGATION_BLOCK_SECS` as proof that its other evidence is measuring a different process.
+  Duration is what separates the two cases the tool name cannot, and it needs no exclusion list to stay in sync.
+- **One rule where a helper is never acceptable**: the generated ship brief tells every crewmate not to delegate a pipeline gate response, because it owns every `axi` call for its own run and a helper in that path is unsupervisable by construction.
+
+The placement is the load-bearing part of the first one.
+Claude runs a subagent inside the delegating session, so the delegating turn's own CPU keeps climbing while the worker waits, and the block is invisible in the process table (see the tool-hook lifecycle evidence in [`verification/supervision.md`](verification/supervision.md)).
+A descendant scan would have missed the observed incident entirely; the tool layer sees it, and sees a separate-process helper too.
+
 ## Shipped mechanism
 
 `bin/fm-subagent-pretool-check.sh` is the shipped layer.
 It classifies the tool NAME by shape rather than against a fixed list.
 The tracked Claude PreToolUse matcher is `.*`, so every Claude tool name reaches the script and the script is the single owner of classification.
 A stem-enumerating matcher would reintroduce the fail-open-by-enumeration problem this guard exists to solve, because any future tool name outside the matcher would be silently missed before the script could inspect it.
-A tool is delegation-shaped when its normalized lowercase name contains one of these stems:
+The shape test itself - the stem list, the normalization, and the MCP exclusion below - is owned by [`bin/fm-delegation-lib.sh`](../bin/fm-delegation-lib.sh), because firstmate has a second consumer of the same classification: the crew-side visibility record described under "The crew-side question" below.
+The two consumers share the shape and keep their own exclusions.
 
-```text
-agent  subagent  task  workflow  cron  schedul  worktree
-delegate  spawn  dispatch  handoff  remote  sendmessage  monitor
-```
-
-Three exclusions keep the shape test from producing false positives.
+Three exclusions keep this guard's use of the shape test from producing false positives.
 
 - A name beginning `mcp__` is never classified.
   An MCP server chooses its own tool names, a task or agent noun there is common, and it has no bearing on fleet dispatch.

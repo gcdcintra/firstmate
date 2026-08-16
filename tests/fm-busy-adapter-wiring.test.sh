@@ -245,11 +245,15 @@ test_opencode_plugin_semantic_lifecycle() {
   pass "opencode plugin classifies from session.status, scoped to the latched worker session"
 }
 
-run_claude_hook() {  # <settings.json> <hook-event>
+run_claude_hook() {  # <settings.json> <hook-event> [<stdin-payload>]
   local cmd
   cmd=$(jq -r ".hooks[\"$2\"][0].hooks[0].command" "$1")
   [ -n "$cmd" ] && [ "$cmd" != null ] || fail "no $2 hook command in $1"
-  sh -c "$cmd"
+  if [ "$#" -gt 2 ]; then
+    printf '%s' "$3" | sh -c "$cmd"
+  else
+    sh -c "$cmd" < /dev/null
+  fi
 }
 
 test_claude_hooks_semantic_lifecycle() {
@@ -288,6 +292,63 @@ test_claude_hooks_semantic_lifecycle() {
   out=$(classify claude "$id" "$state")
   [ "$out" = "idle claude-hook" ] || fail "SessionEnd must classify idle, got '$out'"
   pass "claude hooks open on UserPromptSubmit and close on Stop, StopFailure, and SessionEnd"
+}
+
+# The open-delegation record rides the same generated settings file, because it
+# answers a question the busy verdict structurally cannot: the busy verdict is
+# TRUE while a worker sits blocked behind a helper, and says nothing about which
+# agent the open turn is actually waiting on. This drives the real generated
+# hook commands with real payloads.
+test_claude_tool_hooks_record_an_open_delegation_and_clear_it_on_turn_close() {
+  local rec id=busy-cl-3 out state settings open
+  rec=$(make_spawn_case claude-delegation claude "$id")
+  read_case_record "$rec"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" "$PROJ_DIR")
+  expect_code 0 $? "claude spawn should succeed: $out"
+  state="$HOME_DIR/state"
+  settings="$WT_DIR/.claude/settings.local.json"
+  jq -e . "$settings" >/dev/null || fail "claude hook settings are not valid JSON"
+  # The matcher must cover every tool name, for the reason docs/subagent-guard.md
+  # gives: the script owns the shape test, so a delegation tool that ships later
+  # is covered without anyone editing a matcher.
+  for ev in PreToolUse PostToolUse; do
+    [ "$(jq -r ".hooks[\"$ev\"][0].matcher" "$settings")" = '.*' ] \
+      || fail "the $ev hook is not registered across every tool name"
+  done
+
+  # shellcheck source=bin/fm-delegation-lib.sh
+  . "$ROOT/bin/fm-delegation-lib.sh"
+
+  run_claude_hook "$settings" PreToolUse '{"tool_name":"Read","tool_use_id":"t_read"}'
+  fm_delegation_open_age "$state" "$id" >/dev/null \
+    && fail "an ordinary tool call opened a delegation record"
+
+  run_claude_hook "$settings" PreToolUse '{"tool_name":"Agent","tool_use_id":"t_outer"}'
+  open=$(fm_delegation_open_age "$state" "$id") \
+    || fail "a delegation tool call left no open record"
+  [ "${open#* }" = Agent ] || fail "the open record names the wrong tool: $open"
+
+  # A helper's own calls are nested inside the outer one and must not retire it.
+  run_claude_hook "$settings" PreToolUse '{"tool_name":"Bash","tool_use_id":"t_inner"}'
+  run_claude_hook "$settings" PostToolUse '{"tool_name":"Bash","tool_use_id":"t_inner"}'
+  fm_delegation_open_age "$state" "$id" >/dev/null \
+    || fail "a nested helper tool call retired the outer delegation"
+
+  run_claude_hook "$settings" PostToolUse '{"tool_name":"Agent","tool_use_id":"t_outer"}'
+  fm_delegation_open_age "$state" "$id" >/dev/null \
+    && fail "the delegation record survived its own matching close"
+
+  # Every turn-close hook clears the record, so a call whose close never fires
+  # (an interrupt, an abnormal end) cannot outlive one turn.
+  for ev in Stop StopFailure SessionEnd UserPromptSubmit; do
+    run_claude_hook "$settings" PreToolUse '{"tool_name":"Agent","tool_use_id":"t_stale"}'
+    fm_delegation_open_age "$state" "$id" >/dev/null \
+      || fail "could not re-open a record before testing $ev"
+    run_claude_hook "$settings" "$ev"
+    fm_delegation_open_age "$state" "$id" >/dev/null \
+      && fail "$ev left a stale delegation record behind"
+  done
+  pass "claude tool hooks record an open delegation, survive nested helper calls, and clear on every turn close"
 }
 
 test_claude_hooks_stale_incarnation_harmless() {
@@ -344,6 +405,7 @@ test_pi_extension_stale_incarnation_rejected
 test_kimi_and_grok_install_no_unverified_wiring
 test_opencode_plugin_semantic_lifecycle
 test_claude_hooks_semantic_lifecycle
+test_claude_tool_hooks_record_an_open_delegation_and_clear_it_on_turn_close
 test_claude_hooks_stale_incarnation_harmless
 test_codex_unverified_until_a_semantic_source_exists
 
