@@ -641,12 +641,22 @@ SH
   pass "valid direct and merge flows record exact metadata and reject multiline head metadata"
 }
 
+# A watcher bounded to one PR-poll question, with every wake source this suite
+# does not own turned off so the poll's own wake is the only one that can fire.
+# FM_HEARTBEAT and FM_ENDPOINT_ABSENCE_CONFIRM_POLLS are both pushed out of
+# reach for the same reason: these fixtures record a `window=` because the PR
+# and teardown flows require one, never create the endpoint it names, and
+# wake() exits on the FIRST actionable wake - so a heartbeat, or the gone wake
+# a never-created endpoint legitimately earns, would end the run before the
+# publication under test finishes and mask the assertion entirely. Endpoint
+# absence has its own coverage in tests/fm-watch-triage.test.sh.
 run_watcher_bounded() {
   local home=$1 fakebin=$2 check_interval=${FM_TEST_CHECK_INTERVAL:-0} watch_root=${FM_TEST_WATCH_ROOT:-$ROOT}
   shift 2
   perl -e 'my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } local $SIG{ALRM}=sub { kill "TERM", $pid; waitpid $pid, 0; exit 124 }; alarm 10; waitpid $pid, 0; alarm 0; exit($? >> 8)' \
     env FM_HOME="$home" FM_ROOT_OVERRIDE="$watch_root" FM_CHECK_INTERVAL="$check_interval" FM_CHECK_TIMEOUT=1 \
-      FM_POLL=0.02 FM_HEARTBEAT=999999 FM_SIGNAL_GRACE=0 PATH="$fakebin:$BASE_PATH" "$WATCH" "$@"
+      FM_POLL=0.02 FM_HEARTBEAT=999999 FM_ENDPOINT_ABSENCE_CONFIRM_POLLS=999999 \
+      FM_SIGNAL_GRACE=0 PATH="$fakebin:$BASE_PATH" "$WATCH" "$@"
 }
 
 test_rejected_metacharacter_bytes_are_inert() {
