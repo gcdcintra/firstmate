@@ -403,6 +403,9 @@ You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 When starting no-mistakes, make \`--intent\` preserve all relevant content from this brief's \`# Task\` section plus every later accepted Firstmate requirement, clarification, constraint, exclusion, and supersession, carrying only each requirement's current accepted form; retain direct requirements instead of substituting a diff summary, and exclude generic operational, status, delivery, and other scaffold boilerplate unless it is task-specific.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
+Answer every gate yourself, in your own turn.
+Never hand a gate response to a helper agent or subagent: you own every \`axi\` call for your run, and a helper in that path is invisible to the supervisor watching you - a worker that did this once sat blocked on its helper for over two hours while its own pipeline carried on without it.
+Delegating bounded research or search is fine; delegating the thing you were spawned to answer is not.
 
 Three firstmate-specific rules layer on top of that guidance:
 - If the pipeline will not return custody of your branch because the gate has diverged, a run died mid-flight and its guarded recovery can never succeed again.

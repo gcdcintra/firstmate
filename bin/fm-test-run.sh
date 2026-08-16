@@ -137,6 +137,7 @@ family_for_basename() {
     fm-calm-pi-extension.test.sh|fm-cd-pretool-check.test.sh|\
     fm-composer-ghost.test.sh|fm-composer-lib.test.sh|\
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
+    fm-delegation-event.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
@@ -914,6 +915,14 @@ families_for_changed_path() {
     bin/fm-quota-kill-lib.sh)
       # Two consumers in different families: bin/fm-crew-state.sh names a failed
       # run's cause, and bin/fm-push-transition-lib.sh names a blocked pane's.
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' watcher-wake-lock
+      ;;
+    bin/fm-delegation-lib.sh)
+      # Two consumers in different families: the shape test and the record
+      # contract have their own unit suites, and bin/fm-watch.sh sources this
+      # file for fm_delegation_open_age, which is the delegation veto in the
+      # wedge hierarchy.
       printf '%s\n' pure-contract-unit
       printf '%s\n' watcher-wake-lock
       ;;

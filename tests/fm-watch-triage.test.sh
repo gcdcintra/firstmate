@@ -3265,6 +3265,306 @@ test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline() {
   pass "a provably-working crew whose pane is static while its pipeline advances is deferred on the non-busy path too"
 }
 
+# --- the delegation veto: a worker blocked behind a helper of its own --------
+#
+# Observed 2026-08-15 (fm-crew-delegation-invisible-wedge): a crewmate delegated
+# a review-gate response to a helper and sat blocked on it for over two hours
+# while its own pipeline carried on without it. The signals were not merely
+# unread this time - they were read, and each was CORRECT about its own subject,
+# which is a different and harder failure than the one the hierarchy above
+# fixed. The helper sat between the worker and every one of them.
+#
+# These cases pin the separation that matters, and the pair that matters most is
+# the last two: identical panes, identical harness verdict, the SAME real
+# spinning process measured as progressing, differing only in whether a
+# delegation call is open. One must escalate and one must be left alone. If a
+# future change makes those two behave the same, it has either lost the
+# signature or started disturbing healthy work.
+
+# seed_delegation: state an open delegation-shaped tool call as having been open
+# for <age> seconds, the way bin/fm-delegation-event.sh records one from the
+# worker's own PreToolUse hook.
+seed_delegation() {  # <state> <id> <age-secs> [tool]
+  local dir="$1/$2.delegating"
+  mkdir -p "$dir"
+  printf 'v1 ts=%s tool=%s\n' "$(( $(date +%s) - $3 ))" "${4:-Agent}" > "$dir/toolu_fixture"
+}
+
+# The BASELINE, kept as a live case rather than a claim in a comment: with the
+# veto switched off, the incident's exact shape really is deferred by tier 3.
+# Every signal reads healthy and the pipeline genuinely is advancing, so the
+# hierarchy that landed before this change absorbs it and the block stays
+# invisible until the cap and the ladder eventually force a look. That is what
+# the veto below has to change, and this is the case that proves it needed to.
+test_without_the_veto_the_delegation_shape_is_still_deferred() {
+  local dir state fakebin out window key id pid
+  window="test:fm-deleg-baseline"
+  dir=$(cpu_wedge_case delegation-baseline "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  seed_delegation "$state" "$id" 7200
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step review, active 2h, last activity 19s' \
+    FM_WEDGE_DELEGATION_BLOCK_SECS=999999 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; fail "the baseline shape did not defer, so this case no longer reproduces what the veto fixes: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "the baseline shape escalated without the veto: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "the baseline shape printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  pass "with the veto off, a worker blocked behind a helper is still absorbed by its advancing pipeline"
+}
+
+# The same pane with the veto live. The pipeline reading is unchanged and still
+# accurate; what changes is that it is no longer allowed to speak for a worker
+# that is not the one doing that work.
+test_an_aged_delegation_denies_the_pipeline_tier_and_names_the_shape() {
+  local dir state fakebin out window key id pid aged
+  window="test:fm-deleg-veto"
+  dir=$(cpu_wedge_case delegation-veto "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  seed_delegation "$state" "$id" 7200
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step review, active 2h, last activity 19s' \
+    FM_WEDGE_DELEGATION_BLOCK_SECS=900 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a worker blocked inside a delegation call kept deferring on its pipeline: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "the delegation block did not escalate as a possible wedge: $(cat "$out")"
+  aged=$(grep -Eo 'inside the Agent tool call for [0-9]+s' "$out" | head -1 | tr -cd '0-9')
+  [ -n "$aged" ] && [ "$aged" -ge 7200 ] \
+    || fail "the escalation did not name the open delegation call at its seeded age: $(cat "$out")"
+  grep -F "blocked behind a helper of its own" "$out" >/dev/null \
+    || fail "the escalation did not name the shape: $(cat "$out")"
+  # The pipeline reading is still carried - it is real evidence - but it must
+  # arrive AFTER the veto that explains why it is not about this worker, or the
+  # alarm hands its reader the confident wrong answer first.
+  grep -F "the attributed pipeline run is at step review" "$out" >/dev/null \
+    || fail "the escalation dropped the pipeline evidence it still carries: $(cat "$out")"
+  case "$(cat "$out")" in
+    *"blocked behind a helper of its own"*"the attributed pipeline run is at step review"*) : ;;
+    *) fail "the pipeline reading was placed ahead of the veto that explains it: $(cat "$out")" ;;
+  esac
+  # A positively identified block earns the real look on its FIRST alarm: one
+  # reading already names why the run-step and pane state cannot explain this
+  # pane, so waiting for two more identical alarms would only spend the minutes
+  # this shape has already proven it can waste.
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    || fail "a positively identified delegation block did not demand a real look: $(cat "$out")"
+  grep -F "escalation 1" "$out" >/dev/null \
+    || fail "the delegation block was not the pane's first escalation: $(cat "$out")"
+  [ ! -s "$state/.wedge-defer-since-$key" ] \
+    || fail "a vetoed pane opened a deferral episode it was never granted"
+  pass "an aged delegation denies the pipeline tier, names the shape first, and demands a real look at once"
+}
+
+# The veto is a measurement like any other, so a short call must buy nothing and
+# cost nothing. An ordinary bounded delegation - a search, a focused read - is
+# open for minutes and must leave the hierarchy exactly as it was.
+test_a_short_delegation_leaves_the_hierarchy_untouched() {
+  local dir state fakebin out window key id pid
+  window="test:fm-deleg-short"
+  dir=$(cpu_wedge_case delegation-short "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  seed_delegation "$state" "$id" 60
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step document, active 34m, last activity 24s' \
+    FM_WEDGE_DELEGATION_BLOCK_SECS=900 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; fail "a short delegation cost the pane its pipeline deferral: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "a short delegation was escalated as a block: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "a short delegation printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  pass "a delegation call that has not been open long buys and costs the hierarchy nothing"
+}
+
+# The strongest pair, and the reason the signature had to live at the tool layer
+# rather than in the process table. Claude runs a subagent IN the delegating
+# session, so the delegating turn's own CPU keeps climbing while the worker
+# waits - it reads exactly like a healthy long tool call, because at the process
+# level it IS one (docs/verification/supervision.md).
+#
+# Both halves run the same real spinning process, measured progressing by the
+# same predicate. Only the open delegation call differs.
+test_a_delegation_block_escalates_even_while_the_worker_process_burns_cpu() {
+  local dir state fakebin out window key id pid
+  window="test:fm-deleg-cpu"
+  dir=$(cpu_wedge_case delegation-cpu "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  spawn_cpu_fixture busy
+  seed_cpu_anchor "$state" "$key" "$CPU_SPAWNED"
+
+  # Phase A: mature the CPU window against the real process.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_live "$pid" 45 || { cpu_reap_kids; reap "$pid"; fail "the fixture escalated during warm-up: $(cat "$out")"; }
+  reap "$pid"
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the watcher did not measure the fixture as progressing, so this case would not test the veto: $(cat "$state/.cpu-$key")"; }
+
+  # Phase B, half one: no delegation open. This is the healthy long call - the
+  # two-hour consultation with tokens and CPU climbing - and it must be left
+  # alone exactly as before.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_WEDGE_DELEGATION_BLOCK_SECS=900 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    cpu_reap_kids; reap "$pid"; fail "a healthy long tool call with CPU climbing was escalated: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { cpu_reap_kids; reap "$pid"; fail "a healthy long tool call printed a wake: $(cat "$out")"; }
+  reap "$pid"
+
+  # Phase C, half two: the identical pane, the identical process, still measured
+  # progressing - with one delegation call open past the block threshold.
+  seed_delegation "$state" "$id" 5400 Agent
+  rm -f "$state/.wedge-defer-since-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 \
+    FM_WEDGE_DELEGATION_BLOCK_SECS=900 \
+    FM_CPU_PROGRESS_WINDOW=2 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_for_exit "$pid" 60; then
+    cpu_reap_kids; reap "$pid"; fail "a delegation block hid behind a progressing CPU reading: $(cat "$out")"
+  fi
+  grep -q 'class=progressing' "$state/.cpu-$key" \
+    || { cpu_reap_kids; fail "the fixture stopped spinning, so the two halves were not measured alike: $(cat "$state/.cpu-$key")"; }
+  grep -F "inside the Agent tool call for" "$out" >/dev/null \
+    || { cpu_reap_kids; fail "the escalation did not name the open delegation: $(cat "$out")"; }
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    || { cpu_reap_kids; fail "the delegation block did not demand a real look: $(cat "$out")"; }
+  # The climbing CPU is real and is still carried, but its ordinary spin-loop
+  # hint would contradict the veto leading the same sentence - and on this
+  # shape it points exactly the wrong way, because the CPU is climbing in the
+  # delegating turn precisely BECAUSE the helper runs there. An alarm that
+  # offers two answers and leads with the wrong one is the failure this whole
+  # change exists to stop.
+  grep -F "spin loop" "$out" >/dev/null \
+    && { cpu_reap_kids; fail "the delegation escalation also told its reader to look for a spin loop: $(cat "$out")"; }
+  cpu_reap_kids
+  pass "a delegation block escalates while an identical healthy long call with the same climbing CPU is left alone"
+}
+
+# Tier 2 keeps its credit THROUGH the veto, and that is a decision rather than a
+# fallout: a worker that declared its wait has already told supervision what it
+# is doing, which is the visibility this whole change is for, so taking its
+# cadence away would teach the next worker to stay silent instead. The half of
+# that decision with no coverage before is the second one - the deferral must
+# NAME the open delegation, so a choice made on the quiet path stays
+# inspectable rather than becoming the invisible absorb this incident was.
+#
+# The failure direction is proven in the same case by running the identical
+# fixture with the veto switched off. That path is byte-identical to the
+# behavior before the veto existed - fm_wedge_delegation_block returns 1, so
+# tier 2 composes its sentence with no delegation clause - and there the
+# deferral hides the delegation it deferred over. Proving it against the knob
+# rather than against a historical commit keeps the proof runnable in CI
+# forever instead of pinned to a hash that shallow clones may not carry.
+delegation_declared_wait_case() {  # <name> <window> <block-secs> -> sets DELEGATION_CASE_DIR
+  local name=$1 window=$2 block=$3 dir state fakebin out key id pid
+  dir=$(cpu_wedge_case "$name" "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  printf 'paused: waiting on the review helper to come back, roughly 30-60 min\n' > "$state/$id.status"
+  printf '%s' "$(seen_sig "$state/$id.status")" > "$state/.seen-${id}_status"
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  seed_delegation "$state" "$id" 7200
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_WEDGE_DELEGATION_BLOCK_SECS="$block" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  # The declared wait must still buy its long cadence with a delegation open.
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; fail "$name: the declared wait lost its recheck window: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "$name: a declared wait was escalated as a possible wedge: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "$name: a declared wait inside its recheck window printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  grep -F 'declared wait on the long recheck cadence' "$state/.watch-triage.log" >/dev/null \
+    || fail "$name: the absorb did not record the declared wait as its reason: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  DELEGATION_CASE_DIR=$dir
+}
+
+test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation() {
+  local state aged
+
+  # The failure direction: with the veto off, the deferral says only that a wait
+  # was declared and never mentions the helper the worker is actually stuck on.
+  delegation_declared_wait_case delegation-declared-noveto "test:fm-deleg-dw-off" 999999
+  state="$DELEGATION_CASE_DIR/state"
+  grep -F 'inside the Agent tool call for' "$state/.watch-triage.log" >/dev/null \
+    && fail "the veto-off half named the open delegation, so this case cannot prove the failure direction: $(cat "$state/.watch-triage.log")"
+
+  # With the veto live the cadence is unchanged - still deferred, still silent,
+  # still on the declared-wait reason - and the delegation is now named.
+  delegation_declared_wait_case delegation-declared-veto "test:fm-deleg-dw-on" 900
+  state="$DELEGATION_CASE_DIR/state"
+  aged=$(grep -Eo 'inside the Agent tool call for [0-9]+s' "$state/.watch-triage.log" | head -1 | tr -cd '0-9')
+  [ -n "$aged" ] && [ "$aged" -ge 7200 ] \
+    || fail "the deferral hid the open delegation it deferred over: $(cat "$state/.watch-triage.log")"
+  grep -F 'blocked behind a helper of its own' "$state/.watch-triage.log" >/dev/null \
+    || fail "the deferral named the call but not the shape it makes: $(cat "$state/.watch-triage.log")"
+  pass "a declared wait keeps its cadence through the veto, and its deferral names the open delegation it deferred over"
+}
+
 test_advancing_pipeline_run_defers_the_wedge
 test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline
 test_parked_pipeline_run_still_escalates_and_names_the_overridden_busy_verdict
@@ -3274,3 +3574,8 @@ test_pipeline_allowance_spent_by_pane_age_says_so_in_the_escalation
 test_declared_wait_on_a_busy_turn_gets_the_long_recheck_cadence
 test_declared_wait_rechecks_count_on_the_ladder_and_reach_demand_deep_inspection
 test_spent_episode_disables_the_declared_wait_too
+test_without_the_veto_the_delegation_shape_is_still_deferred
+test_an_aged_delegation_denies_the_pipeline_tier_and_names_the_shape
+test_a_short_delegation_leaves_the_hierarchy_untouched
+test_a_delegation_block_escalates_even_while_the_worker_process_burns_cpu
+test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation

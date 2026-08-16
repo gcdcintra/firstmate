@@ -52,12 +52,14 @@
 # OpenCode and Pi consume exit 2 plus stderr.
 set -u
 
-# Lowercase substrings that mark a tool name as delegation-shaped: it creates
-# work, an agent, a schedule, or an isolated workspace that firstmate would not
-# know about. This list is the single owner of the shipped classification.
-DELEGATION_STEMS='agent subagent task workflow cron schedul worktree delegate spawn dispatch handoff remote sendmessage monitor'
-
-# Exact lowercase tool names that match a stem above but only OBSERVE or STOP
+# The delegation-shape test itself - the stem list, the normalization, and the
+# MCP exclusion - is owned by bin/fm-delegation-lib.sh, because firstmate now
+# has a second consumer of the same classification: a crewmate's open
+# delegation calls, which supervision reads to see a worker blocked behind a
+# helper. The two consumers share the shape and keep their OWN exclusions, for
+# the reasons the exclusion comments below and that library's header give.
+#
+# Exact lowercase tool names that match a stem but only OBSERVE or STOP
 # work that already exists. Reading or ending unaccounted work is not creating
 # it, and denying these would strand already-running work with no way to inspect
 # or end it. A local Claude deny list may still remove these from the
@@ -142,27 +144,17 @@ fi
 
 [ -n "$TOOL" ] || exit 0
 
-LC_ALL=C NORMALIZED=$(printf '%s' "$TOOL" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
+# shellcheck source=bin/fm-delegation-lib.sh
+. "$SCRIPT_DIR/fm-delegation-lib.sh" 2>/dev/null || exit 0
 
-# An MCP tool belongs to an external integration, not to the harness's own
-# delegation surface, and its name is chosen by that server. Never classify one
-# here: an MCP server with a task or agent noun in a tool name is common and
-# blocking it would be a false positive with no bearing on fleet dispatch.
-case "$TOOL" in
-  mcp__*) exit 0 ;;
-esac
+NORMALIZED=$(fm_delegation_normalize "$TOOL")
 
 for allowed in $OBSERVE_ONLY_TOOLS $PLAN_ONLY_TOOLS; do
   [ "$NORMALIZED" != "$allowed" ] || exit 0
 done
 
-MATCHED=""
-for stem in $DELEGATION_STEMS; do
-  case "$NORMALIZED" in
-    *"$stem"*) MATCHED=$stem; break ;;
-  esac
-done
-[ -n "$MATCHED" ] || exit 0
+MATCHED=$(fm_delegation_shape_match "$TOOL") || exit 0
 
 # The single deliberate escape hatch. It is an environment variable rather than
 # a flag or a state file so it must be set when the session is launched, which
@@ -170,7 +162,6 @@ done
 # in-session tool call can set it for the call that follows.
 [ "${FM_ALLOW_SUBAGENT:-}" != "1" ] || exit 0
 
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
 FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)} || exit 0
 FM_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}
 STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}

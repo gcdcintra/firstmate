@@ -42,6 +42,14 @@ Read `bin/fm-quota-advice.sh` before deciding anything: the account, weekly, and
 Release the worker once the binding window has room, and record the wait as a declared pause meanwhile.
 A failed validation run reports the same cause in `bin/fm-crew-state.sh`'s detail when the pipeline's own logs prove it; that run's branch content is untouched and its worker is not at fault.
 
+## A worker blocked inside a delegation tool call looks busy and is not
+
+A wake reason naming an open delegation tool call means the worker started a helper and has been waiting on it, not that the pane froze.
+Peeking will show a tool call in flight and the harness will report the turn busy, both correctly, so the ladder below reads this worker as healthy and re-absorbs it; one worker sat this way for over two hours while its own pipeline carried on without it.
+Treat that named wake as the evidence and do not wait for the pane to look wrong.
+Interrupt the tool call with the adapter's interrupt key, then steer the worker in one line to do the work in its own turn rather than delegating it, which is what the brief already requires for anything on its pipeline's gate path.
+Nothing is lost by interrupting: the helper's work was never committed, and the branch, the worktree, and any running validation are untouched.
+
 ## Live-endpoint escalation
 
 Escalate in order:

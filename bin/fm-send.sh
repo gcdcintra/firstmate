@@ -90,6 +90,13 @@ fm_send_record_interrupt() {  # <key>
   case "$TARGET_HARNESS" in claude*) : ;; *) return 0 ;; esac
   [ -n "$TARGET_META" ] || return 0
   id=$(fm_send_id_from_meta "$TARGET_META")
+  # An interrupt fires no closing TOOL-call hook either, so the task's open
+  # delegation records are retired here for the same reason the busy edge is.
+  # Ahead of the busy-gen precondition, which is busy-specific: a task with no
+  # armed generation can still hold a delegation record. Best-effort by
+  # contract - the event script is silent and always exits 0, and a lost clear
+  # must never turn a landed interrupt into a failure.
+  "$FM_ROOT/bin/fm-delegation-event.sh" clear "$STATE" "$id" >/dev/null 2>&1 || true
   [ -f "$STATE/$id.busy-gen" ] || return 0
   gen=$(fm_meta_get "$TARGET_META" busy_gen)
   if [ -n "$gen" ]; then

@@ -1434,16 +1434,34 @@ if [ "$KIND" != secondmate ]; then
       # turn-ended NOTIFICATION touch for the watcher. Every hook command
       # tolerates a refused event (|| true) so a stale-gen writer can never
       # break Claude's own lifecycle.
+      # Open-delegation records (bin/fm-delegation-lib.sh) ride the same file.
+      # PreToolUse opens a record for a delegation-shaped tool call and
+      # PostToolUse retires it by the harness's own tool-call id, which is
+      # required rather than tidy: a subagent's tool calls fire these same hooks
+      # NESTED inside the outer delegation call, so a looser close would clear
+      # the outer record the moment the helper ran its first command. The
+      # matcher is `.*` for the reason docs/subagent-guard.md gives - the script
+      # is the single owner of the shape test, so a future delegation tool name
+      # is covered without editing a matcher. Every turn-close hook also clears
+      # the whole record, and bin/fm-send.sh clears it on a firstmate interrupt,
+      # which Claude answers with no hook of its own; together they bound a call
+      # whose PostToolUse never fires to one turn.
       mkdir -p "$WT/.claude"
       busy_cmd_prefix="$(shell_quote "$FM_ROOT/bin/fm-busy-event.sh") apply $(shell_quote "$STATE_REAL") $(shell_quote "$ID")"
       busy_suffix="--gen $(shell_quote "$BUSY_GEN") --source claude-hook"
-      j_submit=$(json_escape "$busy_cmd_prefix busy $busy_suffix --event user-prompt-submit 2>/dev/null || true")
-      j_stop=$(json_escape "touch $(shell_quote "$TURNEND"); $busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true")
-      j_stopfail=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event stop-failure 2>/dev/null || true")
-      j_sessionend=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event session-end 2>/dev/null || true")
+      deleg_cmd="$(shell_quote "$FM_ROOT/bin/fm-delegation-event.sh")"
+      deleg_args="$(shell_quote "$STATE_REAL") $(shell_quote "$ID")"
+      deleg_clear="$deleg_cmd clear $deleg_args 2>/dev/null || true"
+      j_submit=$(json_escape "$busy_cmd_prefix busy $busy_suffix --event user-prompt-submit 2>/dev/null || true; $deleg_clear")
+      j_stop=$(json_escape "touch $(shell_quote "$TURNEND"); $busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true; $deleg_clear")
+      j_stopfail=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event stop-failure 2>/dev/null || true; $deleg_clear")
+      j_sessionend=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event session-end 2>/dev/null || true; $deleg_clear")
+      j_pretool=$(json_escape "$deleg_cmd open $deleg_args 2>/dev/null || true")
+      j_posttool=$(json_escape "$deleg_cmd close $deleg_args 2>/dev/null || true")
       cat > "$WT/.claude/settings.local.json" <<EOF
-{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}]}}
+{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$j_submit"}]}],"Stop":[{"hooks":[{"type":"command","command":"$j_stop"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"$j_stopfail"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"$j_sessionend"}]}],"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"$j_pretool"}]}],"PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"$j_posttool"}]}]}}
 EOF
+      "$FM_ROOT/bin/fm-delegation-event.sh" clear "$STATE_REAL" "$ID" >/dev/null 2>&1 || true
       exclude_path '.claude/settings.local.json'
       ;;
     opencode*)
