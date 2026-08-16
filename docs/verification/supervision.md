@@ -277,6 +277,33 @@ Recorded log, epoch seconds and the payload's own `tool_use_id`:
 
 Per-harness coverage follows the same rule as the guard's own wiring table in [`../subagent-guard.md`](../subagent-guard.md): only Claude is wired, because only Claude's per-task tool-call hooks are verified here, and that document records why an unvalidated hook is worse than a missing one.
 
+### The quiet path, measured against the pre-veto watcher
+
+A declared wait keeps its long recheck cadence through the veto, so that pane never escalates and its only record is one triage line.
+That makes it the easiest place for the veto to be silently reverted, and the reason `tests/fm-watch-triage.test.sh` asserts the deferral NAMES the open delegation rather than only that it deferred.
+
+That test proves its own failure direction in CI by re-running the identical fixture with `FM_WEDGE_DELEGATION_BLOCK_SECS` set high, which reproduces the pre-veto sentence exactly - `fm_wedge_delegation_block` returns 1, so tier 2 composes with no delegation clause.
+Pinning the proof to the knob rather than to a commit keeps it runnable in a shallow clone.
+
+The equivalence of those two was confirmed once, on 2026-08-16, by running that same case against the real pre-change watcher extracted from the branch point `f8fc8bf`:
+
+```sh
+git archive f8fc8bf bin | tar -x -C "$base"
+# same suite, WATCH repointed at "$base/bin/fm-watch.sh"
+```
+
+Observed triage line, with the delegation record open for 7200s:
+
+```text
+deferred busy (no completed turn) wedge escalation, declared wait on the long recheck cadence
+(no completed turn for 500s): test:fm-deleg-dw-on - the worker declared a wait, so this pane is
+on the 3600s recheck cadence rather than the wedge cadence (paused: waiting on the review helper
+to come back, roughly 30-60 min)
+```
+
+The pane was deferred and the helper it was deferred over is absent from the line, which is the invisible absorb this change exists to end.
+The extraction driver is deliberately not committed: it hardcodes a branch point that shallow clones need not carry, and the committed knob-off case already asserts the same contract on every run.
+
 ## Endpoint absence
 
 The `gone` wake distinguishes a killed endpoint from a wedged worker, which no pane-shaped heuristic can do: both hold a frozen frame and a flat CPU counter.

@@ -3493,6 +3493,76 @@ test_a_delegation_block_escalates_even_while_the_worker_process_burns_cpu() {
   pass "a delegation block escalates while an identical healthy long call with the same climbing CPU is left alone"
 }
 
+# Tier 2 keeps its credit THROUGH the veto, and that is a decision rather than a
+# fallout: a worker that declared its wait has already told supervision what it
+# is doing, which is the visibility this whole change is for, so taking its
+# cadence away would teach the next worker to stay silent instead. The half of
+# that decision with no coverage before is the second one - the deferral must
+# NAME the open delegation, so a choice made on the quiet path stays
+# inspectable rather than becoming the invisible absorb this incident was.
+#
+# The failure direction is proven in the same case by running the identical
+# fixture with the veto switched off. That path is byte-identical to the
+# behavior before the veto existed - fm_wedge_delegation_block returns 1, so
+# tier 2 composes its sentence with no delegation clause - and there the
+# deferral hides the delegation it deferred over. Proving it against the knob
+# rather than against a historical commit keeps the proof runnable in CI
+# forever instead of pinned to a hash that shallow clones may not carry.
+delegation_declared_wait_case() {  # <name> <window> <block-secs> -> echoes dir
+  local name=$1 window=$2 block=$3 dir state fakebin out key id pid
+  dir=$(cpu_wedge_case "$name" "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  id=${window#*:fm-}
+  printf 'paused: waiting on the review helper to come back, roughly 30-60 min\n' > "$state/$id.status"
+  printf '%s' "$(seen_sig "$state/$id.status")" > "$state/.seen-${id}_status"
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  seed_delegation "$state" "$id" 7200
+
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_WEDGE_DELEGATION_BLOCK_SECS="$block" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  # The declared wait must still buy its long cadence with a delegation open.
+  if ! wait_numeric_file "$state/.wedge-defer-since-$key" 60; then
+    reap "$pid"; fail "$name: the declared wait lost its recheck window: $(cat "$out")"
+  fi
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "$name: a declared wait was escalated as a possible wedge: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "$name: a declared wait inside its recheck window printed a wake: $(cat "$out")"; }
+  reap "$pid"
+  grep -F 'declared wait on the long recheck cadence' "$state/.watch-triage.log" >/dev/null \
+    || fail "$name: the absorb did not record the declared wait as its reason: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  printf '%s\n' "$dir"
+}
+
+test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation() {
+  local dir state
+
+  # The failure direction: with the veto off, the deferral says only that a wait
+  # was declared and never mentions the helper the worker is actually stuck on.
+  dir=$(delegation_declared_wait_case delegation-declared-noveto "test:fm-deleg-dw-off" 999999)
+  state="$dir/state"
+  grep -F 'inside the Agent tool call for' "$state/.watch-triage.log" >/dev/null \
+    && fail "the veto-off half named the open delegation, so this case cannot prove the failure direction: $(cat "$state/.watch-triage.log")"
+
+  # With the veto live the cadence is unchanged - still deferred, still silent,
+  # still on the declared-wait reason - and the delegation is now named.
+  dir=$(delegation_declared_wait_case delegation-declared-veto "test:fm-deleg-dw-on" 900)
+  state="$dir/state"
+  grep -F 'inside the Agent tool call for 7200s' "$state/.watch-triage.log" >/dev/null \
+    || fail "the deferral hid the open delegation it deferred over: $(cat "$state/.watch-triage.log")"
+  grep -F 'blocked behind a helper of its own' "$state/.watch-triage.log" >/dev/null \
+    || fail "the deferral named the call but not the shape it makes: $(cat "$state/.watch-triage.log")"
+  pass "a declared wait keeps its cadence through the veto, and its deferral names the open delegation it deferred over"
+}
+
 test_advancing_pipeline_run_defers_the_wedge
 test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline
 test_parked_pipeline_run_still_escalates_and_names_the_overridden_busy_verdict
@@ -3506,3 +3576,4 @@ test_without_the_veto_the_delegation_shape_is_still_deferred
 test_an_aged_delegation_denies_the_pipeline_tier_and_names_the_shape
 test_a_short_delegation_leaves_the_hierarchy_untouched
 test_a_delegation_block_escalates_even_while_the_worker_process_burns_cpu
+test_a_declared_wait_keeps_its_cadence_through_the_veto_and_names_the_delegation
