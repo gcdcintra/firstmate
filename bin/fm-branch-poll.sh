@@ -46,8 +46,16 @@
 #     describes the commit, so a failure that only ever ran on an older commit
 #     is not carried forward.
 #
+# OUTPUT SHAPE
+# A sweep prints one tab-separated "<project><TAB><wake line>" record per newly
+# red project, and nothing at all otherwise. It is one record per project rather
+# than one joined line because the durable wake queue collapses records sharing a
+# kind and key: a single key for every project would let one project's red
+# silently replace another's, which is the loss this whole mechanism exists to
+# prevent. The caller keys each queue record on the project name it is given.
+#
 # Usage:
-#   fm-branch-poll.sh            one sweep; prints a wake line or nothing
+#   fm-branch-poll.sh            one sweep; prints one record per newly red project
 #   fm-branch-poll.sh --ack      mark every pending red verdict as surfaced
 #   fm-branch-poll.sh --status   human-readable current verdict per project
 #
@@ -216,8 +224,8 @@ commit_subject() {
   printf '%s\n' "${subject:0:72}"
 }
 
-# One project's sweep. Prints its wake clause when the branch newly reads red,
-# nothing otherwise. Records the verdict either way.
+# One project's sweep. Prints its "<project><TAB><wake line>" record when the
+# branch newly reads red, nothing otherwise. Records the verdict either way.
 sweep_project() {
   local project=$1 dir repo branch runs verdict fields
   local sha run url workflow conclusion last_green
@@ -297,7 +305,7 @@ EOF
     phrase='is red at a new commit'
   fi
 
-  line="$project/$branch $phrase - $classification; conclusion=$conclusion $evidence"
+  line="branch-red: $project/$branch $phrase - $classification; conclusion=$conclusion $evidence"
   line="$line suspect=$(fm_bw_short "$sha") last_green=$(fm_bw_short "$last_green")"
   line="$line workflow=\"$workflow\" run=$url"
   if subject=$(commit_subject "$repo" "$sha"); then
@@ -305,7 +313,7 @@ EOF
   fi
 
   fm_bw_write "$STATE" "$project" "$repo" "$branch" red "$sha" "$run" "$last_green" no "$(date +%s)" || return 0
-  printf '%s\n' "$line"
+  printf '%s\t%s\n' "$project" "$line"
 }
 
 run_ack() {
@@ -351,17 +359,10 @@ fm_bw_enabled "$CONFIG" || exit 0
 [ -d "$PROJECTS" ] || exit 0
 command -v gh >/dev/null 2>&1 || exit 0
 
-OUT=
 while IFS= read -r PROJECT; do
   [ -n "$PROJECT" ] || continue
-  CLAUSE=$(sweep_project "$PROJECT") || continue
-  [ -n "$CLAUSE" ] || continue
-  if [ -z "$OUT" ]; then
-    OUT="branch-red: $CLAUSE"
-  else
-    OUT="$OUT ;; $CLAUSE"
-  fi
+  RECORD=$(sweep_project "$PROJECT") || continue
+  [ -n "$RECORD" ] || continue
+  printf '%s\n' "$RECORD"
 done < <(list_projects)
-
-[ -z "$OUT" ] || printf '%s\n' "$OUT"
 exit 0

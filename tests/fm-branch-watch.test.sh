@@ -23,6 +23,8 @@
 #     verdict that was never acknowledged is re-emitted (the watcher-crash gap);
 #   - a red commit that cannot have its run detail read still wakes, with the
 #     evidence gap stated rather than the wake dropped;
+#   - two red projects reach the durable queue under two keys and both survive a
+#     drain, which collapses records sharing a kind and key;
 #   - green records silently and clears the pre-launch advisory;
 #   - config/branch-watch "off", a clone with no origin, and a non-GitHub origin
 #     are all silent.
@@ -182,6 +184,21 @@ assert_contains "$OUT" 'job="build" steps=0 duration=2s' "the never-started evid
 assert_not_contains "$OUT" "checks ran and failed" "a refusal must never be reported as a failure"
 pass "a check that never started is distinguished from one that ran and failed, with evidence inline"
 
+# A run the forge itself refused to start reports startup_failure, which is the
+# never-started claim stated by the forge rather than inferred from step counts.
+H=$(new_home)
+add_project "$H" storage-manager >/dev/null
+runs_file "$TMP_ROOT/runs-startup" \
+  "$RED_SHA|completed|startup_failure|906|https://forge/runs/906|CI" \
+  "$GREEN_SHA|completed|success|899|https://forge/runs/899|CI"
+jobs_file "$TMP_ROOT/jobs-startup" "failure|build|7|9"
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-startup" "$TMP_ROOT/jobs-startup")
+OUT=$(poll "$H" "$BIN")
+assert_contains "$OUT" "checks NEVER STARTED" \
+  "a startup_failure conclusion is a refusal even when the run reports steps"
+assert_contains "$OUT" "conclusion=startup_failure" "the forge's own conclusion must be inline"
+pass "a startup_failure conclusion is classified as never started regardless of step count"
+
 # A run that produced no job rows at all is the same refusal shape and must not
 # be dropped for lack of a job to describe.
 H=$(new_home)
@@ -303,6 +320,21 @@ assert_absent "$H/state/branch-watch/no-remote" "a clone with no origin records 
 assert_absent "$H/state/branch-watch/gitlab-hosted" "a non-GitHub origin records nothing"
 pass "clones with no origin and with a non-GitHub origin are skipped silently"
 
+# --- two red projects stay two reports, never one that hides the other ------
+
+H=$(new_home)
+add_project "$H" storage-manager >/dev/null
+add_project "$H" nf-service >/dev/null
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-1" "$TMP_ROOT/jobs-1")
+OUT=$(poll "$H" "$BIN")
+[ "$(printf '%s\n' "$OUT" | grep -c .)" = 2 ] \
+  || fail "two red projects must produce two records, got: $OUT"
+assert_contains "$OUT" "$(printf 'nf-service\tbranch-red: nf-service/main')" \
+  "each record must carry the project name that keys its durable wake"
+assert_contains "$OUT" "$(printf 'storage-manager\tbranch-red: storage-manager/main')" \
+  "each record must carry the project name that keys its durable wake"
+pass "two red projects produce two separately keyed records"
+
 # --- the watcher actually turns a red branch into a durable wake ------------
 #
 # The sweep printing a line is only half the contract: the supervisor has to
@@ -311,6 +343,7 @@ pass "clones with no origin and with a non-GitHub origin are skipped silently"
 
 H=$(new_home)
 add_project "$H" storage-manager >/dev/null
+add_project "$H" nf-service >/dev/null
 BIN=$(fake_gh "$H" "$TMP_ROOT/runs-1" "$TMP_ROOT/jobs-1")
 OUT_FILE="$H/watch.out"
 PATH="$BIN:$PATH" FM_ROOT_OVERRIDE="$H" FM_STATE_OVERRIDE="$H/state" \
@@ -329,10 +362,20 @@ fm_wake_terminate "$WATCH_PID" 2>/dev/null || true
 OUT=$(cat "$OUT_FILE" 2>/dev/null || true)
 assert_contains "$OUT" "check: branch-red:" "the watcher must report a red default branch as a check wake"
 assert_contains "$OUT" "suspect=${RED_SHA:0:7}" "the watcher's wake must carry the suspect commit"
-assert_grep "branch-red:" "$H/state/.wake-queue" "the red verdict must reach the durable wake queue"
+assert_grep "branch-watch:storage-manager" "$H/state/.wake-queue" \
+  "each red project must reach the durable wake queue under its own key"
+assert_grep "branch-watch:nf-service" "$H/state/.wake-queue" \
+  "each red project must reach the durable wake queue under its own key"
 assert_grep "yes" "$H/state/branch-watch/storage-manager" \
   "the watcher must acknowledge the verdict after queueing it, so it does not repeat"
-pass "the watcher turns a red default branch into a durable, acknowledged wake"
+
+# The drain keeps only the newest record per (kind, key), so distinct keys are
+# what stops one project's red from silently replacing the other's - and the
+# acknowledgement above means a dropped record could never be re-emitted.
+DRAINED=$(FM_ROOT_OVERRIDE="$H" FM_STATE_OVERRIDE="$H/state" "$ROOT/bin/fm-wake-drain.sh" 2>/dev/null)
+assert_contains "$DRAINED" "storage-manager/main" "the first project's red must survive the drain"
+assert_contains "$DRAINED" "nf-service/main" "the second project's red must survive the drain"
+pass "the watcher turns each red default branch into its own durable, acknowledged wake"
 
 # A watcher supervising a home with no clones at all must not run the sweep,
 # which is what keeps every other suite's watcher hermetic.

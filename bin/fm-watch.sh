@@ -1304,12 +1304,23 @@ while :; do
       FM_PROJECTS_OVERRIDE="$BRANCH_WATCH_PROJECTS" FM_CONFIG_OVERRIDE="$BRANCH_WATCH_CONFIG" \
       run_check_capture "$SCRIPT_DIR/fm-branch-poll.sh" || exit 1
     out=$FM_CHECK_RESULT
-    if [ -n "$out" ]; then
-      reason="check: $out"
-      fm_wake_append check branch-watch "$reason" || exit 1
-      # Only now is the red verdict durably delivered, so only now may the sweep
-      # mark it surfaced. A watcher that dies before this re-emits the same line
-      # on its next sweep instead of swallowing it.
+    reason=
+    # One queue record per project, keyed on the project name. The drain
+    # collapses records that share a kind and key and keeps only the newest, so
+    # a single shared key would let one project's red silently replace another's
+    # - and the sweep's own re-emit safety net could not recover it, because
+    # acknowledging the wake already marked both verdicts delivered.
+    while IFS=$(printf '\t') read -r bw_project bw_line; do
+      [ -n "$bw_project" ] && [ -n "$bw_line" ] || continue
+      fm_wake_append check "branch-watch:$bw_project" "check: $bw_line" || exit 1
+      if [ -z "$reason" ]; then reason="check: $bw_line"; else reason="$reason ;; $bw_line"; fi
+    done <<EOF
+$out
+EOF
+    if [ -n "$reason" ]; then
+      # Only now is every red verdict durably queued, so only now may the sweep
+      # mark them surfaced. A watcher that dies before this re-emits them on its
+      # next sweep instead of swallowing them.
       FM_HOME="$BRANCH_WATCH_HOME" FM_STATE_OVERRIDE="$STATE" \
         FM_PROJECTS_OVERRIDE="$BRANCH_WATCH_PROJECTS" FM_CONFIG_OVERRIDE="$BRANCH_WATCH_CONFIG" \
         run_check "$SCRIPT_DIR/fm-branch-poll.sh" --ack
