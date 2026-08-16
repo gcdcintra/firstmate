@@ -619,7 +619,9 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  # The crew is provably working on a static pane, and its pipeline activity is
+  # UNMEASURABLE (the fake's default), which credits the pane nothing - so this
+  # case keeps pinning the ladder itself rather than any tier's deferral.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · ci running'
 
   # Phase A: a high escalation threshold means the first sighting is absorbed.
@@ -1192,7 +1194,9 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  # The crew is provably working on a static pane, and its pipeline activity is
+  # UNMEASURABLE (the fake's default), which credits the pane nothing - so this
+  # case keeps pinning the ladder itself rather than any tier's deferral.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # Priming round: first sighting of this stale hash classifies and absorbs it
