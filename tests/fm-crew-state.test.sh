@@ -68,6 +68,9 @@ make_fakebin() {  # <dir> -> echoes fakebin path
   cat > "$fb/no-mistakes" <<'SH'
 #!/usr/bin/env bash
 set -u
+# Every invocation's argv, when a case asks for it: which bounded CLI calls a
+# read actually pays for is part of that read's contract, not an internal.
+[ -n "${FM_FAKE_NM_CALLS:-}" ] && printf '%s\n' "$*" >> "$FM_FAKE_NM_CALLS"
 case "${1:-}" in
   axi)
     shift
@@ -185,8 +188,10 @@ reset_fakes() {
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
   FM_FAKE_STEP_LOGS=""
+  FM_FAKE_NM_CALLS=""
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS FM_FAKE_STEP_LOGS
+  export FM_FAKE_NM_CALLS
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -1780,9 +1785,54 @@ test_pipeline_activity_other_branch_run_is_not_credited() {
   # this worker - the wrong-subject defect this whole change exists to remove.
   FM_FAKE_AXI_STATUS="$(run_active_steps fm/some-other-crew review 3s)"
   out=$(run_pipeline_activity "$d" pa-other)
-  assert_contains "$out" "none " "another branch's run is not attributed here"
+  assert_contains "$out" "unknown " "a run this work cannot claim measures nothing here"
   assert_not_contains "$out" "active " "another crew's advancing run is never credited to this task"
   pass "an advancing run belonging to another branch is never credited to this task"
+}
+
+# The coarse runs-list fallback answers "does this branch have a run at all"
+# with a status word and no activity clock, so --pipeline-activity can only
+# report `unknown` from one - which is what it reports without it. Paying a
+# second bounded CLI call plus a git walk per same-branch row to reach the same
+# answer would double the worst case of a read the watcher makes on its
+# single-threaded poll for every aging pane. The ordinary crew-state path still
+# needs that fallback (case (e)), so this pins the cost, not the behavior.
+test_pipeline_activity_never_spends_the_coarse_runs_fallback() {
+  reset_fakes
+  local d out short; pipeline_case pa-nocoarse pa-nocoarse fm/pa-nocoarse; d=$PA_DIR
+  short=$(git -C "$d/wt" rev-parse --short HEAD)
+  # A sibling crew's run answers bare `axi status`, so attribution misses - and
+  # the runs list really does carry a bindable row for THIS branch, so the
+  # fallback would return something usable if it were consulted.
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/some-other-crew review 3s)"
+  FM_FAKE_RUNS_LIST="running    fm/pa-nocoarse  $short  2026-08-16 09:14"
+  FM_FAKE_NM_CALLS="$d/nm-calls"
+  out=$(run_pipeline_activity "$d" pa-nocoarse)
+  assert_contains "$out" "unknown " "an unattributable run measures nothing, so it is unknown"
+  assert_not_contains "$out" "active " "another crew's advancing run is never credited to this task"
+  grep -q '^axi status' "$d/nm-calls" \
+    || fail "--pipeline-activity did not make the one read it needs: $(cat "$d/nm-calls" 2>/dev/null)"
+  if grep -q '^runs' "$d/nm-calls"; then
+    fail "--pipeline-activity spent the coarse runs-list call whose answer it cannot use: $(cat "$d/nm-calls")"
+  fi
+  pass "--pipeline-activity does not pay for the coarse runs-list fallback it could never use"
+}
+
+# ...and the same fallback is still spent where its answer IS usable: the
+# ordinary crew-state read, whose cross-branch attribution depends on it.
+test_ordinary_read_still_spends_the_coarse_runs_fallback() {
+  reset_fakes
+  local d out short; pipeline_case pa-coarse-kept pa-coarse-kept fm/pa-coarse-kept; d=$PA_DIR
+  short=$(git -C "$d/wt" rev-parse --short HEAD)
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/some-other-crew review 3s)"
+  FM_FAKE_RUNS_LIST="running    fm/pa-coarse-kept  $short  2026-08-16 09:14"
+  FM_FAKE_NM_CALLS="$d/nm-calls"
+  out=$(run_crew_state "$d" pa-coarse-kept)
+  assert_contains "$out" "state: working" "the coarse row still attributes this branch's own run"
+  assert_contains "$out" "background run" "the working verdict came from the coarse row, not the sibling's TOON"
+  grep -q '^runs' "$d/nm-calls" \
+    || fail "the ordinary read stopped consulting the coarse runs list it depends on: $(cat "$d/nm-calls" 2>/dev/null)"
+  pass "the ordinary crew-state read still consults the coarse runs list, which its attribution depends on"
 }
 
 test_pipeline_activity_terminal_run_is_none() {
@@ -1849,6 +1899,8 @@ test_pipeline_activity_quiet_clock_earns_nothing
 test_pipeline_activity_quiet_ci_monitor_is_active
 test_pipeline_activity_parked_run_earns_nothing
 test_pipeline_activity_other_branch_run_is_not_credited
+test_pipeline_activity_never_spends_the_coarse_runs_fallback
+test_ordinary_read_still_spends_the_coarse_runs_fallback
 test_pipeline_activity_terminal_run_is_none
 test_pipeline_activity_silent_cli_is_unknown
 test_pipeline_activity_run_without_active_steps_is_unknown

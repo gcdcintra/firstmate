@@ -168,6 +168,35 @@ fm_wedge_declared_wait() {  # <state-dir> <task>
   printf '%s' "$last"
 }
 
+# fm_wedge_cap_latched: 0 when a tier's allowance no longer buys this pane
+# anything. TWO clocks bound the one shared episode - the episode's own elapsed
+# span, and the pane's wedge-timer age, which started before the episode did and
+# is only reset by a wake, so it is usually the one that crosses a cap first -
+# and an unusable episode record latches every tier at once. The escalation
+# sentence asks this the same way the deferral decision does, so a tier that has
+# stopped holding a pane back always says so.
+fm_wedge_cap_latched() {  # <cap> <deferred-for> <age> <budget-usable>
+  [ "$4" -eq 1 ] || return 0
+  [ "$2" -lt "$1" ] || return 0
+  [ "$3" -lt "$1" ] || return 0
+  return 1
+}
+
+# fm_wedge_spent_note: which clock ended that allowance, phrased for the
+# escalation. The episode epoch records when suppression OPENED and is never
+# refreshed, so it is reported as exactly that: a supervisor reading the
+# twentieth post-budget escalation must not be told the pane is still
+# suppressed.
+fm_wedge_spent_note() {  # <cap> <deferred-for> <age> <budget-usable> <budget-note>
+  if [ "$4" -ne 1 ]; then
+    printf '%s' "${5:-its deferral record is unreadable}"
+  elif [ "$2" -ge "$1" ]; then
+    printf 'this deferral episode opened %ss ago and its suppression ended at the cap' "$2"
+  else
+    printf "this pane's wedge timer has run %ss, past that allowance" "$3"
+  fi
+}
+
 # fm_wedge_evidence: the ordered decision. Called by bin/fm-watch.sh's
 # wedge_timer_check once a pane's wedge timer has reached the ordinary
 # escalation threshold, and never before, so the pipeline read costs nothing on
@@ -200,7 +229,7 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
   local declared_eligible=${12:-0}
   local declared='' has_declared=0 declared_credited=0
   local pipeline pclass pdetail decision tier
-  local harness_clause declared_clause cpu_clause spent_note evidence busy_source
+  local harness_clause declared_clause pipeline_clause cpu_clause evidence busy_source
 
   if [ "$declared_eligible" -eq 1 ]; then
     declared=$(fm_wedge_declared_wait "$state" "$task") && has_declared=1 || has_declared=0
@@ -267,24 +296,29 @@ fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-clas
     fi
   fi
 
-  spent_note=$budget_note
-  if [ -z "$spent_note" ] && [ "$deferred_for" -gt 0 ]; then
-    # The episode epoch records when suppression OPENED and is never refreshed,
-    # so report it as exactly that: a supervisor reading the twentieth
-    # post-budget escalation must not be told the pane is still suppressed.
-    spent_note="this deferral episode opened ${deferred_for}s ago and its suppression ended at the cap"
+  # The pipeline reading stays in the sentence whatever it says - the step and
+  # its own clock are the evidence - but an `active` reading that has stopped
+  # deferring must not be left reading like healthy progress, or the alarm
+  # arrives carrying the very sentence a supervisor dismisses it by. That is the
+  # delegation shape: the run really is advancing, and the worker behind it is
+  # not.
+  pipeline_clause="$pdetail"
+  if [ "$pclass" = active ] \
+     && fm_wedge_cap_latched "$FM_WEDGE_PIPELINE_MAX_DEFER_SECS" "$deferred_for" "$age" "$budget_usable"; then
+    pipeline_clause="$pipeline_clause, but this pane's ${FM_WEDGE_PIPELINE_MAX_DEFER_SECS}s pipeline-activity deferral allowance is spent - $(fm_wedge_spent_note "$FM_WEDGE_PIPELINE_MAX_DEFER_SECS" "$deferred_for" "$age" "$budget_usable" "$budget_note") - so measured pipeline progress no longer holds this pane back; that clock measures the PIPELINE's own agent, not this worker, so look for a worker blocked behind a run that is still advancing without it"
   fi
 
   cpu_clause="$cpu_detail"
   if [ "$busy_path" -eq 0 ]; then
     :
-  elif [ "$cpu_class" = progressing ] && { [ "$budget_usable" -eq 0 ] || [ "$deferred_for" -ge "$FM_WEDGE_CPU_MAX_DEFER_SECS" ]; }; then
-    cpu_clause="$cpu_clause, but this pane's ${FM_WEDGE_CPU_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - ${spent_note:-its deferral record is unreadable} - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent"
+  elif [ "$cpu_class" = progressing ] \
+       && fm_wedge_cap_latched "$FM_WEDGE_CPU_MAX_DEFER_SECS" "$deferred_for" "$age" "$budget_usable"; then
+    cpu_clause="$cpu_clause, but this pane's ${FM_WEDGE_CPU_MAX_DEFER_SECS}s CPU-progress deferral budget is spent - $(fm_wedge_spent_note "$FM_WEDGE_CPU_MAX_DEFER_SECS" "$deferred_for" "$age" "$budget_usable" "$budget_note") - so measured progress no longer holds it back and it escalates on the normal cadence from here; look for a retry or spin loop, not a stopped agent"
   elif [ "$cpu_class" = progressing ]; then
     cpu_clause="$cpu_clause, and CPU has kept moving for that whole span - look for a retry or spin loop, not a stopped agent"
   fi
 
-  evidence="$harness_clause; $pdetail"
+  evidence="$harness_clause; $pipeline_clause"
   [ -n "$declared_clause" ] && evidence="$evidence; $declared_clause"
   evidence="$evidence; $cpu_clause"
   printf '%s\t%s\t%s' "$decision" "$tier" "$evidence"

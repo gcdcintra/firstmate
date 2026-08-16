@@ -516,6 +516,15 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
+      #
+      # --pipeline-activity never pays for it. A coarse row carries a status
+      # word and no activity clock, so that mode can only answer `unknown` from
+      # one - the same answer it gives here - and spending a second bounded call
+      # plus a git walk per same-branch row to reach it would double the worst
+      # case of a read the watcher makes on its single-threaded poll for every
+      # aging pane, on exactly the panes that have no attributable run.
+      pipeline_mode && emit_pipeline unknown \
+        "the run the pipeline CLI reports is not attributable to this work, and the only other source is the coarse runs list, which carries no activity clock"
       COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1

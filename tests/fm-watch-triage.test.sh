@@ -3049,6 +3049,11 @@ test_pipeline_deferral_is_bounded_and_still_reaches_demand_deep_inspection() {
       || fail "round $n did not report escalation count $n: $(cat "$out")"
     grep -F "the attributed pipeline run is at step document" "$out" >/dev/null \
       || fail "round $n dropped the pipeline evidence from its escalation: $(cat "$out")"
+    # ...and that reading, carried alone, reads like healthy progress. The
+    # escalation has to say the allowance behind it latched, or it arrives
+    # carrying the exact sentence a supervisor dismisses it by.
+    grep -F "pipeline-activity deferral allowance is spent" "$out" >/dev/null \
+      || fail "round $n let an advancing-pipeline reading stand without naming its spent allowance: $(cat "$out")"
     if [ "$n" -lt 3 ]; then
       grep -F "demand-deep-inspection" "$out" >/dev/null \
         && fail "round $n demanded deep inspection before the threshold: $(cat "$out")"
@@ -3059,6 +3064,46 @@ test_pipeline_deferral_is_bounded_and_still_reaches_demand_deep_inspection() {
     n=$((n + 1))
   done
   pass "pipeline deferral is bounded, and a worker blocked behind an advancing pipeline still reaches demand-deep-inspection"
+}
+
+# The other clock that ends the pipeline allowance, and the one that ends it
+# FIRST: the wedge timer starts before the deferral episode does and is only
+# reset by a wake, so a pane deferring on an advancing run reaches the cap on
+# its own age while the episode is still short of it. That makes this the first
+# alarm raised after an hour of silence - the one that most needs to say the
+# allowance is spent rather than reading like healthy progress.
+test_pipeline_allowance_spent_by_pane_age_says_so_in_the_escalation() {
+  local dir state fakebin out window key pid
+  window="test:fm-pipe-aged"
+  dir=$(cpu_wedge_case pipeline-aged "$window")
+  state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pipeline_wedge_phase_a "$dir" "$window" "$key"
+  # No episode record at all, and a wedge timer already past the cap: the pane's
+  # own age is the only thing here that can end the deferral.
+  rm -f "$state/.wedge-defer-since-$key"
+  echo $(( $(date +%s) - 4000 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_PIPELINE_ACTIVITY='active the attributed pipeline run is at step document, active 2h, last activity 12s' \
+    FM_WEDGE_PIPELINE_MAX_DEFER_SECS=3600 \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a pane aged past the pipeline cap kept deferring on its advancing run: $(cat "$out")"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "a pane past the pipeline cap did not escalate as a possible wedge: $(cat "$out")"
+  grep -F "the attributed pipeline run is at step document" "$out" >/dev/null \
+    || fail "the escalation dropped the pipeline reading it still carries: $(cat "$out")"
+  grep -F "pipeline-activity deferral allowance is spent" "$out" >/dev/null \
+    || fail "the escalation read as healthy pipeline progress without naming the spent allowance: $(cat "$out")"
+  grep -F "past that allowance" "$out" >/dev/null \
+    || fail "the escalation did not name the clock that ended the allowance: $(cat "$out")"
+  [ ! -s "$state/.wedge-defer-since-$key" ] \
+    || fail "an escalating pane opened a deferral episode it was never granted: $(cat "$state/.wedge-defer-since-$key")"
+  pass "a pane aged past the pipeline cap escalates and names the spent allowance instead of reading like progress"
 }
 
 # Mechanism 3 of the report: a worker that did exactly what the briefs ask -
@@ -3225,6 +3270,7 @@ test_non_busy_provably_working_stale_is_deferred_by_an_advancing_pipeline
 test_parked_pipeline_run_still_escalates_and_names_the_overridden_busy_verdict
 test_quiet_pipeline_run_still_escalates
 test_pipeline_deferral_is_bounded_and_still_reaches_demand_deep_inspection
+test_pipeline_allowance_spent_by_pane_age_says_so_in_the_escalation
 test_declared_wait_on_a_busy_turn_gets_the_long_recheck_cadence
 test_declared_wait_rechecks_count_on_the_ladder_and_reach_demand_deep_inspection
 test_spent_episode_disables_the_declared_wait_too
