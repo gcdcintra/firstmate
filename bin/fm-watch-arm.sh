@@ -63,6 +63,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# For FM_WAKE_REASON_PREFIX_RE, the one definition of which watcher stdout lines
+# are wakes. Sourced for that constant alone; none of its classifiers run here.
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
@@ -352,15 +356,16 @@ trap 'handle_attached_signal INT 130' INT
 
 watch_output_has_wake() {
   local out=$1
-  grep -Eq '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null
+  grep -Eq "$FM_WAKE_REASON_PREFIX_RE" "$out" 2>/dev/null
 }
 
 watch_output_reason_type() {
   local out=$1 line
-  line=$(grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null | head -1 || true)
+  line=$(grep -E "$FM_WAKE_REASON_PREFIX_RE" "$out" 2>/dev/null | head -1 || true)
   case "$line" in
     signal:*) printf 'actionable-signal' ;;
     stale:*) printf 'actionable-stale' ;;
+    gone:*) printf 'actionable-gone' ;;
     check:*) printf 'actionable-check' ;;
     heartbeat*) printf 'actionable-heartbeat' ;;
     *) printf 'none' ;;

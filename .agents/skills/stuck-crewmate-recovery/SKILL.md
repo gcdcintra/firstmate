@@ -2,7 +2,7 @@
 name: stuck-crewmate-recovery
 description: >-
   Agent-only playbook for stuck or missing ordinary Firstmate direct reports.
-  Use when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
+  Use when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or after a stale or gone wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
   Reconciles recorded work before escalating from targeted inspection through safe relaunch or failure.
 user-invocable: false
 metadata:
@@ -11,17 +11,17 @@ metadata:
 
 # stuck-crewmate-recovery
 
-Use this playbook when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
+Use this playbook when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, when a `gone:` wake reports an endpoint killed or left agent-less, or when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
 
 Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
 
-## Session-start reconciliation for a dead ordinary direct report
+## Reconciliation for a dead ordinary direct report
 
-This procedure covers ordinary `kind=ship` and `kind=scout` direct reports.
+This procedure covers ordinary `kind=ship` and `kind=scout` direct reports, reached either from the session-start digest or from a mid-session `gone:` wake, which reports the same dead endpoint the moment the watcher confirms it.
 Load `secondmate-provisioning` instead for `kind=secondmate` recovery.
 
-Treat the digest's endpoint result as a presence signal, not proof that the task's work or validation run is gone.
+Treat the digest's or wake's endpoint result as a presence signal, not proof that the task's work or validation run is gone.
 Read the targeted current state with `bin/fm-crew-state.sh <id>` before deciding to relaunch.
 A no-mistakes run matched to the crew's branch and current code remains authoritative when the endpoint is dead: handle a terminal or parked run through the normal lifecycle, and keep supervising an active run instead of creating a duplicate worker.
 

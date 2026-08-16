@@ -87,12 +87,6 @@ set_mtime() {  # <epoch> <file>
   fi
 }
 
-# Signature a primed .seen-* marker must hold so the per-poll signal scan does not
-# fire on a pre-existing status (mirrors fm-watch.sh's stat_sig exactly).
-seen_sig() {
-  if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
-}
-
 # Prime <file>'s .seen-* suppressor to its CURRENT signature, so the per-poll
 # no-verb signal scan (which watches every *.turn-ended for a size:mtime change)
 # treats a just-created or just-backdated turn-ended marker as already seen.
@@ -2156,6 +2150,7 @@ SH
   [ "$lines" -le 2000 ] || { reap "$pid"; fail "triage log was not capped when wc emitted a spaced byte count (lines=$lines)"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "benign signal enqueued a wake while testing log capping"; }
   reap "$pid"
+  unset FM_FAKE_CREW_STATE
   pass "triage log capping handles wc byte counts with leading spaces"
 }
 
@@ -2474,6 +2469,7 @@ test_beacon_stays_fresh_while_absorbing() {
   [ "$(( now - m2 ))" -lt 10 ] || { reap "$pid"; fail "beacon went stale while absorbing (age $(( now - m2 ))s)"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "absorbing benign signals enqueued a wake"; }
   reap "$pid"
+  unset FM_FAKE_CREW_STATE
   pass "the liveness beacon stays fresh while the watcher absorbs benign wakes (fm-guard never false-alarms)"
 }
 
@@ -2497,6 +2493,7 @@ test_afk_present_reverts_watcher_to_one_shot() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the afk-mode signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null \
     || fail "afk-mode benign signal was not queued for the daemon to classify"
+  unset FM_FAKE_CREW_STATE
   pass "with .afk present the watcher reverts to one-shot so the daemon owns triage (no double-triage)"
 }
 
@@ -2605,6 +2602,239 @@ SH
   pass "wait_for_exit escalates past a SIGTERM-proof child instead of blocking its suite forever"
 }
 
+# --- endpoint absence: a killed endpoint says so, a wedged one does not change --
+# A killed endpoint and a wedged agent are indistinguishable to every pane-shaped
+# heuristic - identical frozen frame, identical flat CPU - so the watcher asks the
+# backend instead. These cases pin both halves of that: the absence wakes as its
+# own `gone` wake with words a wedge alarm cannot carry, and a live-but-silent
+# pane keeps the exact wedge escalation it had before.
+
+# Shared fixture: one ship task whose pane has gone quiet, primed so the signal
+# scan does not pre-empt the endpoint read. Echoes "<dir> <state> <fakebin>".
+make_absence_case() {  # <name> <window> <status-line>
+  local name=$1 window=$2 status=$3 dir state fakebin key sig
+  dir=$(make_case "$name"); state="$dir/state"; fakebin="$dir/fakebin"
+  printf 'idle pane frame' > "$dir/pane.txt"
+  printf 'window=%s\nkind=ship\nworktree=%s\n' "$window" "$dir/worktree" > "$state/absent.meta"
+  printf '%s\n' "$status" > "$state/absent.status"
+  sig=$(seen_sig "$state/absent.status"); printf '%s' "$sig" > "$state/.seen-absent_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "idle pane frame")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s %s %s' "$dir" "$state" "$fakebin"
+}
+
+# The headline case: the endpoint is gone. Its capture fails, which used to drop
+# the window out of the poll loop with no wake at all, every poll, forever.
+test_missing_endpoint_wakes_gone_not_stale() {
+  local dir state fakebin out drain_out window pid
+  read -r dir state fakebin <<<"$(make_absence_case gone-missing "test:fm-killed" "working: implementing")"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; window="test:fm-killed"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_GONE=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a killed endpoint never woke the watcher: $(cat "$out")"; }
+  grep -F "gone: $window" "$out" >/dev/null || fail "a killed endpoint did not wake as gone: $(cat "$out")"
+  grep -F "no longer exists" "$out" >/dev/null || fail "the gone wake did not name the endpoint as killed: $(cat "$out")"
+  grep -F "stale: " "$out" >/dev/null && fail "a killed endpoint was reported as a stale pane"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a killed endpoint was reported as a possible wedge"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the gone wake failed"
+  grep "$(printf '\tgone\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "the gone wake was not queued under its own kind"
+  pass "a killed endpoint wakes as its own gone wake naming the kill, never as a stale pane or a wedge"
+}
+
+# The 2026-08-15 incident shape: the backend server itself died with the desktop
+# session, taking every pane at once. The tmux adapter maps that to `missing`,
+# so it must reach the same wake rather than a read-failure blind spot.
+test_dead_backend_server_wakes_gone() {
+  local dir state fakebin out window pid
+  read -r dir state fakebin <<<"$(make_absence_case gone-no-server "test:fm-swept" "working: implementing")"
+  out="$dir/watch.out"; window="test:fm-swept"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_NO_SERVER=1 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a dead backend server never woke the watcher: $(cat "$out")"; }
+  grep -F "gone: $window" "$out" >/dev/null || fail "a dead backend server did not wake as gone: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a dead backend server was reported as a possible wedge"
+  pass "a backend server that died with its session wakes as gone, the shape of the mass-kill incident"
+}
+
+# The observed husk: the pane survived, the agent did not, and the shell it left
+# behind had fallen back to the primary checkout - a hazard of its own, because
+# work started there would not be isolated in a task worktree.
+test_husk_shell_wakes_gone_and_names_primary_checkout() {
+  local dir state fakebin out window pid root
+  read -r dir state fakebin <<<"$(make_absence_case gone-husk "test:fm-husk" "working: implementing")"
+  out="$dir/watch.out"; window="test:fm-husk"; root="$dir/primary"
+  mkdir -p "$root"
+
+  # The run that outlived its agent still reads as working, which is the shape a
+  # swept pane actually leaves behind: the validation kept running while the
+  # agent died. It also means the confirming poll, not a first-sighting stale
+  # surface, is what this case measures.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=bash FM_FAKE_TMUX_CURRENT_PATH="$root" FM_ROOT_OVERRIDE="$root" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a husk shell never woke the watcher: $(cat "$out")"; }
+  grep -F "gone: $window" "$out" >/dev/null || fail "a husk shell did not wake as gone: $(cat "$out")"
+  grep -F "bare shell" "$out" >/dev/null || fail "the gone wake did not name the husk shell: $(cat "$out")"
+  grep -F "primary checkout" "$out" >/dev/null || fail "the gone wake did not flag the primary-checkout fallback: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a husk shell was reported as a possible wedge"
+  pass "a pane whose agent died into a bare shell wakes as gone and names the primary-checkout fallback"
+}
+
+# The same hazard as above, at the address it actually has. Crew panes are
+# created in the task's recorded `project=` checkout, which for every project
+# other than this firstmate home is a different directory from FM_ROOT - so a
+# shell that fell back there is unisolated for exactly the same reason and must
+# be named the same way, not filed as unremarkable drift.
+test_husk_shell_names_the_project_checkout_fallback() {
+  local dir state fakebin out window pid proj
+  read -r dir state fakebin <<<"$(make_absence_case gone-husk-project "test:fm-proj" "working: implementing")"
+  out="$dir/watch.out"; window="test:fm-proj"; proj="$dir/checkout"
+  mkdir -p "$proj"
+  printf 'project=%s\n' "$proj" >> "$state/absent.meta"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=bash FM_FAKE_TMUX_CURRENT_PATH="$proj" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a husk shell in the project checkout never woke the watcher: $(cat "$out")"; }
+  grep -F "primary checkout $proj" "$out" >/dev/null \
+    || fail "the gone wake did not name the project checkout as the isolation hazard: $(cat "$out")"
+  pass "a husk shell that fell back to the task's project checkout is named as the isolation hazard it is"
+}
+
+# Criterion 3, pinned: this check adds a signal and removes none. A pane that is
+# genuinely there with a genuinely running agent, gone quiet, must escalate with
+# the identical wedge wording it had before the endpoint read existed.
+test_live_but_unresponsive_pane_still_wedge_escalates() {
+  local dir state fakebin out window key pid
+  read -r dir state fakebin <<<"$(make_absence_case gone-live-wedge "test:fm-wedged" "working: implementing")"
+  out="$dir/watch.out"; window="test:fm-wedged"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # Enter on the already-classified stale hash with a backdated timer, the same
+  # priming the sibling wedge cases use, so this exercises the wedge escalation
+  # itself rather than a first sighting that would restart the timer.
+  printf '%s' "$(hash_text "idle pane frame")" > "$state/.stale-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a live unresponsive pane no longer escalates: $(cat "$out")"; }
+  grep -F "stale: $window" "$out" >/dev/null || fail "a live unresponsive pane did not escalate as stale: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null || fail "a live unresponsive pane lost its wedge wording: $(cat "$out")"
+  grep -F "gone: " "$out" >/dev/null && fail "a live pane with a running agent was misreported as gone"
+  unset FM_FAKE_CREW_STATE
+  pass "a wedged worker whose pane and agent are both live still escalates exactly as before"
+}
+
+# An absent endpoint never returns on its own, so re-waking every poll would bury
+# the fleet - especially after a mass kill, where every window is absent at once.
+# And once a worker has reported a terminal outcome, its endpoint disappearing is
+# the expected next step, not a fault.
+test_gone_endpoint_wakes_once_and_absorbs_after_a_terminal_outcome() {
+  local dir state fakebin out window pid
+  read -r dir state fakebin <<<"$(make_absence_case gone-once "test:fm-once" "working: implementing")"
+  out="$dir/watch.out"; window="test:fm-once"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "the first gone wake never fired: $(cat "$out")"; }
+  grep -F "gone: $window" "$out" >/dev/null || fail "the first gone wake did not fire"
+
+  # Same absent endpoint, next watcher cycle: the episode is already recorded.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 40; then
+    reap "$pid"; fail "an already-reported gone endpoint woke again: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "an already-reported gone endpoint printed a second wake: $(cat "$out")"
+  reap "$pid"
+
+  # A worker that reported a terminal outcome makes its absence expected: a fresh
+  # episode on a fresh window must be absorbed rather than reported as a fault.
+  read -r dir state fakebin <<<"$(make_absence_case gone-terminal "test:fm-done" "done: PR opened, checks green")"
+  out="$dir/watch.out"; window="test:fm-done"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_GONE=1 FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 40; then
+    reap "$pid"; fail "an endpoint absent after a terminal outcome woke as a fault: $(cat "$out")"
+  fi
+  grep -F "gone: " "$out" >/dev/null && fail "an expected absence after a terminal outcome woke as gone"
+  reap "$pid"
+  pass "a gone endpoint wakes once per episode, and an absence after a terminal outcome is absorbed"
+}
+
+# A declared pause is the one case where a confidently-exited agent is expected,
+# so the endpoint check absorbs it - but absorbing must not also cancel the
+# bounded recheck that is what makes a long wait safe to absorb in the first
+# place. A pause that stops rechecking is exactly the invisible rot
+# PAUSE_RESURFACE_SECS exists to prevent. The husk shell is the production shape
+# and the reason the sibling pause cases cannot catch this: with no pane command
+# the backend reads `unreadable`, and only a real shell reads `dead`.
+test_paused_husk_shell_keeps_its_bounded_recheck() {
+  local dir state fakebin out window key pid
+  read -r dir state fakebin <<<"$(make_absence_case gone-paused-recheck "test:fm-held" "paused: waiting on external CI")"
+  out="$dir/watch.out"; window="test:fm-held"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # The wait is already older than one recheck window, and the absence episode is
+  # one poll short of confirming, so a single stale poll decides both at once -
+  # the collision the absorb has to survive.
+  set_mtime "$(( $(date +%s) - 500 ))" "$state/absent.status"
+  printf '%s' "$(seen_sig "$state/absent.status")" > "$state/.seen-absent_status"
+  printf 'dead:1' > "$state/.gone-seen-$key"
+
+  # No authoritative current state, which is what a corpse leaves: the pause
+  # classification then has to reach its dead-agent promotion to keep this window
+  # on the bounded cadence. A working or paused verdict would satisfy the
+  # assertion without ever exercising that promotion.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=bash \
+    FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=60 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a declared pause whose agent exited into a husk shell stopped being rechecked: $(cat "$out")"; }
+  grep -F "confirm the wait still holds" "$out" >/dev/null \
+    || fail "the declared pause lost its bounded recheck: $(cat "$out")"
+  grep -F "gone: " "$out" >/dev/null && fail "a declared pause was reported as a killed endpoint"
+  pass "a declared pause whose agent exited into a husk shell keeps its bounded recheck"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -2662,4 +2892,11 @@ test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
+test_missing_endpoint_wakes_gone_not_stale
+test_dead_backend_server_wakes_gone
+test_husk_shell_wakes_gone_and_names_primary_checkout
+test_husk_shell_names_the_project_checkout_fallback
+test_live_but_unresponsive_pane_still_wedge_escalates
+test_gone_endpoint_wakes_once_and_absorbs_after_a_terminal_outcome
+test_paused_husk_shell_keeps_its_bounded_recheck
 test_wait_for_exit_cannot_block_on_a_child_that_survives_sigterm

@@ -82,6 +82,34 @@ FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_CLASSIFY_WEDGE_REASON_SEGMENT=', possible wedge, escalation '
 
+# The wake-reason prefix set: a CONTRACT between the watcher, which prints one
+# reason line per wake on stdout, and every recognizer that decides whether a
+# watcher cycle closed on something the supervising agent must handle. The
+# recognizers live one per harness and are the LAST hop before a wake reaches a
+# model, so a kind missing from any one of them is enqueued and never
+# delivered: bin/fm-watch-arm.sh (Claude/Grok arm cycles), the Stop-owned
+# rewake in bin/fm-claude-stop-autoarm.sh, bin/fm-watch-checkpoint.sh (Codex),
+# and bin/fm-supervise-daemon.sh's is_wake_reason (away mode). All read this
+# ONE definition rather than hardcoding the alternation, so adding a wake kind
+# to bin/fm-wake-lib.sh's queue vocabulary cannot half-land with the kind
+# queued but undeliverable. TWO recognizers cannot read this constant, because
+# they are loaded into a harness process and cannot source bash, so a new kind
+# must be added to BOTH of them by hand as well:
+# .pi/extensions/fm-primary-pi-watch.ts and
+# .opencode/plugins/fm-primary-watch-arm.js. Missing either one is worse than
+# silence there - both classify an unrecognized reason as a watcher failure, so
+# a dead worker would surface as a broken watcher.
+# tests/fm-pi-watch-extension.test.sh pins each of them to this set by
+# behavior, but over a hardcoded kind list, so that list needs the new kind too.
+#
+# Anchored and complete so a consumer can use it as its whole pattern. Anything
+# else on watcher stdout - "watcher: already running" on a singleton-lock
+# collision, for instance - is a STATUS line, not a wake, and must not match.
+# Deliberately not overridable: a wire format between components, not a
+# per-home vocabulary.
+# shellcheck disable=SC2034 # Read by the harness wake recognizers (fm-watch-arm.sh, fm-claude-stop-autoarm.sh, fm-watch-checkpoint.sh, fm-supervise-daemon.sh), not this lib.
+FM_WAKE_REASON_PREFIX_RE='^(signal:|stale:|gone:|check:|heartbeat($|:))'
+
 # The resolution verb and durable-backlog-transfer verb that CLOSE a keyed
 # status decision opened by needs-decision or blocked. See status_open_decisions
 # below for the status-fold contract. The transfer verb is written only after

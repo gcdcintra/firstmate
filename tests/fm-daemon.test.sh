@@ -722,11 +722,75 @@ test_is_wake_reason_distinguishes_status_stdout() {
   # are not, so the main loop can idle them without flooding escalations.
   is_wake_reason "signal: /x/y.status" || fail "signal: not recognized as wake"
   is_wake_reason "stale: s:fm-x" || fail "stale: not recognized as wake"
+  is_wake_reason "gone: s:fm-x (the worker's endpoint no longer exists)" || fail "gone: not recognized as wake"
   is_wake_reason "check: /s/c.sh: merged" || fail "check: not recognized as wake"
   is_wake_reason "heartbeat" || fail "heartbeat not recognized as wake"
   is_wake_reason "watcher: already running" && fail "singleton status line misclassified as wake"
   is_wake_reason "watcher: already running pid 123" && fail "singleton status (pid) misclassified as wake"
   pass "is_wake_reason distinguishes watcher wake reasons from singleton-status stdout"
+}
+
+# A killed endpoint never clears on its own and relaunching a worker is not a
+# decision the away-mode daemon may make, so it must reach the captain. Both
+# halves are pinned: the main loop only calls handle_wake for reasons
+# is_wake_reason accepts, so a gone wake that the recognizer above rejected
+# would leave this escalation permanently unreachable.
+test_gone_wake_escalates_to_an_away_captain() {
+  local dir state reason
+  dir=$(make_supercase gone-escalates)
+  state="$dir/state"
+  printf 'working: implementing\n' > "$state/gone-w1.status"
+  reason="gone: sess:fm-gone-w1 (the worker's endpoint no longer exists - it was killed)"
+  is_wake_reason "$reason" || fail "the daemon's main loop would idle a gone wake instead of handling it"
+  FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+  grep -F "$reason" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "a gone wake was self-handled instead of escalated: $(cat "$state/.subsuper-escalations" 2>/dev/null)"
+  pass "a killed endpoint escalates to an away captain instead of being absorbed"
+}
+
+# The husk shape specifically, and the whole away-mode sequence it takes. A husk
+# endpoint still captures, so housekeeping's persistence recheck cannot tell it
+# from a merely idle pane and would raise the ordinary wedge alarm a killed pane
+# is supposed to stop producing - a wedge window AFTER the captain was already
+# told the worker is dead.
+test_gone_escalate_leaves_no_marker_for_a_later_false_wedge() {
+  local dir state fakebin task win key pane reason
+  dir=$(make_supercase gone-no-false-wedge)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  task="husk-w2"
+  win="sess:fm-$task"
+  pane="$dir/pane.txt"
+  key=$(printf '%s' "$task" | tr ':/.' '___')
+  fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
+  printf 'working: implementing\n' > "$state/$task.status"
+  printf 'Working...\n' > "$pane"
+
+  # Poll before the absence confirms: the watcher still reads this as an
+  # ordinary stale pane, and the daemon self-handles it into a wedge marker.
+  FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
+  [ -e "$state/.subsuper-stale-$key" ] \
+    || fail "the ordinary stale wake recorded no wedge marker, so this case would prove nothing"
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+
+  # Next poll: the absence confirms and the worker is escalated as gone.
+  reason="gone: $win (the endpoint is still there but its agent is not - a bare shell where a worker belongs)"
+  FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+  grep -F "$reason" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "the gone wake was not escalated: $(cat "$state/.subsuper-escalations" 2>/dev/null)"
+
+  # Past the wedge window, with the husk still capturing exactly as a live pane
+  # would. Nothing further may reach the captain about this corpse.
+  : > "$state/.subsuper-escalations"
+  rm -f "$state/.subsuper-last-scan"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 FM_ESCALATE_BATCH_SECS=999999 \
+    housekeeping "$state"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    && fail "a dead worker was re-reported as a possible wedge after its gone escalation: $(cat "$state/.subsuper-escalations")"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "housekeeping escalated again for an already-reported dead endpoint: $(cat "$state/.subsuper-escalations")"
+  pass "a gone escalation clears the wedge marker, so a husk never raises a later possible-wedge alarm"
 }
 
 test_terminal_stale_escalate_leaves_no_marker() {
@@ -1911,6 +1975,8 @@ test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_inject_skip_forces_self
 test_is_wake_reason_distinguishes_status_stdout
+test_gone_wake_escalates_to_an_away_captain
+test_gone_escalate_leaves_no_marker_for_a_later_false_wedge
 test_terminal_stale_escalate_leaves_no_marker
 test_signal_escalate_marks_seen_no_catchall_refire
 test_collapse_newlines_pure

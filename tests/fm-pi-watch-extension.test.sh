@@ -172,7 +172,7 @@ const metadata = [tool.description, tool.promptSnippet, ...(tool.promptGuideline
 if (metadata.includes("Always use this tool")) throw new Error(`broad tool-selection metadata remained visible: ${metadata}`);
 if (!tool.description.includes("first required Pi watcher cycle")) throw new Error(`tool description omitted the first-cycle condition: ${tool.description}`);
 if (!tool.promptSnippet.includes("ordinary re-arming is automatic")) throw new Error(`tool snippet omitted automatic continuation: ${tool.promptSnippet}`);
-if (!tool.promptGuidelines.some((guideline) => guideline.includes("ordinary signal, stale, check, or heartbeat handling"))) {
+if (!tool.promptGuidelines.some((guideline) => guideline.includes("ordinary signal, stale, gone, check, or heartbeat handling"))) {
   throw new Error(`tool guidelines omitted ordinary-notification prevention: ${tool.promptGuidelines}`);
 }
 const result = await tool.execute("tool-call-1", {}, undefined, undefined, {});
@@ -394,6 +394,76 @@ EOF
   expect_code 0 "$status" "Pi actionable close must start one successor before wake delivery settles"
   [ -z "$out" ] || fail "Pi continuous-rearm test printed output: $out"
   pass "Pi actionable close starts one successor before wake delivery settles"
+}
+
+# The extension holds the one copy of the wake-reason prefix set that cannot
+# read bin/fm-classify-lib.sh's FM_WAKE_REASON_PREFIX_RE, so drift here is real
+# and its failure mode is worse than silence: an unrecognized reason is
+# classified as a broken watcher, which sends a supervisor after the monitoring
+# instead of after the dead worker it was told about. Every kind is driven
+# through the real close classifier, so a kind added on the bash side and
+# forgotten here fails this case rather than a live incident.
+test_pi_every_wake_kind_is_delivered_not_reported_as_a_watcher_failure() {
+  local kind repo home plugin log stop out status reason
+  for kind in signal stale gone check heartbeat; do
+    repo="$TMP_ROOT/pi-kind-$kind-root"
+    home="$TMP_ROOT/pi-kind-$kind-home"
+    log="$TMP_ROOT/pi-kind-$kind.log"
+    stop="$TMP_ROOT/pi-kind-$kind.stop"
+    mkdir -p "$repo/bin" "$home/state" "$home/config"
+    install_pi_watch_extension_fixture "$repo"
+    plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+    case "$kind" in
+      heartbeat) reason='heartbeat' ;;
+      *) reason="$kind: synthetic $kind wake" ;;
+    esac
+    cat > "$repo/bin/fm-watch-arm.sh" <<SH
+#!/usr/bin/env bash
+printf 'arm=%s\n' "\$\$" >> "\${FM_ARM_LOG:?}"
+count=\$(wc -l < "\$FM_ARM_LOG" | tr -d '[:space:]')
+printf 'watcher: started pid=%s (beacon fresh)\n' "\$\$"
+if [ "\$count" -eq 1 ]; then
+  printf '%s\n' '$reason'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+while [ ! -e "\$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+    chmod +x "$repo/bin/fm-watch-arm.sh"
+    out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" FM_WAKE_REASON="$reason" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+let prompt = "";
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (message) => {
+    prompt += message;
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-wake-kind", {}, undefined, undefined, {});
+for (let i = 0; i < 500 && !prompt; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+if (!prompt.includes(process.env.FM_WAKE_REASON)) throw new Error(`wake was not delivered: ${prompt}`);
+if (prompt.includes("watcher: FAILED")) throw new Error(`a real wake was reported as a watcher failure: ${prompt}`);
+process.exit(0);
+EOF
+    )
+    status=$?
+    expect_code 0 "$status" "Pi must deliver a $kind wake instead of reporting a watcher failure: $out"
+    [ -z "$out" ] || fail "Pi $kind wake-kind test printed output: $out"
+  done
+  pass "Pi delivers every watcher wake kind as its own reason, never as a watcher failure"
 }
 
 test_pi_hung_successor_falls_back_to_typed_wake() {
@@ -1566,6 +1636,76 @@ EOF
   pass "OpenCode pre-ready actionable close preserves its successor"
 }
 
+# The OpenCode plugin holds the second copy of the wake-reason prefix set that
+# cannot read bin/fm-classify-lib.sh's FM_WAKE_REASON_PREFIX_RE, and misses in
+# exactly the same direction as the Pi extension: an unrecognized reason becomes
+# "watcher: FAILED - OpenCode arm cycle ended without an actionable reason",
+# a broken-watcher alarm standing in for a dead worker.
+test_opencode_every_wake_kind_is_delivered_not_reported_as_a_watcher_failure() {
+  local kind plugin repo home log stop out status reason
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  for kind in signal stale gone check heartbeat; do
+    repo="$TMP_ROOT/opencode-kind-$kind-root"
+    home="$TMP_ROOT/opencode-kind-$kind-home"
+    log="$TMP_ROOT/opencode-kind-$kind.log"
+    stop="$TMP_ROOT/opencode-kind-$kind.stop"
+    mkdir -p "$repo/bin" "$home/state" "$home/config"
+    git init -q "$repo"
+    : > "$repo/AGENTS.md"
+    : > "$home/state/task.meta"
+    case "$kind" in
+      heartbeat) reason='heartbeat' ;;
+      *) reason="$kind: synthetic $kind wake" ;;
+    esac
+    cat > "$repo/bin/fm-watch-arm.sh" <<SH
+#!/usr/bin/env bash
+printf 'arm=%s\n' "\$\$" >> "\${FM_ARM_LOG:?}"
+count=\$(wc -l < "\$FM_ARM_LOG" | tr -d '[:space:]')
+printf 'watcher: started pid=%s (beacon fresh)\n' "\$\$"
+if [ "\$count" -eq 1 ]; then
+  printf '%s\n' '$reason'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+while [ ! -e "\$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+    chmod +x "$repo/bin/fm-watch-arm.sh"
+    out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" FM_WAKE_REASON="$reason" node 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let prompt = "";
+const client = {
+  session: {
+    promptAsync: async (request) => {
+      prompt += request.body.parts[0].text;
+    },
+  },
+};
+const hooks = await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+for (let i = 0; i < 500 && !prompt; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+if (!prompt.includes(process.env.FM_WAKE_REASON)) throw new Error(`wake was not delivered: ${prompt}`);
+if (prompt.includes("watcher: FAILED")) throw new Error(`a real wake was reported as a watcher failure: ${prompt}`);
+process.exit(0);
+EOF
+    )
+    status=$?
+    expect_code 0 "$status" "OpenCode must deliver a $kind wake instead of reporting a watcher failure: $out"
+    [ -z "$out" ] || fail "OpenCode $kind wake-kind test printed output: $out"
+  done
+  pass "OpenCode delivers every watcher wake kind as its own reason, never as a watcher failure"
+}
+
 test_opencode_hung_successor_falls_back_to_typed_wake() {
   local plugin repo home log out status
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -2139,6 +2279,7 @@ test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
 test_pi_scheduled_retry_call_is_owned_noop
 test_pi_actionable_close_starts_single_successor_before_delivery
+test_pi_every_wake_kind_is_delivered_not_reported_as_a_watcher_failure
 test_pi_hung_successor_falls_back_to_typed_wake
 test_pi_unretired_successor_falls_back_without_retry
 test_pi_late_unretired_close_resumes_supervision
@@ -2156,6 +2297,7 @@ test_opencode_primary_watch_plugin_requires_session_lock
 test_opencode_watch_arm_coordinator_respects_primary_scope
 test_opencode_primary_watch_plugin_rearms_after_wake
 test_opencode_pre_ready_actionable_close_preserves_its_successor
+test_opencode_every_wake_kind_is_delivered_not_reported_as_a_watcher_failure
 test_opencode_hung_successor_falls_back_to_typed_wake
 test_opencode_unretired_successor_falls_back_without_retry
 test_opencode_late_unretired_close_resumes_supervision

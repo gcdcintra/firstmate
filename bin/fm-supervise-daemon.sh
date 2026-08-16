@@ -433,6 +433,13 @@ classify_unknown() {  # <reason>
   printf 'escalate|unknown wake: %s' "$1"
 }
 
+# A killed or agent-less endpoint always escalates. The daemon self-handles
+# waits that clear on their own; this one never does, and relaunching a worker
+# is a supervision decision the away-mode daemon has no authority to make.
+classify_gone() {  # <reason>
+  printf 'escalate|%s' "$1"
+}
+
 # --- stale marker + escalation buffer (stateful, but via explicit state dir) -
 # Marker:   state/.subsuper-stale-<key>   contains the epoch first seen idle.
 # Buffer:   state/.subsuper-escalations    one distilled line per escalation.
@@ -1195,19 +1202,19 @@ should_force_self() {  # <reason>
   return 1
 }
 
-# A real watcher WAKE reason starts with one of these prefixes. Anything else on
-# the watcher child's stdout (e.g. "watcher: already running" on a singleton-lock
-# collision, reachable if the daemon was SIGKILL'd and its orphaned watcher child
-# still holds the #29 singleton lock) is a STATUS line, not a wake: handling it
-# as an unknown wake would flood the escalation buffer and restart the child with
-# no crash backoff. The main loop treats a non-wake line as idle (log + sleep +
+# A real watcher WAKE reason starts with one of the prefixes in the shared
+# FM_WAKE_REASON_PREFIX_RE (fm-classify-lib.sh owns the one definition, read
+# here and by every harness wake recognizer, so a new wake kind cannot be
+# queueable but undeliverable). Anything else on the watcher child's stdout
+# (e.g. "watcher: already running" on a singleton-lock collision, reachable if
+# the daemon was SIGKILL'd and its orphaned watcher child still holds the #29
+# singleton lock) is a STATUS line, not a wake: handling it as an unknown wake
+# would flood the escalation buffer and restart the child with no crash
+# backoff. The main loop treats a non-wake line as idle (log + sleep +
 # continue), so a singleton collision cannot hot-loop escalations.
 is_wake_reason() {  # <reason>
   local reason=$1
-  case "$reason" in
-    signal:*|stale:*|check:*|heartbeat|heartbeat:*) return 0 ;;
-  esac
-  return 1
+  [[ $reason =~ $FM_WAKE_REASON_PREFIX_RE ]]
 }
 
 # --- dispatch one wake reason to self-handle or escalate --------------------
@@ -1235,6 +1242,8 @@ handle_wake() {  # <reason> <state>
                 *"$FM_CLASSIFY_WEDGE_REASON_SEGMENT"*)
                   decision="escalate|${reason#stale: }" ;;
               esac ;;
+    gone:*)   kind=gone; arg="${reason#gone: }"; arg="${arg%% \(*}"
+              decision=$(classify_gone "$reason") ;;
     check:*)  decision=$(classify_check "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;
@@ -1246,9 +1255,18 @@ handle_wake() {  # <reason> <state>
     escalate)
       log "escalate: $reason -> $distilled"
       escalate_add "$state" "$distilled"
-      # A terminal-stale escalate must not leave a persistence marker behind, or
-      # housekeeping re-escalates the same pane as a false wedge later.
-      [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
+      # A terminal-stale or gone escalate must not leave a persistence marker
+      # behind, or housekeeping re-escalates the same pane as a false wedge
+      # later. For gone that false wedge is the precise alarm this wake kind
+      # exists to replace: a husk endpoint still captures, so the persistence
+      # recheck reads it as merely not-busy rather than gone, and an away
+      # captain would get the dead-worker report and then, a wedge window
+      # later, "possible wedge" for the same corpse.
+      case "$kind" in
+        stale) stale_marker_remove "$arg" "$state" ;;
+        gone)  stale_marker_remove "$arg" "$state"
+               pause_marker_remove "$arg" "$state" ;;
+      esac
       mark_escalated_seen "$kind" "$arg" "$state"
       [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
       ;;

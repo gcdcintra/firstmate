@@ -129,9 +129,22 @@ async function sessionOwnsLock(paths) {
   return false;
 }
 
+// The wake-reason prefix set. bin/fm-classify-lib.sh's FM_WAKE_REASON_PREFIX_RE
+// is its one owner; this is one of the two copies that cannot read it, because
+// they are loaded into a harness process and cannot source a bash library. The
+// other is .pi/extensions/fm-primary-pi-watch.ts, and a new wake kind has to be
+// added here AND there. A kind missing here is not silence but a
+// false alarm: an unrecognized reason is classified below as "watcher: FAILED",
+// which would send a supervisor hunting a broken watcher instead of the dead
+// worker the watcher actually reported. Stated once for both readers in this
+// file, and pinned to delivery by behavior in
+// tests/fm-pi-watch-extension.test.sh. No `g` flag: these are `.test` calls, and
+// a global regex would carry lastIndex between them.
+const WAKE_REASON_PREFIX = /^(signal:|stale:|gone:|check:|heartbeat($|:))/;
+
 function classifyArmClose(stdout, stderr, code, signal) {
   const combined = `${stdout}\n${stderr}`;
-  const reason = combined.split(/\r?\n/).find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line));
+  const reason = combined.split(/\r?\n/).find((line) => WAKE_REASON_PREFIX.test(line));
   if (reason) return { kind: "actionable", message: reason };
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
@@ -162,7 +175,7 @@ function classifyArmClose(stdout, stderr, code, signal) {
 
 function observeArmOutput(stdout, stderr, settleReadiness) {
   const combined = `${stdout}\n${stderr}`;
-  if (combined.split(/\r?\n/).some((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line))) {
+  if (combined.split(/\r?\n/).some((line) => WAKE_REASON_PREFIX.test(line))) {
     setArmStatus("wake");
     settleReadiness("wake");
     return;

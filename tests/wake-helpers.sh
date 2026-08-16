@@ -65,13 +65,27 @@ make_case() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+# Endpoint-presence knobs, modelling what a real tmux does to every probe the
+# agent-state classifier makes (bin/backends/tmux.sh):
+#   FM_FAKE_TMUX_NO_SERVER  the server is down: every call fails, and the
+#                           inventory carries tmux's own "no server running on"
+#                           text, which the adapter reads as `missing`.
+#   FM_FAKE_TMUX_GONE       the server is up but this window is not in it: the
+#                           inventory omits it and capture-pane fails.
+# Unset, the pane is present and behaves exactly as it did before these knobs
+# existed, so every pre-existing case is untouched.
+if [ -n "${FM_FAKE_TMUX_NO_SERVER:-}" ]; then
+  printf 'no server running on /tmp/fake-tmux-socket\n' >&2
+  exit 1
+fi
 if [ "${1:-}" = "list-windows" ]; then
-  if [ -n "${FM_FAKE_TMUX_WINDOW:-}" ]; then
+  if [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && [ -z "${FM_FAKE_TMUX_GONE:-}" ]; then
     printf '%s\n' "${FM_FAKE_TMUX_WINDOW#*:}"
   fi
   exit 0
 fi
 if [ "${1:-}" = "capture-pane" ]; then
+  [ -n "${FM_FAKE_TMUX_GONE:-}" ] && exit 1
   if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ]; then
     cat "$FM_FAKE_TMUX_CAPTURE"
     # Opt-in animated footer (FM_FAKE_TMUX_CHURN_FILE names a counter file). A
@@ -91,8 +105,10 @@ if [ "${1:-}" = "capture-pane" ]; then
   exit 0
 fi
 if [ "${1:-}" = "display-message" ]; then
+  [ -n "${FM_FAKE_TMUX_GONE:-}" ] && exit 1
   case "$*" in
     *pane_current_command*) printf '%s\n' "${FM_FAKE_TMUX_CURRENT_COMMAND:-}"; exit 0 ;;
+    *pane_current_path*) printf '%s\n' "${FM_FAKE_TMUX_CURRENT_PATH:-}"; exit 0 ;;
   esac
 fi
 exit 1
@@ -295,6 +311,14 @@ hash_text() {
   else
     printf '%s' "$1" | md5sum | cut -d' ' -f1
   fi
+}
+
+# Signature a primed .seen-* marker must hold so the per-poll signal scan does not
+# fire on a pre-existing status (mirrors fm-watch.sh's stat_sig exactly). Any
+# fixture that writes a status file up front and then asserts on a LATER wake
+# needs this, or the status's own first sighting fires first and masks the case.
+seen_sig() {
+  if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
 }
 
 dead_pid() {

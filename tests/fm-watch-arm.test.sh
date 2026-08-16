@@ -145,6 +145,50 @@ test_attached_arm_still_fails_on_a_wake_it_did_not_deliver() {
   pass "watch-arm: a cycle that delivered no wake of its own still fails loudly"
 }
 
+# Every wake kind must survive the arm layer, not just the two it was written
+# around. An arm that owns its watcher reads that watcher's stdout, so a kind its
+# recognizer does not know closes the cycle as if nothing had happened - and the
+# harnesses downstream of the arm read the classification it records here.
+test_owned_arm_reports_a_killed_endpoint_as_its_own_wake() {
+  local dir state fakebin armout status window key pid
+  dir=$(make_case owned-gone-wake)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  window="test:fm-killed"
+
+  # One in-flight ship task whose endpoint the fake backend reports as absent.
+  # The status is primed as already seen so the signal scan cannot pre-empt the
+  # endpoint read, and the pane hash is primed so the watcher enters on the
+  # already-stale path rather than a first sighting.
+  printf 'idle pane frame' > "$dir/pane.txt"
+  printf 'window=%s\nkind=ship\nworktree=%s\n' "$window" "$dir/worktree" > "$state/killed.meta"
+  printf 'working: implementing\n' > "$state/killed.status"
+  printf '%s' "$(seen_sig "$state/killed.status")" > "$state/.seen-killed_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "idle pane frame")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" FM_FAKE_TMUX_GONE=1 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_STALE_ESCALATE_SECS=999 \
+    "$WATCH_ARM" > "$armout" 2>&1 &
+  pid=$!
+  wait_for_exit "$pid" 120
+  status=$?
+
+  expect_code 0 "$status" "an arm whose watcher reported a killed endpoint must close successfully"
+  grep -q "^gone: $window" "$armout" \
+    || fail "the arm did not pass through the gone wake its own watcher produced: $(cat "$armout")"
+  ! grep -qF 'watcher: FAILED' "$armout" \
+    || fail "the arm reported a killed endpoint as a failed watcher cycle: $(cat "$armout")"
+  grep -q 'reason=actionable-gone' "$state/.watch-cycle-exits.log" \
+    || fail "the gone close was misclassified in the lifecycle ledger: $(cat "$state/.watch-cycle-exits.log" 2>/dev/null)"
+  pass "watch-arm: a killed endpoint closes the owning arm as its own actionable wake kind"
+}
+
 test_attached_arm_reports_the_delivered_wake
 test_attached_arm_reports_the_delivered_wake_after_drain
 test_attached_arm_still_fails_on_a_wake_it_did_not_deliver
+test_owned_arm_reports_a_killed_endpoint_as_its_own_wake

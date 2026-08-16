@@ -4,6 +4,10 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# For FM_WAKE_REASON_PREFIX_RE, the one definition of which watcher stdout lines
+# are wakes. Sourced for that constant alone; none of its classifiers run here.
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
 
 usage() {
@@ -86,7 +90,7 @@ else
 fi
 set -e
 
-if grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" >/dev/null 2>&1; then
+if grep -E "$FM_WAKE_REASON_PREFIX_RE" "$OUT" >/dev/null 2>&1; then
   cat "$OUT"
   [ ! -s "$ERR" ] || cat "$ERR" >&2
   exit 0
