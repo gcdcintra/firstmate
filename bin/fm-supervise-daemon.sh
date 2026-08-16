@@ -484,14 +484,15 @@ clear_pause_tracking() {  # <window> <state>
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   watcher_key=$(_stale_key "$win")
-  # The watcher's wedge markers are cleared as ONE set here too, matching
-  # fm-watch.sh's clear_wedge_tracking: leaving the worker-CPU anchor or the
-  # pane's spent deferral budget behind would make the watcher treat the next
-  # long turn on this pane as one that had already used its deferral up.
   rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
     "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
-    "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key" \
-    "$state/.cpu-$watcher_key" "$state/.cpu-defer-since-$watcher_key"
+    "$state/.stale-$watcher_key"
+  # The watcher's wedge markers are cleared as ONE set here too, through the
+  # owner both supervisors read (fm_wedge_markers_clear in fm-classify-lib.sh):
+  # leaving the worker-CPU anchor, the pipeline-activity sample, or the pane's
+  # spent deferral budget behind would make the watcher treat the next long turn
+  # on this pane as one that had already used its deferral up.
+  fm_wedge_markers_clear "$state" "$watcher_key"
 }
 
 reconcile_pause_tracking() {  # <window> <state> <last-status-line>

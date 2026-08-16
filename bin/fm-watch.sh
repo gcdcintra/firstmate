@@ -370,23 +370,18 @@ cpu_progress_for_window() {  # <window>
   fm_cpu_progress_check "$STATE/.cpu-$key" "$(window_backend "$w")" "$w"
 }
 
-# The ONE owner of a pane's wedge bookkeeping: the escalation timer, the
-# consecutive-escalation count, the rolling worker-CPU anchor, the throttled
-# pipeline-activity sample, and the shared deferral-episode epoch. They are
-# reset together wherever a pane goes genuinely active or moves onto the
-# declared-pause cadence, so a pane that resumes starts clean on all of them and
-# no marker can outlive a reset because one call site listed a stale subset.
+# A pane's wedge bookkeeping is reset as one set wherever that pane goes
+# genuinely active or moves onto the declared-pause cadence, so a pane that
+# resumes starts clean on all of it and no marker can outlive a reset because one
+# call site listed a stale subset. The set itself is owned by
+# bin/fm-classify-lib.sh's fm_wedge_markers_clear, because the away-mode daemon
+# resets the same markers and the two must not drift.
 # Surfacing a stale pane is NOT such a reset: those sites clear only the timer,
 # deliberately keeping the escalation count and the spent deferral budget.
-# `.cpu-defer-since-<key>` is the pre-hierarchy name of the episode epoch, which
-# now covers every deferral tier rather than only CPU; it is removed here too so
-# an upgraded home does not keep a marker nothing reads.
 clear_wedge_tracking() {  # <window>
   local win=$1 key
   key=$(window_key "$win")
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" \
-    "$STATE/.cpu-$key" "$STATE/.wedge-defer-since-$key" \
-    "$STATE/.wedge-pipeline-$key" "$STATE/.cpu-defer-since-$key"
+  fm_wedge_markers_clear "$STATE" "$key"
 }
 
 # --- endpoint absence: a killed endpoint is not a quiet worker ---------------

@@ -523,8 +523,21 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # plus a git walk per same-branch row to reach it would double the worst
       # case of a read the watcher makes on its single-threaded poll for every
       # aging pane, on exactly the panes that have no attributable run.
-      pipeline_mode && emit_pipeline unknown \
-        "the run the pipeline CLI reports is not attributable to this work, and the only other source is the coarse runs list, which carries no activity clock"
+      #
+      # `unknown` for all three, because this mode stops one source short of
+      # proving there is no run - but the three misses are different facts about
+      # a pane, and this sentence is read inside a wedge escalation, so a crew
+      # that has simply not started a run must not be described as one whose run
+      # failed to bind.
+      if pipeline_mode; then
+        if [ -z "$run_branch" ]; then
+          emit_pipeline unknown "the pipeline CLI answered without naming a run, so there is no activity clock to read for this work"
+        elif [ "$run_branch" != "$CREW_BRANCH" ]; then
+          emit_pipeline unknown "the only run the pipeline CLI reports is for another branch ($run_branch), so no run of this work's own could be measured"
+        else
+          emit_pipeline unknown "the run the pipeline CLI reports for this branch is validating other code - a superseded or rewritten head - so its clock is not this work's"
+        fi
+      fi
       COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
@@ -599,12 +612,12 @@ if pipeline_mode; then
   if [ -z "$CREW_BRANCH" ]; then
     emit_pipeline none "the task worktree is at a detached HEAD, so no run can be attributed to it"
   fi
+  # Every other way to reach here without an attributed run already emitted
+  # above: an answering CLI whose run this work cannot claim exits at the
+  # three-way miss, so no run is left for this block but an absent answer - and
+  # nothing unattributed can reach the field parsing below.
   if [ "$HAVE_RUN" != 1 ]; then
-    [ -n "$RUN_OUT" ] || emit_pipeline unknown "the pipeline CLI did not answer within ${NM_TIMEOUT}s"
-    emit_pipeline none "no pipeline run is attributed to this work"
-  fi
-  if [ "$RUN_SOURCE" = coarse ]; then
-    emit_pipeline unknown "the attributed run was found only in the coarse runs list, which carries no activity clock"
+    emit_pipeline unknown "the pipeline CLI did not answer within ${NM_TIMEOUT}s"
   fi
   PA_OUTCOME=$(strip_quotes "$(nm_field outcome)")
   [ -n "$PA_OUTCOME" ] && emit_pipeline none "the attributed pipeline run is terminal ($PA_OUTCOME)"

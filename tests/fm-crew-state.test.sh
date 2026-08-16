@@ -1787,7 +1787,36 @@ test_pipeline_activity_other_branch_run_is_not_credited() {
   out=$(run_pipeline_activity "$d" pa-other)
   assert_contains "$out" "unknown " "a run this work cannot claim measures nothing here"
   assert_not_contains "$out" "active " "another crew's advancing run is never credited to this task"
+  assert_contains "$out" "another branch (fm/some-other-crew)" "the miss names whose run it saw instead"
   pass "an advancing run belonging to another branch is never credited to this task"
+}
+
+# The three ways attribution can miss are three different facts about a pane, and
+# this sentence is spliced into the wedge escalation a supervisor reads. The
+# dominant one - a ship crew that has simply not started a run - must not be
+# reported as a run that failed to bind.
+test_pipeline_activity_names_which_attribution_missed() {
+  reset_fakes
+  local d out
+  pipeline_case pa-nobranch pa-nobranch fm/pa-nobranch; d=$PA_DIR
+  # An answer that names no run at all.
+  FM_FAKE_AXI_STATUS=$(run_active_steps fm/pa-nobranch review 3s | grep -v '^  branch:')
+  out=$(run_pipeline_activity "$d" pa-nobranch)
+  assert_contains "$out" "unknown " "an answer naming no run measures nothing"
+  assert_contains "$out" "without naming a run" "a crew with no run yet is described as exactly that"
+  assert_not_contains "$out" "another branch" "a crew with no run yet is not blamed on a sibling's run"
+
+  reset_fakes
+  pipeline_case pa-unbound pa-unbound fm/pa-unbound; d=$PA_DIR
+  # This branch's own run, but validating code this worktree cannot see: a
+  # rewritten or superseded head, which binds nothing here.
+  FM_FAKE_RUN_HEAD=0000000000000000000000000000000000000000
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-unbound review 3s)"
+  out=$(run_pipeline_activity "$d" pa-unbound)
+  assert_contains "$out" "unknown " "a run whose head binds nothing measures nothing here"
+  assert_contains "$out" "superseded or rewritten head" "an unbindable same-branch run is named as one"
+  assert_not_contains "$out" "active " "a run validating other code is never credited to this task"
+  pass "each way attribution can miss is reported as the distinct fact it is"
 }
 
 # The coarse runs-list fallback answers "does this branch have a run at all"
@@ -1899,6 +1928,7 @@ test_pipeline_activity_quiet_clock_earns_nothing
 test_pipeline_activity_quiet_ci_monitor_is_active
 test_pipeline_activity_parked_run_earns_nothing
 test_pipeline_activity_other_branch_run_is_not_credited
+test_pipeline_activity_names_which_attribution_missed
 test_pipeline_activity_never_spends_the_coarse_runs_fallback
 test_ordinary_read_still_spends_the_coarse_runs_fallback
 test_pipeline_activity_terminal_run_is_none
