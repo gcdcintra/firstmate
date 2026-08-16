@@ -52,6 +52,9 @@
 #     recovery does not;
 #   - a pass with both gaps claims only what is true and states the latency at
 #     the rate the ring actually advances;
+#   - a stored verdict is never presented as current once its clone's query is
+#     failing, including on the passes rotation spends elsewhere, and returns to
+#     current on the first query that answers again;
 #   - a reported failure is forgotten only after sustained recovery, judged per
 #     project rather than on the fleet being clean, so a transient blip cannot
 #     pre-forgive a later permanent failure, an intermittent one does not report
@@ -225,9 +228,9 @@ STALL_BUDGET=2
 
 # sweep_field <home> <line>: one line of the sweep cursor, which is this
 # feature's own persisted record format (bin/fm-branch-watch-lib.sh documents the
-# nine lines); line 3 is the coverage gap, line 7 the delivered watermark, and
-# line 8 the delivered failed-query projects, each with the consecutive answered
-# queries counted since.
+# ten lines); line 3 is the coverage gap, line 7 the delivered watermark, line 8
+# the delivered failed-query projects each with the consecutive answered queries
+# counted since, and line 9 the projects whose most recent attempt failed.
 sweep_field() {
   sed -n "${2}p" "$1/state/branch-watch/.sweep" 2>/dev/null || true
 }
@@ -406,6 +409,13 @@ OUT=$(poll "$H" "$BIN")
 [ -z "$OUT" ] || fail "a clone with no GitHub origin must be skipped, got: $OUT"
 assert_absent "$H/state/branch-watch/no-remote" "a clone with no origin records nothing"
 assert_absent "$H/state/branch-watch/gitlab-hosted" "a non-GitHub origin records nothing"
+# A clone outside the watch is skipped rather than queried, so it can never be
+# counted as a failing query. Its wording is deliberately left alone here.
+STATUS=$(poll "$H" "$BIN" --status)
+assert_contains "$STATUS" "gitlab-hosted: no default-branch verdict recorded yet" \
+  "a clone permanently outside the watch keeps its existing wording"
+assert_not_contains "$STATUS" "gitlab-hosted: no verdict - the forge query" \
+  "a skipped clone must never be reported as one whose query failed"
 pass "clones with no origin and with a non-GitHub origin are skipped silently"
 
 # --- two red projects stay two reports, never one that hides the other ------
@@ -853,6 +863,84 @@ while [ "$I" -lt 3 ]; do
 done
 pass "a query failing on alternating passes does not re-report once per fault cycle"
 
+# --- a verdict is never shown as current once its query stops answering -----
+#
+# This work began as a silence problem. A stale green is worse than silence:
+# silence at least prompts a question, while false reassurance stops one being
+# asked. So a status line must never assert a verdict that outlives the ability
+# to verify it, and must say how long ago it was actually observed.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+
+FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(well_bin "$H")" >/dev/null
+STATUS=$(poll "$H" "$(well_bin "$H")" --status)
+assert_contains "$STATUS" "alpha (main): green" "a freshly assessed clone reports its verdict plainly"
+assert_contains "$STATUS" "observed" "every verdict must say how long ago it was observed"
+assert_contains "$STATUS" "ago" "the observed age must be stated, not merely implied"
+
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)")
+assert_contains "$OUT" "forge query failed" "alpha's query starting to fail is reported"
+poll "$H" "$(fail_bin "$H" alpha)" --ack :sweep
+STATUS=$(poll "$H" "$(fail_bin "$H" alpha)" --status)
+assert_contains "$STATUS" "NOT current" \
+  "a verdict for a clone whose query is failing must not be presented as current"
+assert_not_contains "$STATUS" "alpha (main): green at" \
+  "the unqualified current-verdict form must not appear for a clone that cannot be queried"
+assert_contains "$STATUS" "bravo (main): green at" "a clone that still answers keeps its plain verdict"
+pass "a recorded verdict stops being presented as current once its clone's query fails"
+
+# The rotation case that a last-pass-only signal cannot survive: a pass that did
+# not attempt alpha at all must still not present alpha's verdict as current.
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 2.2 "" alpha)
+FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN" >/dev/null
+poll "$H" "$BIN" --ack :sweep
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+STATUS=$(poll "$H" "$BIN" --status)
+assert_not_contains "$STATUS" "could not query alpha" \
+  "this pass must not have attempted alpha, or the case proves nothing about rotation"
+assert_contains "$STATUS" "NOT current" \
+  "a pass that never attempted the clone must not restore its verdict to current"
+assert_not_contains "$STATUS" "alpha (main): green at" \
+  "the qualifier must survive the passes rotation spends elsewhere"
+pass "a failing clone's verdict stays qualified through the passes that never attempted it"
+
+# And it clears the moment the clone genuinely answers again - which the delivered
+# set deliberately does not do, since it keeps a project for several answered
+# queries so the notice will not flap.
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(well_bin "$H")")
+STATUS=$(poll "$H" "$(well_bin "$H")" --status)
+assert_contains "$STATUS" "alpha (main): green at" \
+  "one answered query must restore the plain current verdict"
+assert_not_contains "$STATUS" "NOT current" "a recovered clone must not stay qualified"
+pass "a verdict returns to being current on the first query that answers again"
+
+# The same property where there is no verdict at all to qualify.
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)" >/dev/null
+poll "$H" "$(fail_bin "$H" alpha)" --ack :sweep
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 2.2 "" alpha)
+FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN" >/dev/null
+poll "$H" "$BIN" --ack :sweep
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+STATUS=$(poll "$H" "$BIN" --status)
+assert_not_contains "$STATUS" "could not query alpha" \
+  "this pass must not have attempted alpha, or the case proves nothing about rotation"
+assert_contains "$STATUS" "alpha: no verdict - the forge query failed" \
+  "a clone with no verdict whose query is failing must say so, not read as merely unswept"
+assert_not_contains "$STATUS" "alpha: no default-branch verdict recorded yet" \
+  "never and not-yet must not be conflated on the passes rotation spends elsewhere"
+pass "a clone with no verdict whose query is failing never reads as merely not yet swept"
+
 # --- a pass that never asked is not evidence that anything recovered --------
 #
 # Under truncation a project can go many passes unattempted. Counting those as
@@ -973,7 +1061,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v5\nalpha\n%s\n-\n%s\nyes\n3\n-\n1\n' \
+printf 'fm-branch-sweep-v6\nalpha\n%s\n-\n%s\nyes\n3\n-\n-\n1\n' \
   "bravo charlie" "alpha bravo charlie" > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 chmod 555 "$H/state/branch-watch"
@@ -1037,7 +1125,7 @@ add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 add_project "$H" delta >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v5\ndelta\n%s\n-\n%s\nno\n-\n-\n1\n' \
+printf 'fm-branch-sweep-v6\ndelta\n%s\n-\n%s\nno\n-\n-\n-\n1\n' \
   "alpha bravo charlie delta" "alpha bravo charlie delta" > "$H/state/branch-watch/.sweep"
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" alpha)
 poll "$H" "$BIN" --ack :sweep
@@ -1116,7 +1204,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v5\nzulu\n-\n-\n-\nyes\n-\n-\n1\n' > "$H/state/branch-watch/.sweep"
+printf 'fm-branch-sweep-v6\nzulu\n-\n-\n-\nyes\n-\n-\n-\n1\n' > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
 assert_present "$H/state/branch-watch/alpha" \
@@ -1207,7 +1295,7 @@ UMASK_BEFORE=$(umask)
 fm_bw_write "$H/state" p acme/p main red "$RED_SHA" 900 "$GREEN_SHA" no 1 \
   || fail "writing a verdict must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_write must restore the caller's umask, got $(umask)"
-fm_bw_sweep_write "$H/state" p - - - yes - - 1 || fail "writing the sweep cursor must succeed"
+fm_bw_sweep_write "$H/state" p - - - yes - - - 1 || fail "writing the sweep cursor must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_sweep_write must restore the caller's umask, got $(umask)"
 [ -n "$(find "$H/state/branch-watch/p" -perm 0600 2>/dev/null)" ] \
   || fail "the verdict record must still be written private to its owner"

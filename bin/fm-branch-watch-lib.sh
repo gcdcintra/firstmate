@@ -33,9 +33,9 @@
 # when nothing ever carried it, which is that same swallowed red by another
 # route.
 #
-# The sweep's own cursor is a second record, state/branch-watch/.sweep, nine
+# The sweep's own cursor is a second record, state/branch-watch/.sweep, ten
 # lines and one per line:
-#   1  fm-branch-sweep-v5     version tag; anything else is refused, not guessed
+#   1  fm-branch-sweep-v6     version tag; anything else is refused, not guessed
 #   2  resume                 last project the previous pass ATTEMPTED, or "-"
 #   3  unreached              projects that pass never reached, space-joined, or "-"
 #   4  failed                 projects it reached whose forge query would not answer
@@ -45,7 +45,8 @@
 #   8  delivered              "<project>:<streak>" per failed query already
 #                             DELIVERED, streak being its consecutive answered
 #                             queries since, or "-"
-#   9  observed               unix epoch of the observation
+#   9  failing                projects whose most recent ATTEMPT failed its query
+#  10  observed               unix epoch of the observation
 # Line 2 is what makes a fleet too large for one pass lose a rotating slice
 # instead of the same tail forever, so it is written before each attempt rather
 # than after: a pass killed mid-project must not send every later pass back into
@@ -87,7 +88,20 @@
 # acknowledgement, never at the write that produces the notice, because that is
 # what an undelivered report must not be able to silence. The streak is exempt
 # because it only ever REMOVES entries, which makes a failure more visible
-# rather than less - the direction that needs no delivery gate.
+# rather than less - the direction that needs no delivery gate. Line 9 is
+# observation for the same reason and is never gated on delivery either.
+#
+# Line 9 answers a different question from line 8 and cannot be derived from it:
+# "is this project's query failing RIGHT NOW", which is what a status display
+# must not get wrong. Line 8 deliberately lags - it holds an entry for several
+# answered queries after recovery so a notice does not flap, and it never holds
+# a failure whose notice was not delivered. Both are correct for deciding
+# whether to speak; both would be wrong for describing the present. So line 9
+# tracks the outcome of each project's most recent ATTEMPT: a failed query puts
+# it in, the first answered query takes it out, and a pass that never attempted
+# it changes nothing. It keys no notice - waking on it would report every
+# recover-and-fail-again flap, which is precisely what line 8's patience exists
+# to avoid.
 #
 # The record is data, never authority: nothing here is interpolated into shell
 # source, and every field is revalidated on read rather than trusted from disk.
@@ -106,7 +120,7 @@ FM_BW_LAST_GREEN=
 FM_BW_SURFACED=
 FM_BW_OBSERVED=
 
-FM_BW_SWEEP_VERSION=fm-branch-sweep-v5
+FM_BW_SWEEP_VERSION=fm-branch-sweep-v6
 # How many consecutive answered queries retire a project from the delivered
 # failure set, so its next failure is news again rather than pre-forgiven.
 FM_BW_FORGET_AFTER=4
@@ -122,6 +136,7 @@ FM_BW_SWEEP_FLEET=
 FM_BW_SWEEP_SURFACED=
 FM_BW_SWEEP_WATERMARK=
 FM_BW_SWEEP_DELIVERED=
+FM_BW_SWEEP_FAILING=
 FM_BW_SWEEP_OBSERVED=
 
 # A project name addresses a directory under <home>/projects and a file under
@@ -452,8 +467,38 @@ fm_bw_watermark_valid() {
   [ "${#mark}" -le 12 ]
 }
 
+# fm_bw_failing_update <failing> <fleet> <unreached> <failed>
+# Which projects a status display must not present a stored verdict for. The
+# outcome of the most recent ATTEMPT and nothing else: a query that failed puts a
+# project in, the first query that answers takes it straight out, and a pass that
+# never attempted it leaves it exactly as it was. No delivery gate and no
+# patience, because both of those are right for deciding whether to speak and
+# wrong for saying what is true now.
+fm_bw_failing_update() {
+  local failing=${1-} fleet=${2-} unreached=${3-} failed=${4-} name rest out
+  out=''
+  [ "$failed" = - ] || out=$failed
+  if [ "$failing" != - ] && [ -n "$failing" ]; then
+    rest=$failing
+    while [ -n "$rest" ]; do
+      name=${rest%% *}
+      case "$rest" in
+        *' '*) rest=${rest#* } ;;
+        *) rest= ;;
+      esac
+      fm_bw_list_subset "$name" "$unreached" || continue
+      fm_bw_list_subset "$name" "$fleet" || continue
+      case " $out " in
+        *" $name "*) ;;
+        *) out="${out:+$out }$name" ;;
+      esac
+    done
+  fi
+  printf '%s\n' "${out:--}"
+}
+
 fm_bw_sweep_read() {
-  local state=$1 file version resume unreached failed fleet surfaced watermark delivered observed extra
+  local state=$1 file version resume unreached failed fleet surfaced watermark delivered failing observed extra
   FM_BW_SWEEP_RESUME=
   FM_BW_SWEEP_UNREACHED=
   FM_BW_SWEEP_FAILED=
@@ -461,6 +506,7 @@ fm_bw_sweep_read() {
   FM_BW_SWEEP_SURFACED=
   FM_BW_SWEEP_WATERMARK=
   FM_BW_SWEEP_DELIVERED=
+  FM_BW_SWEEP_FAILING=
   FM_BW_SWEEP_OBSERVED=
   file=$(fm_bw_sweep_path "$state")
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -473,6 +519,7 @@ fm_bw_sweep_read() {
   IFS= read -r surfaced <&6 || { exec 6<&-; return 1; }
   IFS= read -r watermark <&6 || { exec 6<&-; return 1; }
   IFS= read -r delivered <&6 || { exec 6<&-; return 1; }
+  IFS= read -r failing <&6 || { exec 6<&-; return 1; }
   IFS= read -r observed <&6 || { exec 6<&-; return 1; }
   if IFS= read -r extra <&6; then
     exec 6<&-
@@ -487,6 +534,7 @@ fm_bw_sweep_read() {
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   fm_bw_watermark_valid "$watermark" || return 1
   fm_bw_delivered_valid "$delivered" || return 1
+  fm_bw_list_valid "$failing" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   FM_BW_SWEEP_RESUME=$resume
   FM_BW_SWEEP_UNREACHED=$unreached
@@ -495,13 +543,14 @@ fm_bw_sweep_read() {
   FM_BW_SWEEP_SURFACED=$surfaced
   FM_BW_SWEEP_WATERMARK=$watermark
   FM_BW_SWEEP_DELIVERED=$delivered
+  FM_BW_SWEEP_FAILING=$failing
   FM_BW_SWEEP_OBSERVED=$observed
 }
 
-# fm_bw_sweep_write <state> <resume> <unreached> <failed> <fleet> <surfaced> <watermark> <delivered> <observed>
+# fm_bw_sweep_write <state> <resume> <unreached> <failed> <fleet> <surfaced> <watermark> <delivered> <failing> <observed>
 fm_bw_sweep_write() {
   local state=$1 resume=$2 unreached=$3 failed=$4 fleet=$5 surfaced=$6 watermark=$7
-  local delivered=$8 observed=$9
+  local delivered=$8 failing=$9 observed=${10}
   local dir file
   # Validate exactly what fm_bw_sweep_read demands. A cursor this writes but the
   # reader then refuses would restart every pass at the beginning, which quietly
@@ -513,12 +562,13 @@ fm_bw_sweep_write() {
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   fm_bw_watermark_valid "$watermark" || return 1
   fm_bw_delivered_valid "$delivered" || return 1
+  fm_bw_list_valid "$failing" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   dir=$(fm_bw_dir "$state")
   file=$(fm_bw_sweep_path "$state")
-  fm_bw_publish "$dir" "$file" "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+  fm_bw_publish "$dir" "$file" "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
     "$FM_BW_SWEEP_VERSION" "$resume" "$unreached" "$failed" "$fleet" "$surfaced" \
-    "$watermark" "$delivered" "$observed")"
+    "$watermark" "$delivered" "$failing" "$observed")"
 }
 
 # How many passes a fleet of <fleet> needs at the coverage a pass achieved, where

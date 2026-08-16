@@ -69,10 +69,19 @@
 # there is deliberate: a relapse arriving before that forgetting completes stays
 # quiet, on the reading that inside such a window it is most likely the same
 # fault still settling rather than a new one, and it is still visible on demand
-# through --status. Any red report in a truncated pass carries
+# through --status. Any red report in a truncated pass THAT SELF-BOUNDS carries
 # the unreached names with it whether or not the notice is suppressed, so a red
 # wake can never be read as "and the rest of the fleet is fine", and --status
 # prints the current gap on demand.
+#
+# A pass KILLED by the watcher's per-check timeout is the accepted exception: a
+# red already printed inside the loop reaches the watcher while the trailing
+# report never runs, so that one wake carries no coverage clause. Buffering reds
+# until the trailing report would let a kill swallow them outright, which is the
+# expensive failure traded for the cheap one - the wrong way round. Two things
+# already cover it: --status reports the killed pass's real gap, because the
+# cursor is written before each attempt, and that same write is what lets the
+# next pass resume where this one stopped.
 #
 # WHAT THIS FEATURE'S HISTORY IS, because it should shape what gets added next.
 # The sweep first dropped a fixed alphabetical tail and said nothing, so it was
@@ -456,7 +465,7 @@ run_ack() {
       seen=$(fm_bw_delivered_add "$FM_BW_SWEEP_DELIVERED" "$FM_BW_SWEEP_FAILED")
       fm_bw_sweep_write "$STATE" "$FM_BW_SWEEP_RESUME" "$FM_BW_SWEEP_UNREACHED" \
         "$FM_BW_SWEEP_FAILED" "$FM_BW_SWEEP_FLEET" yes "$mark" "$seen" \
-        "$FM_BW_SWEEP_OBSERVED" || true
+        "$FM_BW_SWEEP_FAILING" "$FM_BW_SWEEP_OBSERVED" || true
       continue
     fi
     fm_bw_read "$STATE" "$key" || continue
@@ -466,21 +475,42 @@ run_ack() {
   done
 }
 
+status_age() {
+  local then=$1 now=$2 secs
+  secs=$((now - then))
+  [ "$secs" -ge 0 ] || secs=0
+  if [ "$secs" -lt 60 ]; then
+    printf '%ss\n' "$secs"
+  elif [ "$secs" -lt 3600 ]; then
+    printf '%sm\n' "$((secs / 60))"
+  elif [ "$secs" -lt 86400 ]; then
+    printf '%sh\n' "$((secs / 3600))"
+  else
+    printf '%sd\n' "$((secs / 86400))"
+  fi
+}
+
 run_status() {
-  local project found=0 sweep_failed=- have_sweep=0
+  local project found=0 sweep_failed=- sweep_failing=- have_sweep=0 now
   if fm_bw_sweep_read "$STATE"; then
     have_sweep=1
     sweep_failed=$FM_BW_SWEEP_FAILED
+    sweep_failing=$FM_BW_SWEEP_FAILING
   fi
+  now=$(date +%s)
   while IFS= read -r project; do
     [ -n "$project" ] || continue
     found=1
+    # Whether this project's query is failing RIGHT NOW, which is what decides
+    # whether a stored verdict may be shown as the current one. The durable
+    # field carries it across the passes rotation did not attempt it on; the
+    # last pass's own list covers a pass killed before it could write that field.
     if ! fm_bw_read "$STATE" "$project"; then
       # A clone nobody could query and a clone nobody has swept yet both have no
       # verdict, and telling them apart is the whole point of tracking the one.
-      case " $sweep_failed " in
+      case " $sweep_failing $sweep_failed " in
         *" $project "*)
-          printf '%s: no verdict - the forge query failed on the last pass that tried it\n' "$project"
+          printf '%s: no verdict - the forge query failed and has not succeeded since\n' "$project"
           ;;
         *)
           printf '%s: no default-branch verdict recorded yet\n' "$project"
@@ -488,10 +518,21 @@ run_status() {
       esac
       continue
     fi
+    case " $sweep_failing $sweep_failed " in
+      *" $project "*)
+        # Naming the age rather than only the doubt: a verdict nothing has been
+        # able to re-check is not wrong, it is unverified, and how long it has
+        # been unverified is the thing that tells an operator what to do about it.
+        printf '%s (%s): last verdict %s at %s, observed %s ago - NOT current, its forge query is failing\n' \
+          "$project" "$FM_BW_BRANCH" "$FM_BW_STATE" "$(fm_bw_short "$FM_BW_SHA")" \
+          "$(status_age "$FM_BW_OBSERVED" "$now")"
+        continue
+        ;;
+    esac
     printf '%s (%s): %s at %s' "$project" "$FM_BW_BRANCH" "$FM_BW_STATE" "$(fm_bw_short "$FM_BW_SHA")"
     [ "$FM_BW_STATE" = green ] || printf ', last green %s, run %s, surfaced=%s' \
       "$(fm_bw_short "$FM_BW_LAST_GREEN")" "$FM_BW_RUN" "$FM_BW_SURFACED"
-    printf '\n'
+    printf ', observed %s ago\n' "$(status_age "$FM_BW_OBSERVED" "$now")"
   done < <(list_projects)
   [ "$found" = 1 ] || printf 'no default-branch verdicts recorded in %s\n' "$(fm_bw_dir "$STATE")"
   # Coverage is part of the verdict: a reader has to be able to tell "every
@@ -545,6 +586,7 @@ PREV_FLEET=-
 PREV_SURFACED=yes
 PREV_WATERMARK=-
 PREV_DELIVERED=-
+PREV_FAILING=-
 RESUME=-
 if fm_bw_sweep_read "$STATE"; then
   RESUME=$FM_BW_SWEEP_RESUME
@@ -552,6 +594,7 @@ if fm_bw_sweep_read "$STATE"; then
   PREV_SURFACED=$FM_BW_SWEEP_SURFACED
   PREV_WATERMARK=$FM_BW_SWEEP_WATERMARK
   PREV_DELIVERED=$FM_BW_SWEEP_DELIVERED
+  PREV_FAILING=$FM_BW_SWEEP_FAILING
 fi
 
 # Resume after the project the previous pass last attempted. An unreadable,
@@ -602,7 +645,8 @@ while [ "$K" -lt "$COUNT" ]; do
   # cleaner gap forward would let a pass that died three projects into fifty
   # report that it reached them all.
   fm_bw_sweep_write "$STATE" "${RING[$K]}" "$REMAINING" "${FAILED:--}" "$PREV_FLEET" \
-    "$PREV_SURFACED" "$PREV_WATERMARK" "$PREV_DELIVERED" "$(date +%s)" || true
+    "$PREV_SURFACED" "$PREV_WATERMARK" "$PREV_DELIVERED" "$PREV_FAILING" \
+    "$(date +%s)" || true
   LAST_ATTEMPTED=${RING[$K]}
   RECORD=$(sweep_project "${RING[$K]}")
   RC=$?
@@ -628,6 +672,7 @@ UNREACHED=$REMAINING
 FAILED=${FAILED# }
 [ -n "$FAILED" ] || FAILED=-
 REACHED=$((K - $(fm_bw_list_count "$FAILED")))
+FAILING=$(fm_bw_failing_update "$PREV_FAILING" "$FLEET" "$UNREACHED" "$FAILED")
 
 NOW=$(date +%s)
 if [ "$UNREACHED" = - ] && [ "$FAILED" = - ]; then
@@ -643,7 +688,7 @@ if [ "$UNREACHED" = - ] && [ "$FAILED" = - ]; then
   # and the watermark they were measured against carry through untouched.
   fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - - "$PREV_FLEET" "$PREV_SURFACED" \
     "$PREV_WATERMARK" "$(fm_bw_delivered_advance "$PREV_DELIVERED" "$FLEET" - -)" \
-    "$NOW" || true
+    "$FAILING" "$NOW" || true
   exit 0
 fi
 
@@ -704,12 +749,12 @@ if [ "$NOTIFY" = 1 ]; then
   # lasts is proportionate, and saying inline that it could not be recorded is
   # what keeps the repeat self-explaining rather than reading as noise.
   if ! fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
-    no "$WATERMARK" "$DELIVERED" "$NOW"; then
+    no "$WATERMARK" "$DELIVERED" "$FAILING" "$NOW"; then
     LINE="$LINE; this coverage report could not be recorded, so it repeats every sweep until it can be"
   fi
   printf '%s\t%s\n' "$FM_BW_SWEEP_KEY" "$LINE"
 elif ! fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
-  yes "$WATERMARK" "$DELIVERED" "$NOW"; then
+  yes "$WATERMARK" "$DELIVERED" "$FAILING" "$NOW"; then
   # Suppression is only trustworthy while the cursor it is decided from can be
   # written. Once it cannot, the resume position freezes and rotation falls back
   # to the fixed tail it was added to remove, while --status keeps describing a

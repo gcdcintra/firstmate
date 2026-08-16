@@ -146,7 +146,8 @@ The wake reports the breakage and never acts on it: reverting or force-pushing a
 
 `state/branch-watch/<project>` holds one private per-project verdict record, `state/branch-watch/.sweep` holds the pass cursor and the last reported coverage gap, and `state/.last-branch-watch` is the sweep's own cadence marker.
 `bin/fm-branch-watch-lib.sh` owns that record's layout and validation, including the surfaced flag that keeps a red verdict pending until its wake has reached the durable queue.
-Run `bin/fm-branch-poll.sh --status` to read the current verdict per project.
+Run `bin/fm-branch-poll.sh --status` to read the current verdict per project, each with how long ago it was observed.
+A clone whose forge query is failing is never shown as having a current verdict: its last one is labelled as no longer current, so a stored green cannot read as reassurance about a clone nothing has been able to reach since.
 
 ## Gate defaults (.no-mistakes.yaml)
 
