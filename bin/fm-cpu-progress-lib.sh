@@ -30,7 +30,12 @@
 #     floor - and escalates. This library must never start excusing that one.
 #   - A wedge that KEEPS BURNING CPU - an internal retry or spin loop - looks
 #     exactly like productive work here and is suppressed. That is why the
-#     caller bounds total deferral rather than deferring forever.
+#     caller bounds total deferral rather than deferring forever. This measure
+#     is the LAST tier of that caller's ordered evidence hierarchy
+#     (bin/fm-wedge-evidence-lib.sh), which owns the order, the caps, and the
+#     single per-pane deferral episode they are all measured against - so an
+#     earlier tier that already opened that episode shortens the window stated
+#     below rather than adding to it.
 #   - That bound covers about three hours of ONE turn: the one-hour limit on a
 #     busy pane with no completed turn, plus the two-hour deferral budget. The
 #     longest productive turn on record ran five hours at 5.6 ticks/s

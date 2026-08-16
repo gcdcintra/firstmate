@@ -43,15 +43,15 @@
 #   - Bounded wedge latency: a stale pane without a declared external wait is
 #     escalated only after it has gone STALE_ESCALATE_SECS without pane output
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
-#     within STALE_ESCALATE_SECS + a tick, never lost. The watcher reports the
-#     worker process's own CPU reading on EVERY wedge escalation, but only a
-#     pane still inside a turn - busy with no completed turn - may have that
-#     escalation DEFERRED, by the bounded budget bin/fm-watch.sh owns
-#     (FM_CPU_PROGRESS_MAX_DEFER_SECS): a longer delay on that one path, still
-#     not a loss. A stale pane holds no exact busy verdict, so it escalates on
-#     the cadence above whatever its CPU reads.
-#     A declared pause instead gets its own longer PAUSE_RESURFACE_SECS
-#     recheck, never a wedge escalation.
+#     within STALE_ESCALATE_SECS + a tick, never lost. The watcher carries the
+#     whole ordered evidence reading (bin/fm-wedge-evidence-lib.sh) on EVERY
+#     wedge escalation, and each tier that may DEFER one is capped against a
+#     single per-pane deferral episode: a longer delay on those paths, still
+#     not a loss, and the escalation ladder keeps counting through every
+#     deferral so demand-deep-inspection stays reachable.
+#     A declared pause gets its own longer PAUSE_RESURFACE_SECS recheck, worded
+#     without the possible-wedge segment below that threshold so it classifies
+#     here as the pause recheck it is, and switching to the wedge form at it.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays

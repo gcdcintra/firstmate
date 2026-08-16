@@ -96,7 +96,8 @@ tests/fm-crew-state.test.sh
 
 ## Worker CPU progress
 
-[`bin/fm-cpu-progress-lib.sh`](../../bin/fm-cpu-progress-lib.sh) reads utime+stime+cutime+cstime from `/proc/<pid>/stat`, and the watcher consults it before every wedge escalation.
+[`bin/fm-cpu-progress-lib.sh`](../../bin/fm-cpu-progress-lib.sh) reads utime+stime+cutime+cstime from `/proc/<pid>/stat`.
+It is the LAST tier of the wedge evidence hierarchy ([pipeline activity](#pipeline-activity) is the tier above it), and its reading is carried in every wedge escalation whether or not it decided one.
 These measurements set its shipped floor of `FM_CPU_PROGRESS_MIN_TICKS_PER_MIN=120`, i.e. 2.0 ticks/s.
 Fields are USER_HZ units, fixed at 100 on Linux (`getconf CLK_TCK` reported `100` on the sampled host).
 
@@ -161,6 +162,78 @@ tests/fm-daemon.test.sh
 `tests/fm-cpu-progress.test.sh` drives real processes rather than canned `/proc` fixtures, since the guarantee is about the counter the kernel maintains.
 A live worker is not a usable stand-in for a wedged one: a quiet agent can resume mid-sample and then correctly reads as progressing, which is why the flat-counter cases use processes the test controls or a pane whose agent has actually exited.
 The escalation reason carrying that reading is also a contract with the away-mode daemon's force-escalate matcher, so `tests/fm-daemon.test.sh` pins both ends together: it feeds a real `bin/fm-watch.sh` wedge escalation through the daemon's own wake handling and fails if either side's wording drifts off the shared segment.
+
+## Pipeline activity
+
+The wedge alarm's CPU tier above measures the worker's own pane process, which during a validation run is blocked in one `axi run` call and is correct to be near-idle; the work happens in the pipeline's separate agent.
+[`bin/fm-crew-state.sh`](../../bin/fm-crew-state.sh)'s `--pipeline-activity` mode reads that other process's clock instead, and [`bin/fm-wedge-evidence-lib.sh`](../../bin/fm-wedge-evidence-lib.sh) orders it above CPU for that reason.
+
+The fields it reads are published by the installed CLI itself.
+Verified 2026-08-16 against `no-mistakes version v1.46.0 (20892e6)`, whose embedded agent instructions and TOON struct tags both name the table:
+
+```sh
+strings "$(command -v no-mistakes)" | grep -F 'A run object with a `running` or `fixing` step'
+# - A run object with a `running` or `fixing` step may include an `active_steps` table. Use it to see the
+#   active duration, latest activity, native agent PID, and current execution or fix round.
+
+strings "$(command -v no-mistakes)" | grep -F 'active_steps` with `active_for`'
+#    `active_steps` with `active_for`, `last_activity`, a native `agent_pid` when
+
+strings "$(command -v no-mistakes)" | grep -cE '^toon:"(step|active_for|last_activity|agent_pid|round)"$'
+# 5
+```
+
+The same instructions define the quiet marker and the gate marker this mode maps:
+
+- `last_activity` is prefixed `quiet` once no step log or native-agent lifecycle activity has arrived for longer than the pipeline's own `step_quiet_warning` (`10m` in the shipped `~/.no-mistakes/config.yaml`), and the CLI calls that "a liveness clue".
+- a run waiting at an approval or fix-review gate carries `awaiting_agent: parked <duration>`.
+
+No live run was available to capture an `active_steps` table verbatim during this change, so the reader is deliberately built to survive being wrong about it: it binds each field by COLUMN NAME from the table header rather than by position, and every unreadable outcome - no table, an unnamed column, a short row, a silent CLI, coarse attribution only - is `unknown`, which earns a caller nothing and escalates exactly as before the tier existed.
+`tests/fm-crew-state.test.sh` pins that both ways, including a deliberately reordered header.
+
+Two mappings are decisions rather than readings, and are recorded as such:
+
+- a `quiet` clock on the `ci` step is still reported `active`, because that step's own logged vocabulary ("all CI checks passed - still monitoring until merged or closed", "no CI checks reported - still monitoring until merged or closed", verified in the [`nm_ci_checks_state`](../../bin/fm-crew-state.sh) marker set against 360+ real run logs) shows the CI monitor deliberately waits on the forge without writing a step log. Every other step's quiet is a real liveness clue and earns nothing.
+- a `parked` run earns nothing, because it is waiting for THIS worker to answer a gate, which makes a quiet worker the fault rather than an explanation for one.
+
+Attribution is not re-derived for this mode: it reuses the branch and code-identity binding the rest of [`bin/fm-crew-state.sh`](../../bin/fm-crew-state.sh) already applies, including `branch_sync.pipeline.submitted_head`.
+That matters because bare `axi status` answers with another branch's run when this branch has none, so an unattributed read would credit a sibling crew's advancing pipeline to a wedged pane - the wrong-subject defect the whole hierarchy exists to remove.
+
+End-to-end on 2026-08-16, with a real `bin/fm-watch.sh` in a throwaway `FM_HOME`, a private tmux server on its own socket, and a `no-mistakes` shadowed on `PATH` so the shared daemon was never contacted.
+The pane was set up once - a busy record, a spawn record aged past `FM_BUSY_TURN_MAX_SECS`, a real git worktree on the run's branch and head - and only the CLI's answer changed between the two phases.
+
+The real reader, on a real `active_steps` table:
+
+```
+active the attributed pipeline run is at step document, active 34m12s, last activity 24s
+```
+
+With that answer the watcher deferred, opened one deferral episode, printed no wake, and recorded which evidence held the escalation back:
+
+```
+deferred busy (no completed turn) wedge escalation, the attributed pipeline run is advancing
+  (no completed turn for 11s): live:fm-livecheck - the attributed pipeline run is at step document,
+  active 34m12s, last activity 24s
+```
+
+With the same pane and the same busy verdict, once the run parked on the worker, it escalated and carried the whole ordered reading:
+
+```
+stale: live:fm-livecheck (no completed turn for 12s, possible wedge, escalation 1;
+  the harness still reports this turn busy (pi-ext), but a busy turn that completes nothing has
+  passed its bound, so that verdict alone no longer clears this pane;
+  the attributed pipeline run is parked at review waiting for this worker to answer it;
+  could not resolve the worker process for live:fm-livecheck)
+```
+
+That second transcript is the point of the whole change: the alarm names the authoritative signal it overrode and why, names the pipeline state that failed to excuse it, and reports the CPU tier as unmeasured rather than silently deciding on it.
+
+Deterministic entry points:
+
+```sh
+tests/fm-crew-state.test.sh
+tests/fm-watch-triage.test.sh
+```
 
 ## Endpoint absence
 
