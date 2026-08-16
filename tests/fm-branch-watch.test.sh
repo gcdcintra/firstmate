@@ -42,6 +42,12 @@
 #     alternating complete and truncated does not re-notify every other sweep;
 #   - a red whose verdict cannot be recorded is still reported, says so inline,
 #     and never claims a first observation it already made;
+#   - a project whose forge query fails is excluded from the coverage figure,
+#     named as its own category, distinguishable in --status from a never-swept
+#     clone, and still produces no verdict;
+#   - a truncated pass whose cursor cannot be written still reports its gap;
+#   - a fleet that grew during a complete pass still reports its own first
+#     truncation rather than inheriting the old fleet's figure;
 #   - green records silently and clears the pre-launch advisory;
 #   - config/branch-watch "off", a clone with no origin, and a non-GitHub origin
 #     are all silent.
@@ -93,10 +99,13 @@ add_project() {
 # may be the literal word "fail", which makes that subcommand exit non-zero the
 # way an expired log or an unreachable forge does. <list-delay> makes each
 # `run list` take that many seconds, which is how the cases below drive a sweep
-# past its own budget the way a real fleet's forge round-trips do.
+# past its own budget the way a real fleet's forge round-trips do. <fail-repo>
+# makes `run list` fail for that one project only, the way a renamed repository
+# or a lapsed token grant does while the rest of the fleet answers normally.
 FAKE_SUBJECT='Merge pull request #36 from acme/nf-9'
 fake_gh() {
-  local home=$1 runs=$2 jobs=$3 delay=${4:-0} slow=${5:-} fakebin
+  local home=$1 runs=$2 jobs=$3 delay=${4:-0} slow=${5:-} failrepo=${6:-} fakebin failarm=
+  [ -z "$failrepo" ] || failarm="case \"\$*\" in *\"$failrepo\"*) exit 1 ;; esac"
   fakebin=$(fm_fakebin "$home")
   cat > "$fakebin/gh" <<SH
 #!/usr/bin/env bash
@@ -112,6 +121,7 @@ case "\$1" in
     case "\$2" in
       list)
         [ "$runs" != fail ] || exit 1
+        $failarm
         case "\$*" in
           *"$slow"*) [ "$delay" = 0 ] || sleep "$delay" ;;
         esac
@@ -561,8 +571,8 @@ pass "the same degraded coverage level does not surface again"
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
 [ -z "$OUT" ] || fail "coverage recovering must not surface, got: $OUT"
-[ "$(sweep_field "$H" 6)" = 4 ] || \
-  fail "recovery must not lower the worst coverage reported, got $(sweep_field "$H" 6)"
+[ "$(sweep_field "$H" 7)" = 4 ] || \
+  fail "recovery must not lower the worst coverage reported, got $(sweep_field "$H" 7)"
 pass "coverage recovering does not surface, and does not lower the watermark"
 
 # Pass 5 resumes at charlie and stalls there: 1 of 4, the worst level again.
@@ -598,7 +608,7 @@ BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
 assert_contains "$OUT" "covering the fleet within 2 passes" "the first truncation states its pass count"
 poll "$H" "$BIN" --ack :sweep
-[ "$(sweep_field "$H" 6)" = 2 ] || fail "the delivered pass count must be recorded, got $(sweep_field "$H" 6)"
+[ "$(sweep_field "$H" 7)" = 2 ] || fail "the delivered pass count must be recorded, got $(sweep_field "$H" 7)"
 
 # A pass that fits in its budget reaches everything.
 FAST=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
@@ -606,8 +616,8 @@ OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$FAST")
 [ -z "$OUT" ] || fail "a complete pass must wake nothing, got: $OUT"
 assert_contains "$(poll "$H" "$FAST" --status)" "sweep: the last pass reached every project" \
   "a complete pass must report complete coverage"
-[ "$(sweep_field "$H" 6)" = 2 ] \
-  || fail "a complete pass must not discard the coverage already reported, got $(sweep_field "$H" 6)"
+[ "$(sweep_field "$H" 7)" = 2 ] \
+  || fail "a complete pass must not discard the coverage already reported, got $(sweep_field "$H" 7)"
 
 # Back to the same truncated coverage. Nothing about it is new. The complete pass
 # above resumed the ring at charlie, so the stall goes on delta to land second in
@@ -658,6 +668,134 @@ assert_not_contains "$OUT" "was already red when the watch started" \
   "a later sweep must not claim a first observation it already made"
 pass "a red verdict that cannot be recorded is still reported, and says so rather than claiming a first sighting"
 
+# --- a project the forge will not answer for is not a project that was checked -
+#
+# A renamed repository or a lapsed token grant fails that one query forever while
+# the rest of the fleet answers normally. Counting it toward the coverage figure
+# would make the disclosure assert it was looked at, which is worse than the
+# silent tail rotation replaced: rotation at least guaranteed eventual coverage.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+runs_file "$TMP_ROOT/runs-green" "$GREEN_SHA|completed|success|899|https://forge/runs/899|CI"
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 0 "" bravo)
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
+assert_contains "$OUT" "reached 2 of 3 projects" \
+  "a project whose forge query failed must not count toward the coverage figure"
+assert_contains "$OUT" "forge query failed, so no verdict at all for: bravo" \
+  "the failed query must be named as its own category"
+assert_not_contains "$OUT" "not reached this pass" \
+  "an attempted project is not an unreached one, and rotation cannot help it"
+assert_present "$H/state/branch-watch/alpha" "the projects that did answer are still assessed"
+assert_absent "$H/state/branch-watch/bravo" \
+  "a query that could not answer must produce no verdict at all"
+STATUS=$(poll "$H" "$BIN" --status)
+assert_contains "$STATUS" "bravo: no verdict - the forge query failed" \
+  "--status must tell a failing query apart from a clone never swept"
+assert_contains "$STATUS" "sweep: the last pass could not query bravo" \
+  "--status must name the failed query in the pass summary too"
+assert_contains "$STATUS" "charlie (main): green" "the rest of the fleet still reports its verdict"
+pass "a project whose forge query fails is excluded from coverage and named, with no verdict invented"
+
+poll "$H" "$BIN" --ack :sweep
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "a persistently failing query must not wake every sweep, got: $OUT"
+pass "a persistently failing query surfaces once and is then carried by the watermark"
+
+# A pass killed after a failed query must still leave the cursor it wrote on the
+# way through: the trailing report never runs, so whatever the last in-loop write
+# recorded is the whole account of that pass. alpha's query fails instantly and
+# bravo then stalls, so the kill lands with alpha already recorded as failed.
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 2.2 bravo alpha)
+set -m
+PATH="$BIN:$PATH" FM_HOME="$H" FM_BRANCH_WATCH_BUDGET=999 \
+  "$ROOT/bin/fm-branch-poll.sh" >/dev/null 2>&1 &
+POLL_PID=$!
+set +m
+sleep 1
+POLL_PGID=$(ps -o pgid= -p "$POLL_PID" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$POLL_PGID" ] && [ "$POLL_PGID" = "$POLL_PID" ]; then
+  kill -KILL -- "-$POLL_PGID" 2>/dev/null || true
+else
+  kill -KILL "$POLL_PID" 2>/dev/null || true
+fi
+wait "$POLL_PID" 2>/dev/null || true
+is_live_non_zombie "$POLL_PID" && fail "the killed sweep must not outlive the case"
+STATUS=$(poll "$H" "$BIN" --status)
+assert_contains "$STATUS" "sweep: the last pass could not query alpha" \
+  "a pass killed after a failed query must still have recorded that failure"
+assert_contains "$STATUS" "alpha: no verdict - the forge query failed" \
+  "the per-project annotation must survive a killed pass too"
+assert_not_contains "$STATUS" "did not reach alpha" \
+  "a project that was attempted and failed is never reported as merely unreached"
+pass "a failed query is recorded as the pass goes, so a killed pass still accounts for it"
+
+# --- a coverage report that cannot be recorded is still reported -------------
+#
+# When the cursor cannot be written, three protections fail at once: rotation
+# degenerates back to the fixed alphabetical tail, the notice would vanish, and
+# --status goes blank. A red found in the reached prefix would then be read as
+# covering a fleet the pass never looked at.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+mkdir -p "$H/state/elsewhere"
+ln -s "$H/state/elsewhere" "$H/state/branch-watch"
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-1" "$TMP_ROOT/jobs-1")
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-red: alpha/main" "the red the pass did find must still be reported"
+INCOMPLETE=$(printf '%s\n' "$OUT" | grep 'branch-watch-incomplete' || true)
+[ -n "$INCOMPLETE" ] || fail "a truncated pass must report its gap even when it cannot record it, got: $OUT"
+assert_contains "$INCOMPLETE" "not reached this pass: bravo charlie" \
+  "the red must never be read as covering a fleet the pass did not look at"
+assert_contains "$INCOMPLETE" "could not be recorded" \
+  "the report must say it was not recorded, so repeating it explains itself"
+STATUS=$(poll "$H" "$BIN" --status)
+assert_contains "$STATUS" "sweep: no pass cursor could be read" \
+  "--status must say the coverage is unknown rather than saying nothing"
+pass "a truncated pass whose cursor cannot be written still reports its gap, and says it is unrecorded"
+
+# --- a fleet that changed never inherits another fleet's watermark ----------
+#
+# The complete pass carries the PREVIOUS fleet forward rather than stamping the
+# current one, so a fleet that grew during it still counts as never reported.
+# Stamping the current fleet would silence the new fleet's first truncation
+# whenever its coverage happens to be no worse than the old fleet's figure.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "covering the fleet within 2 passes" "the four-project fleet reports two passes"
+poll "$H" "$BIN" --ack :sweep
+
+add_project "$H" echo-svc >/dev/null
+FAST=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$FAST")
+[ -z "$OUT" ] || fail "a complete pass must wake nothing, got: $OUT"
+
+# Five projects reaching three needs two passes - no worse than the figure
+# already delivered for the four-project fleet, so only the fleet change can
+# make this speak up.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" echo-svc)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-watch-incomplete" \
+  "a fleet that grew during a complete pass must still report its own first truncation"
+assert_contains "$OUT" "reached 3 of 5 projects" \
+  "the truncation must land no worse than the old fleet's figure, or this case proves nothing"
+pass "a complete pass does not stamp the current fleet, so a grown fleet still reports its first truncation"
+
 # --- a pass that reached nothing is the worst coverage there is -------------
 #
 # The sweep always attempts its first project, so this state is reachable
@@ -671,12 +809,12 @@ add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 add_project "$H" delta >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v2\ndelta\n%s\n%s\nno\n-\n1\n' \
+printf 'fm-branch-sweep-v3\ndelta\n%s\n-\n%s\nno\n-\n1\n' \
   "alpha bravo charlie delta" "alpha bravo charlie delta" > "$H/state/branch-watch/.sweep"
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" alpha)
 poll "$H" "$BIN" --ack :sweep
-[ "$(sweep_field "$H" 6)" = 5 ] \
-  || fail "a pass that reached no project must record worse than any finite figure, got $(sweep_field "$H" 6)"
+[ "$(sweep_field "$H" 7)" = 5 ] \
+  || fail "a pass that reached no project must record worse than any finite figure, got $(sweep_field "$H" 7)"
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
 [ -z "$OUT" ] || fail "a level better than reaching nothing must not surface, got: $OUT"
 pass "a pass that reached no project counts as worse than any coverage the fleet can have"
@@ -750,7 +888,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v2\nzulu\n-\n-\nyes\n-\n1\n' > "$H/state/branch-watch/.sweep"
+printf 'fm-branch-sweep-v3\nzulu\n-\n-\n-\nyes\n-\n1\n' > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
 assert_present "$H/state/branch-watch/alpha" \
@@ -841,7 +979,7 @@ UMASK_BEFORE=$(umask)
 fm_bw_write "$H/state" p acme/p main red "$RED_SHA" 900 "$GREEN_SHA" no 1 \
   || fail "writing a verdict must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_write must restore the caller's umask, got $(umask)"
-fm_bw_sweep_write "$H/state" p - - yes - 1 || fail "writing the sweep cursor must succeed"
+fm_bw_sweep_write "$H/state" p - - - yes - 1 || fail "writing the sweep cursor must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_sweep_write must restore the caller's umask, got $(umask)"
 [ -n "$(find "$H/state/branch-watch/p" -perm 0600 2>/dev/null)" ] \
   || fail "the verdict record must still be written private to its owner"

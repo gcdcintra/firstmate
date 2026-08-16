@@ -4,8 +4,11 @@
 #
 # The watcher invokes this trusted repository script directly on its own slow
 # cadence. Its contract is the same as every other poll: print one line and
-# firstmate wakes, print nothing and the fleet keeps sleeping. Every failure
-# path is silent, so an unreachable forge is never mistaken for a broken branch.
+# firstmate wakes, print nothing and the fleet keeps sleeping. Every failure path
+# is silent about the VERDICT, so an unreachable forge is never mistaken for a
+# broken branch - but it is not silent about COVERAGE: a project whose query
+# would not answer is counted as unassessed and named, because "no verdict" and
+# "checked and fine" are the two things this must never conflate.
 #
 # WHY THE WAKE CARRIES EVIDENCE, NOT A BADGE
 # A red default branch has at least two causes that look identical in the
@@ -71,6 +74,11 @@
 # layer was correct and every one stopped one step short of the thing it was
 # protecting against. Ask it of whatever comes next here: does this leave
 # something unbounded, silent, or stale?
+#
+# THE COVERAGE NUMBER IS LOAD-BEARING. It is what tells an operator how much of
+# the fleet was actually looked at, so every path that increments it has to be
+# honest. Read any future change that touches that counter with one question:
+# can this increment without a successful check?
 #
 # NOT COVERED, deliberately. Each of these is a real limit, not an oversight:
 #   - projects with no origin remote, and projects whose origin is not GitHub
@@ -294,6 +302,11 @@ commit_subject() {
 
 # One project's sweep. Prints its "<project><TAB><wake line>" record when the
 # branch newly reads red, nothing otherwise. Records the verdict either way.
+#
+# Returns 2, and only 2, when the forge would not answer for this project: the
+# caller must not count it among the projects the pass assessed. A project whose
+# origin is missing or is not GitHub returns 0 instead - those are stated limits,
+# outside the watched set by design rather than a check that failed.
 sweep_project() {
   local project=$1 dir repo branch runs verdict fields
   local sha run url workflow conclusion last_green
@@ -302,7 +315,7 @@ sweep_project() {
 
   dir="$PROJECTS/$project"
   repo=$(fm_gh_repo_from_remote "$dir" 2>/dev/null) || return 0
-  branch=$(resolve_default_branch "$dir" "$project" "$repo") || return 0
+  branch=$(resolve_default_branch "$dir" "$project" "$repo") || return 2
 
   if fm_bw_read "$STATE" "$project"; then
     had_prev=1
@@ -316,7 +329,7 @@ sweep_project() {
   runs=$(gh run list --repo "$repo" --branch "$branch" --limit "$RUN_LIMIT" \
     --json headSha,status,conclusion,databaseId,url,workflowName \
     -q '.[] | [ .headSha, .status, (.conclusion // ""), (.databaseId | tostring),
-      (.url // ""), (.workflowName // "") ] | @tsv' 2>/dev/null) || return 0
+      (.url // ""), (.workflowName // "") ] | @tsv' 2>/dev/null) || return 2
   [ -n "$runs" ] || return 0
 
   fields=$(printf '%s\n' "$runs" | assess_runs)
@@ -419,13 +432,14 @@ run_ack() {
       # Delivery is also what raises the watermark, so the level just handed over
       # is the one that may silence a later pass. It only ever rises: worse
       # coverage than anything delivered is news, recovery is not.
-      level=$(fm_bw_pass_count "$FM_BW_SWEEP_FLEET" "$FM_BW_SWEEP_UNREACHED")
+      level=$(fm_bw_pass_count "$FM_BW_SWEEP_FLEET" "$FM_BW_SWEEP_UNREACHED" \
+        "$FM_BW_SWEEP_FAILED")
       mark=$FM_BW_SWEEP_WATERMARK
       if [ "$mark" = - ] || [ "$level" -gt "$mark" ]; then
         mark=$level
       fi
       fm_bw_sweep_write "$STATE" "$FM_BW_SWEEP_RESUME" "$FM_BW_SWEEP_UNREACHED" \
-        "$FM_BW_SWEEP_FLEET" yes "$mark" "$FM_BW_SWEEP_OBSERVED" || true
+        "$FM_BW_SWEEP_FAILED" "$FM_BW_SWEEP_FLEET" yes "$mark" "$FM_BW_SWEEP_OBSERVED" || true
       continue
     fi
     fm_bw_read "$STATE" "$key" || continue
@@ -436,12 +450,25 @@ run_ack() {
 }
 
 run_status() {
-  local project found=0
+  local project found=0 sweep_failed=- have_sweep=0
+  if fm_bw_sweep_read "$STATE"; then
+    have_sweep=1
+    sweep_failed=$FM_BW_SWEEP_FAILED
+  fi
   while IFS= read -r project; do
     [ -n "$project" ] || continue
     found=1
     if ! fm_bw_read "$STATE" "$project"; then
-      printf '%s: no default-branch verdict recorded yet\n' "$project"
+      # A clone nobody could query and a clone nobody has swept yet both have no
+      # verdict, and telling them apart is the whole point of tracking the one.
+      case " $sweep_failed " in
+        *" $project "*)
+          printf '%s: no verdict - the forge query failed on the last pass that tried it\n' "$project"
+          ;;
+        *)
+          printf '%s: no default-branch verdict recorded yet\n' "$project"
+          ;;
+      esac
       continue
     fi
     printf '%s (%s): %s at %s' "$project" "$FM_BW_BRANCH" "$FM_BW_STATE" "$(fm_bw_short "$FM_BW_SHA")"
@@ -452,18 +479,23 @@ run_status() {
   [ "$found" = 1 ] || printf 'no default-branch verdicts recorded in %s\n' "$(fm_bw_dir "$STATE")"
   # Coverage is part of the verdict: a reader has to be able to tell "every
   # project reads green" from "every project I got to reads green".
-  if fm_bw_sweep_read "$STATE"; then
-    if [ "$FM_BW_SWEEP_UNREACHED" = - ]; then
-      printf 'sweep: the last pass reached every project\n'
-    else
-      printf 'sweep: the last pass did not reach %s (truncation surfaced=%s' \
-        "$FM_BW_SWEEP_UNREACHED" "$FM_BW_SWEEP_SURFACED"
-      if [ "$FM_BW_SWEEP_WATERMARK" = - ]; then
-        printf ', no coverage reported yet)\n'
-      else
-        printf ', worst coverage reported %s passes)\n' "$FM_BW_SWEEP_WATERMARK"
-      fi
-    fi
+  if [ "$have_sweep" = 0 ]; then
+    printf 'sweep: no pass cursor could be read, so the coverage of the last pass is unknown\n'
+    return 0
+  fi
+  if [ "$FM_BW_SWEEP_UNREACHED" = - ] && [ "$FM_BW_SWEEP_FAILED" = - ]; then
+    printf 'sweep: the last pass reached every project\n'
+    return 0
+  fi
+  [ "$FM_BW_SWEEP_UNREACHED" = - ] \
+    || printf 'sweep: the last pass did not reach %s\n' "$FM_BW_SWEEP_UNREACHED"
+  [ "$FM_BW_SWEEP_FAILED" = - ] \
+    || printf 'sweep: the last pass could not query %s\n' "$FM_BW_SWEEP_FAILED"
+  printf 'sweep: coverage surfaced=%s' "$FM_BW_SWEEP_SURFACED"
+  if [ "$FM_BW_SWEEP_WATERMARK" = - ]; then
+    printf ', no coverage reported yet\n'
+  else
+    printf ', worst coverage reported %s passes\n' "$FM_BW_SWEEP_WATERMARK"
   fi
 }
 
@@ -531,6 +563,7 @@ REMAINING=${REMAINING% }
 SWEEP_START=$SECONDS
 RED=0
 K=0
+FAILED=
 LAST_ATTEMPTED=$RESUME
 while [ "$K" -lt "$COUNT" ]; do
   # The first project of a pass is always attempted. A deadline that could stop
@@ -549,10 +582,17 @@ while [ "$K" -lt "$COUNT" ]; do
   # in this field is what --status will claim, and carrying the previous pass's
   # cleaner gap forward would let a pass that died three projects into fifty
   # report that it reached them all.
-  fm_bw_sweep_write "$STATE" "${RING[$K]}" "$REMAINING" "$PREV_FLEET" \
+  fm_bw_sweep_write "$STATE" "${RING[$K]}" "$REMAINING" "${FAILED:--}" "$PREV_FLEET" \
     "$PREV_SURFACED" "$PREV_WATERMARK" "$(date +%s)" || true
   LAST_ATTEMPTED=${RING[$K]}
-  RECORD=$(sweep_project "${RING[$K]}") || RECORD=
+  RECORD=$(sweep_project "${RING[$K]}")
+  RC=$?
+  [ "$RC" = 0 ] || RECORD=
+  # A project the forge would not answer for was attempted and not assessed, so
+  # it never counts toward what this pass covered. Rotation cannot help it the
+  # way it helps an unreached one: a renamed repository or a lapsed token grant
+  # fails on every pass, forever.
+  [ "$RC" != 2 ] || FAILED="${FAILED:+$FAILED }${RING[$K]}"
   if [ -n "$RECORD" ]; then
     printf '%s\n' "$RECORD"
     RED=1
@@ -564,12 +604,14 @@ while [ "$K" -lt "$COUNT" ]; do
   K=$((K + 1))
 done
 
-REACHED=$K
 UNREACHED=$REMAINING
 [ -n "$UNREACHED" ] || UNREACHED=-
+FAILED=${FAILED# }
+[ -n "$FAILED" ] || FAILED=-
+REACHED=$((K - $(fm_bw_list_count "$FAILED")))
 
 NOW=$(date +%s)
-if [ "$UNREACHED" = - ]; then
+if [ "$UNREACHED" = - ] && [ "$FAILED" = - ]; then
   # A complete pass clears the gap and nothing else. The watermark and the fleet
   # it was measured on carry through untouched, because a complete pass is the
   # fullest recovery there is and recovery is never news: clearing them here
@@ -577,12 +619,12 @@ if [ "$UNREACHED" = - ]; then
   # truncated and announce the same unchanged coverage every other sweep. They
   # are carried through rather than restated from this pass, so a fleet that
   # changes still resets and never inherits a figure measured on another one.
-  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - "$PREV_FLEET" "$PREV_SURFACED" \
+  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - - "$PREV_FLEET" "$PREV_SURFACED" \
     "$PREV_WATERMARK" "$NOW" || true
   exit 0
 fi
 
-PASSES=$(fm_bw_pass_count "$FLEET" "$UNREACHED")
+PASSES=$(fm_bw_pass_count "$FLEET" "$UNREACHED" "$FAILED")
 
 # Truncated. Report it when a red report is going out in the same pass (so it can
 # never be read as covering a fleet it did not look at), when this fleet has not
@@ -603,11 +645,32 @@ fi
 WATERMARK=$PREV_WATERMARK
 [ "$FLEET" = "$PREV_FLEET" ] || WATERMARK=-
 
+LINE="branch-watch-incomplete: this pass reached $REACHED of $COUNT projects inside its ${BUDGET}s budget"
+if [ "$UNREACHED" != - ]; then
+  LINE="$LINE - not reached this pass: $UNREACHED; the next pass resumes there, covering the fleet within $PASSES passes"
+fi
+if [ "$FAILED" != - ]; then
+  LINE="$LINE - forge query failed, so no verdict at all for: $FAILED; rotation does not reach these, they stay unassessed until the query works again"
+fi
+
 if [ "$NOTIFY" = 1 ]; then
-  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FLEET" no "$WATERMARK" "$NOW" || exit 0
-  printf '%s\t%s\n' "$FM_BW_SWEEP_KEY" \
-    "branch-watch-incomplete: this pass reached $REACHED of $COUNT projects inside its ${BUDGET}s budget - not reached this pass: $UNREACHED; the next pass resumes there, covering the fleet within $PASSES passes"
+  # The notice goes out even when the cursor cannot be recorded. The rule that a
+  # persistently large fleet must not wake every sweep was about a HEALTHY fleet,
+  # where truncation is expected and repeating it is stale news. A state
+  # directory that cannot be written is not that: rotation degenerates back to
+  # the fixed alphabetical tail it was added to remove, this notice would vanish,
+  # and --status goes blank - all three at once, leaving a supervisor reading a
+  # red report from a truncated pass with no coverage beside it, which this
+  # file's own contract says can never happen. Waking every sweep while that
+  # lasts is proportionate, and saying inline that it could not be recorded is
+  # what keeps the repeat self-explaining rather than reading as noise.
+  if ! fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
+    no "$WATERMARK" "$NOW"; then
+    LINE="$LINE; this coverage report could not be recorded, so it repeats every sweep until it can be"
+  fi
+  printf '%s\t%s\n' "$FM_BW_SWEEP_KEY" "$LINE"
 else
-  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FLEET" yes "$WATERMARK" "$NOW" || true
+  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
+    yes "$WATERMARK" "$NOW" || true
 fi
 exit 0

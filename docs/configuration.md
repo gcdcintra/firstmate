@@ -133,6 +133,8 @@ This preference is local to each home and is not part of secondmate inherited co
 A pass costs one forge query per clone, so past a certain fleet size it cannot reach everything at once.
 It handles that by rotating rather than by truncating: the next pass resumes at the project after the last one it attempted and wraps around, so the fleet is covered on a ring instead of the same tail being dropped every time.
 A pass that did not reach everything says so and names the projects it missed, and always alongside any red report from that same pass; `bin/fm-branch-poll.sh --status` prints the current gap on demand.
+A project whose forge query will not answer - a renamed repository, a lapsed token grant - counts as unassessed rather than as covered, and is named separately from the ones a pass simply did not get to, because rotation reaches those next pass and cannot help these at all.
+It still produces no verdict of its own: silence about a red or green that could not be obtained is right, and only the coverage accounting changes.
 That notice is not repeated on every sweep of a fleet that is simply large: it fires when the set of clones changes, and again whenever a pass needs more passes to cover the fleet than any figure already reported, so coverage that degrades from two passes to fourteen is stated rather than left sitting behind a disclosure that was true when it was written.
 Coverage recovering is not reported, which is also what keeps a fleet sitting on the boundary from speaking up every other pass.
 
