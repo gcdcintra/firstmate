@@ -45,7 +45,13 @@
 #   - a project whose forge query fails is excluded from the coverage figure,
 #     named as its own category, distinguishable in --status from a never-swept
 #     clone, and still produces no verdict;
-#   - a truncated pass whose cursor cannot be written still reports its gap;
+#   - a truncated pass whose cursor cannot be written still reports its gap,
+#     whether the notice was going out anyway or was being suppressed;
+#   - a query that starts failing surfaces even when the pass count does not
+#     move, the same failing set stays quiet, an additional one surfaces, and a
+#     recovery does not;
+#   - a pass with both gaps claims only what is true and states the latency at
+#     the rate the ring actually advances;
 #   - a fleet that grew during a complete pass still reports its own first
 #     truncation rather than inheriting the old fleet's figure;
 #   - green records silently and clears the pre-launch advisory;
@@ -99,13 +105,18 @@ add_project() {
 # may be the literal word "fail", which makes that subcommand exit non-zero the
 # way an expired log or an unreachable forge does. <list-delay> makes each
 # `run list` take that many seconds, which is how the cases below drive a sweep
-# past its own budget the way a real fleet's forge round-trips do. <fail-repo>
-# makes `run list` fail for that one project only, the way a renamed repository
-# or a lapsed token grant does while the rest of the fleet answers normally.
+# past its own budget the way a real fleet's forge round-trips do. <fail-repos>
+# is a space-separated list of projects whose `run list` fails, the way a renamed
+# repository or a lapsed token grant does while the rest of the fleet answers
+# normally.
 FAKE_SUBJECT='Merge pull request #36 from acme/nf-9'
 fake_gh() {
-  local home=$1 runs=$2 jobs=$3 delay=${4:-0} slow=${5:-} failrepo=${6:-} fakebin failarm=
-  [ -z "$failrepo" ] || failarm="case \"\$*\" in *\"$failrepo\"*) exit 1 ;; esac"
+  local home=$1 runs=$2 jobs=$3 delay=${4:-0} slow=${5:-} failrepos=${6:-} fakebin
+  local failarm name
+  failarm=''
+  for name in $failrepos; do
+    failarm="$failarm case \"\$*\" in *\"$name\"*) exit 1 ;; esac;"
+  done
   fakebin=$(fm_fakebin "$home")
   cat > "$fakebin/gh" <<SH
 #!/usr/bin/env bash
@@ -210,7 +221,8 @@ STALL_BUDGET=2
 
 # sweep_field <home> <line>: one line of the sweep cursor, which is this
 # feature's own persisted record format (bin/fm-branch-watch-lib.sh documents the
-# seven lines); line 3 is the coverage gap and line 6 the delivered watermark.
+# nine lines); line 3 is the coverage gap, line 7 the delivered watermark, and
+# line 8 the failed-query projects already delivered.
 sweep_field() {
   sed -n "${2}p" "$1/state/branch-watch/.sweep" 2>/dev/null || true
 }
@@ -546,7 +558,7 @@ add_project "$H" delta >/dev/null
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
 assert_contains "$OUT" "reached 2 of 4 projects" "the stall must decide the coverage level, not the clock"
-assert_contains "$OUT" "covering the fleet within 2 passes" "a new fleet states its pass count"
+assert_contains "$OUT" "reaching them within 2 passes" "a new fleet states its pass count"
 poll "$H" "$BIN" --ack :sweep
 
 # Pass 2 resumes at charlie and stalls there: 1 of 4, so the fleet now needs 4
@@ -554,7 +566,7 @@ poll "$H" "$BIN" --ack :sweep
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" charlie)
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
 assert_contains "$OUT" "reached 1 of 4 projects" "the pass must reach only the stalled project"
-assert_contains "$OUT" "covering the fleet within 4 passes" \
+assert_contains "$OUT" "reaching them within 4 passes" \
   "coverage degrading past what was reported must surface with the worse figure"
 poll "$H" "$BIN" --ack :sweep
 pass "coverage degrading past the figure already reported surfaces again"
@@ -606,7 +618,7 @@ add_project "$H" delta >/dev/null
 
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
-assert_contains "$OUT" "covering the fleet within 2 passes" "the first truncation states its pass count"
+assert_contains "$OUT" "reaching them within 2 passes" "the first truncation states its pass count"
 poll "$H" "$BIN" --ack :sweep
 [ "$(sweep_field "$H" 7)" = 2 ] || fail "the delivered pass count must be recorded, got $(sweep_field "$H" 7)"
 
@@ -704,6 +716,81 @@ OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
 [ -z "$OUT" ] || fail "a persistently failing query must not wake every sweep, got: $OUT"
 pass "a persistently failing query surfaces once and is then carried by the watermark"
 
+# --- a query that starts failing is news the pass count cannot carry ---------
+#
+# A pass count collapses a bounded rotation gap and a permanent query failure
+# into one number, so a fleet already reported at some pass count can start
+# failing queries without that number moving at all. Nothing else would ever say
+# so: rotation cannot close that gap, and no verdict is produced to wake on.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "reaching them within 2 passes" "the fleet is first reported at two passes"
+poll "$H" "$BIN" --ack :sweep
+
+# charlie's query now fails. Coverage is 3 of 4, which still needs two passes -
+# exactly the figure already delivered - so only the failing query itself is new.
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 0 "" charlie)
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
+assert_contains "$OUT" "forge query failed, so no verdict at all for: charlie" \
+  "a query that starts failing must surface even when the pass count did not move"
+poll "$H" "$BIN" --ack :sweep
+[ "$(sweep_field "$H" 8)" = charlie ] \
+  || fail "the delivered failure must be recorded, got $(sweep_field "$H" 8)"
+pass "a newly failing query surfaces even when the pass count is unchanged"
+
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "the same failing query must not surface again, got: $OUT"
+pass "the same failing set does not surface again"
+
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 0 "" "charlie delta")
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
+assert_contains "$OUT" "forge query failed" "a further project failing its query is news"
+assert_contains "$OUT" "delta" "the newly failing project must be named"
+poll "$H" "$BIN" --ack :sweep
+pass "an additional failing query surfaces"
+
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 0 "" charlie)
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "a project whose query recovered must not surface, got: $OUT"
+pass "a recovering query does not surface"
+
+# The pass-count arm still works on its own, with no failing query at all.
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "reached 1 of 4 projects" "coverage worse than the figure delivered must still surface"
+assert_not_contains "$OUT" "forge query failed" "this pass had no failing query to report"
+pass "the pass-count arm keeps working independently of the failed-query arm"
+
+# --- the coverage claim stays true when both gaps are present ---------------
+#
+# Rotation reaches the projects a pass ran out of budget for; it never reaches
+# the ones whose query fails, so the line must not claim the fleet is covered.
+# The number it states is the rate the ring actually advances, which counts every
+# project the cursor moved past - including the one that failed.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 2.2 bravo alpha)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "reached 1 of 4 projects" "only the project that answered counts as assessed"
+assert_contains "$OUT" "not reached this pass: charlie delta" "the rotation gap is named"
+assert_contains "$OUT" "reaching them within 2 passes" \
+  "the stated latency must be the rate the ring actually advances, not the suppression figure"
+assert_not_contains "$OUT" "covering the fleet" \
+  "the line must never claim the fleet is covered when a failed query is excluded from it"
+assert_contains "$OUT" "forge query failed, so no verdict at all for: alpha" \
+  "the failed query is named separately as what rotation cannot reach"
+pass "a pass with both gaps states a coverage claim that is true and a latency that is real"
+
 # A pass killed after a failed query must still leave the cursor it wrote on the
 # way through: the trailing report never runs, so whatever the last in-loop write
 # recorded is the whole account of that pass. alpha's query fails instantly and
@@ -763,6 +850,34 @@ assert_contains "$STATUS" "sweep: no pass cursor could be read" \
   "--status must say the coverage is unknown rather than saying nothing"
 pass "a truncated pass whose cursor cannot be written still reports its gap, and says it is unrecorded"
 
+# The same fault with the notice SUPPRESSED. The cursor here is readable and
+# consistent, so the suppression arms all say "nothing new" - and the write still
+# fails, which freezes the resume position and sends rotation back to the fixed
+# tail it was added to remove while --status keeps describing a pass that is no
+# longer the last one. Staying quiet would leave all of that unsaid.
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+mkdir -p "$H/state/branch-watch"
+printf 'fm-branch-sweep-v4\nalpha\n%s\n-\n%s\nyes\n3\n-\n1\n' \
+  "bravo charlie" "alpha bravo charlie" > "$H/state/branch-watch/.sweep"
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+chmod 555 "$H/state/branch-watch"
+if : > "$H/state/branch-watch/.probe" 2>/dev/null; then
+  rm -f "$H/state/branch-watch/.probe" 2>/dev/null || true
+  chmod 755 "$H/state/branch-watch"
+  pass "skipped: this user can write into a read-only directory, so the fixture cannot be expressed here"
+else
+  OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+  chmod 755 "$H/state/branch-watch"
+  assert_contains "$OUT" "branch-watch-incomplete" \
+    "a suppressed notice must still be reported when its cursor cannot be written"
+  assert_contains "$OUT" "could not be recorded" \
+    "the suppressed arm must say it was not recorded, just as the reporting arm does"
+  pass "a pass whose notice is suppressed still speaks when its cursor cannot be written"
+fi
+
 # --- a fleet that changed never inherits another fleet's watermark ----------
 #
 # The complete pass carries the PREVIOUS fleet forward rather than stamping the
@@ -777,7 +892,7 @@ add_project "$H" charlie >/dev/null
 add_project "$H" delta >/dev/null
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
 OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
-assert_contains "$OUT" "covering the fleet within 2 passes" "the four-project fleet reports two passes"
+assert_contains "$OUT" "reaching them within 2 passes" "the four-project fleet reports two passes"
 poll "$H" "$BIN" --ack :sweep
 
 add_project "$H" echo-svc >/dev/null
@@ -809,7 +924,7 @@ add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 add_project "$H" delta >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v3\ndelta\n%s\n-\n%s\nno\n-\n1\n' \
+printf 'fm-branch-sweep-v4\ndelta\n%s\n-\n%s\nno\n-\n-\n1\n' \
   "alpha bravo charlie delta" "alpha bravo charlie delta" > "$H/state/branch-watch/.sweep"
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" alpha)
 poll "$H" "$BIN" --ack :sweep
@@ -888,7 +1003,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v3\nzulu\n-\n-\n-\nyes\n-\n1\n' > "$H/state/branch-watch/.sweep"
+printf 'fm-branch-sweep-v4\nzulu\n-\n-\n-\nyes\n-\n-\n1\n' > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
 assert_present "$H/state/branch-watch/alpha" \
@@ -979,7 +1094,7 @@ UMASK_BEFORE=$(umask)
 fm_bw_write "$H/state" p acme/p main red "$RED_SHA" 900 "$GREEN_SHA" no 1 \
   || fail "writing a verdict must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_write must restore the caller's umask, got $(umask)"
-fm_bw_sweep_write "$H/state" p - - - yes - 1 || fail "writing the sweep cursor must succeed"
+fm_bw_sweep_write "$H/state" p - - - yes - - 1 || fail "writing the sweep cursor must succeed"
 [ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_sweep_write must restore the caller's umask, got $(umask)"
 [ -n "$(find "$H/state/branch-watch/p" -perm 0600 2>/dev/null)" ] \
   || fail "the verdict record must still be written private to its owner"

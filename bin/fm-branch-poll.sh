@@ -61,10 +61,13 @@
 # figure already delivered - coverage sliding from two passes to fourteen turns a
 # disclosure the reader still trusts into a false one, and a stale disclosure is
 # worse than none. Recovery is not news and stays quiet, which is also what stops
-# a fleet hovering on a boundary from reporting every other pass. Any red report
-# in a truncated pass carries the unreached names with it whether or not the
-# notice is suppressed, so a red wake can never be read as "and the rest of the
-# fleet is fine", and --status prints the current gap on demand.
+# a fleet hovering on a boundary from reporting every other pass. It speaks up a
+# third time when a project starts failing its query that was never reported
+# failing, because that gap can grow while the pass count sits still and it is
+# the one rotation can never close. Any red report in a truncated pass carries
+# the unreached names with it whether or not the notice is suppressed, so a red
+# wake can never be read as "and the rest of the fleet is fine", and --status
+# prints the current gap on demand.
 #
 # WHAT THIS FEATURE'S HISTORY IS, because it should shape what gets added next.
 # The sweep first dropped a fixed alphabetical tail and said nothing, so it was
@@ -423,7 +426,7 @@ EOF
 # surfaced key is skipped rather than treated as an error, because failing to
 # acknowledge only costs a duplicate report - the safe direction.
 run_ack() {
-  local key level mark
+  local key level mark seen
   for key in "$@"; do
     [ -n "$key" ] || continue
     if [ "$key" = "$FM_BW_SWEEP_KEY" ]; then
@@ -438,8 +441,14 @@ run_ack() {
       if [ "$mark" = - ] || [ "$level" -gt "$mark" ]; then
         mark=$level
       fi
+      # The delivered failures only ever grow, for the same reason the watermark
+      # only ever rises: a project that failed, recovered, and failed again was
+      # already said out loud once, and saying it again on every relapse is the
+      # flapping this suppression exists to avoid.
+      seen=$(fm_bw_list_union "$FM_BW_SWEEP_DELIVERED" "$FM_BW_SWEEP_FAILED")
       fm_bw_sweep_write "$STATE" "$FM_BW_SWEEP_RESUME" "$FM_BW_SWEEP_UNREACHED" \
-        "$FM_BW_SWEEP_FAILED" "$FM_BW_SWEEP_FLEET" yes "$mark" "$FM_BW_SWEEP_OBSERVED" || true
+        "$FM_BW_SWEEP_FAILED" "$FM_BW_SWEEP_FLEET" yes "$mark" "$seen" \
+        "$FM_BW_SWEEP_OBSERVED" || true
       continue
     fi
     fm_bw_read "$STATE" "$key" || continue
@@ -527,12 +536,14 @@ FLEET=${FLEET% }
 PREV_FLEET=-
 PREV_SURFACED=yes
 PREV_WATERMARK=-
+PREV_DELIVERED=-
 RESUME=-
 if fm_bw_sweep_read "$STATE"; then
   RESUME=$FM_BW_SWEEP_RESUME
   PREV_FLEET=$FM_BW_SWEEP_FLEET
   PREV_SURFACED=$FM_BW_SWEEP_SURFACED
   PREV_WATERMARK=$FM_BW_SWEEP_WATERMARK
+  PREV_DELIVERED=$FM_BW_SWEEP_DELIVERED
 fi
 
 # Resume after the project the previous pass last attempted. An unreadable,
@@ -583,7 +594,7 @@ while [ "$K" -lt "$COUNT" ]; do
   # cleaner gap forward would let a pass that died three projects into fifty
   # report that it reached them all.
   fm_bw_sweep_write "$STATE" "${RING[$K]}" "$REMAINING" "${FAILED:--}" "$PREV_FLEET" \
-    "$PREV_SURFACED" "$PREV_WATERMARK" "$(date +%s)" || true
+    "$PREV_SURFACED" "$PREV_WATERMARK" "$PREV_DELIVERED" "$(date +%s)" || true
   LAST_ATTEMPTED=${RING[$K]}
   RECORD=$(sweep_project "${RING[$K]}")
   RC=$?
@@ -620,34 +631,50 @@ if [ "$UNREACHED" = - ] && [ "$FAILED" = - ]; then
   # are carried through rather than restated from this pass, so a fleet that
   # changes still resets and never inherits a figure measured on another one.
   fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - - "$PREV_FLEET" "$PREV_SURFACED" \
-    "$PREV_WATERMARK" "$NOW" || true
+    "$PREV_WATERMARK" "$PREV_DELIVERED" "$NOW" || true
   exit 0
 fi
 
 PASSES=$(fm_bw_pass_count "$FLEET" "$UNREACHED" "$FAILED")
+RING_PASSES=$(( (COUNT + K - 1) / K ))
 
 # Truncated. Report it when a red report is going out in the same pass (so it can
 # never be read as covering a fleet it did not look at), when this fleet has not
 # been reported yet, when the last notice was never acknowledged and so may never
-# have been delivered, or when coverage has slipped past the worst already
-# delivered for this fleet - a stated latency that quietly doubles is a disclosure
-# the reader still trusts and it is no longer true.
+# have been delivered, when coverage has slipped past the worst already delivered
+# for this fleet - a stated latency that quietly doubles is a disclosure the
+# reader still trusts and it is no longer true - or when a project is failing its
+# query that was never reported failing. That last arm is not the pass count in
+# another form: a query failure can leave the count untouched while the fleet
+# quietly stops being assessed, and it is the one gap rotation can never close.
 NOTIFY=0
 if [ "$RED" = 1 ] || [ "$FLEET" != "$PREV_FLEET" ] || [ "$PREV_SURFACED" = no ]; then
   NOTIFY=1
 elif [ "$PREV_WATERMARK" = - ] || [ "$PASSES" -gt "$PREV_WATERMARK" ]; then
   NOTIFY=1
+elif ! fm_bw_list_subset "$FAILED" "$PREV_DELIVERED"; then
+  NOTIFY=1
 fi
 
-# The watermark belongs to the fleet it was measured on, so a fleet that changed
-# starts again with nothing delivered. It is raised by the acknowledgement, not
-# here: a level this pass never managed to deliver must not silence the next one.
+# Both suppression markers belong to the fleet they were measured on, so a fleet
+# that changed starts again with nothing delivered. They are raised by the
+# acknowledgement, not here: a report this pass never managed to deliver must not
+# silence the one after it.
 WATERMARK=$PREV_WATERMARK
-[ "$FLEET" = "$PREV_FLEET" ] || WATERMARK=-
+DELIVERED=$PREV_DELIVERED
+if [ "$FLEET" != "$PREV_FLEET" ]; then
+  WATERMARK=-
+  DELIVERED=-
+fi
 
 LINE="branch-watch-incomplete: this pass reached $REACHED of $COUNT projects inside its ${BUDGET}s budget"
 if [ "$UNREACHED" != - ]; then
-  LINE="$LINE - not reached this pass: $UNREACHED; the next pass resumes there, covering the fleet within $PASSES passes"
+  # The claim is about the projects this pass did not reach, never about the
+  # fleet: the failed-query ones below are not covered by rotation at all. The
+  # number is how fast the ring actually advances, which is the attempted rate -
+  # the cursor moves past a project whose query failed too. The pass count that
+  # drives suppression is a different figure and deliberately not stated here.
+  LINE="$LINE - not reached this pass: $UNREACHED; the next pass resumes there, reaching them within $RING_PASSES passes"
 fi
 if [ "$FAILED" != - ]; then
   LINE="$LINE - forge query failed, so no verdict at all for: $FAILED; rotation does not reach these, they stay unassessed until the query works again"
@@ -665,12 +692,18 @@ if [ "$NOTIFY" = 1 ]; then
   # lasts is proportionate, and saying inline that it could not be recorded is
   # what keeps the repeat self-explaining rather than reading as noise.
   if ! fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
-    no "$WATERMARK" "$NOW"; then
+    no "$WATERMARK" "$DELIVERED" "$NOW"; then
     LINE="$LINE; this coverage report could not be recorded, so it repeats every sweep until it can be"
   fi
   printf '%s\t%s\n' "$FM_BW_SWEEP_KEY" "$LINE"
-else
-  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
-    yes "$WATERMARK" "$NOW" || true
+elif ! fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FAILED" "$FLEET" \
+  yes "$WATERMARK" "$DELIVERED" "$NOW"; then
+  # Suppression is only trustworthy while the cursor it is decided from can be
+  # written. Once it cannot, the resume position freezes and rotation falls back
+  # to the fixed tail it was added to remove, while --status keeps describing a
+  # pass that is no longer the last one. Staying quiet here for the same reason
+  # the sibling arm does not would leave that condition entirely unsaid.
+  printf '%s\t%s\n' "$FM_BW_SWEEP_KEY" \
+    "$LINE; this coverage report could not be recorded, so it repeats every sweep until it can be"
 fi
 exit 0

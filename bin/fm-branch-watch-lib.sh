@@ -33,16 +33,17 @@
 # when nothing ever carried it, which is that same swallowed red by another
 # route.
 #
-# The sweep's own cursor is a second record, state/branch-watch/.sweep, eight
+# The sweep's own cursor is a second record, state/branch-watch/.sweep, nine
 # lines and one per line:
-#   1  fm-branch-sweep-v3     version tag; anything else is refused, not guessed
+#   1  fm-branch-sweep-v4     version tag; anything else is refused, not guessed
 #   2  resume                 last project the previous pass ATTEMPTED, or "-"
 #   3  unreached              projects that pass never reached, space-joined, or "-"
 #   4  failed                 projects it reached whose forge query would not answer
-#   5  fleet                  the project list line 7's watermark was measured on
+#   5  fleet                  the project list lines 7 and 8 were measured on
 #   6  yes|no                 whether line 5's truncation notice was surfaced
 #   7  watermark              the worst pass count DELIVERED for line 5's fleet, or "-"
-#   8  observed               unix epoch of the observation
+#   8  delivered              the failed-query projects already DELIVERED, or "-"
+#   9  observed               unix epoch of the observation
 # Line 2 is what makes a fleet too large for one pass lose a rotating slice
 # instead of the same tail forever, so it is written before each attempt rather
 # than after: a pass killed mid-project must not send every later pass back into
@@ -55,13 +56,24 @@
 # and the forge would not answer, which rotation cannot fix. Both are subtracted
 # from the count of projects a pass actually assessed.
 #
-# Lines 5 and 7 together are the suppression key, and line 6 is the same
+# Lines 5, 7 and 8 together are the suppression key, and line 6 is the same
 # durability boundary as field 9 above. Line 7 holds a count of passes, not a
 # timestamp or a flag: coverage that gets WORSE than anything already delivered
-# is news and speaks up again, coverage that merely recovers is not. It is
-# raised only by the acknowledgement, never by the write that produces the
-# notice, because it records what a caller actually delivered - raising it any
-# earlier would let an undelivered level silence the level that follows it.
+# is news and speaks up again, coverage that merely recovers is not.
+#
+# Line 8 exists because line 7 cannot see the difference line 4 draws. A pass
+# count collapses a bounded rotation gap and a permanent query failure into one
+# number, so a fleet already reported at some pass count can start failing
+# queries without that number moving at all, and the failure would never be
+# said out loud. Line 8 is compared as a SET, not as a signature: a failure that
+# is not already in it is news, and anything that is - including a project that
+# recovered and is simply absent now - is not. Unlike the rotation gap, which
+# churns every pass by construction, this set is stable exactly while the fault
+# lasts, so keying on it cannot wake every sweep.
+#
+# Both are raised only by the acknowledgement, never by the write that produces
+# the notice, because they record what a caller actually delivered - raising
+# either any earlier would let an undelivered report silence the one after it.
 #
 # The record is data, never authority: nothing here is interpolated into shell
 # source, and every field is revalidated on read rather than trusted from disk.
@@ -80,7 +92,7 @@ FM_BW_LAST_GREEN=
 FM_BW_SURFACED=
 FM_BW_OBSERVED=
 
-FM_BW_SWEEP_VERSION=fm-branch-sweep-v3
+FM_BW_SWEEP_VERSION=fm-branch-sweep-v4
 # The sweep's own record is addressed by a key that is deliberately outside the
 # project-name charset, so the truncation notice can never share a durable wake
 # key with a project called anything at all - two records under one key collapse
@@ -92,6 +104,7 @@ FM_BW_SWEEP_FAILED=
 FM_BW_SWEEP_FLEET=
 FM_BW_SWEEP_SURFACED=
 FM_BW_SWEEP_WATERMARK=
+FM_BW_SWEEP_DELIVERED=
 FM_BW_SWEEP_OBSERVED=
 
 # A project name addresses a directory under <home>/projects and a file under
@@ -134,6 +147,46 @@ fm_bw_list_valid() {
     esac
     fm_bw_project_valid "$name" || return 1
   done
+}
+
+# Every name in <a> also appears in <b>. An empty set is a subset of anything,
+# and "-" holds nothing, so a non-empty set is never a subset of it.
+fm_bw_list_subset() {
+  local a=${1-} b=${2-} name rest
+  [ "$a" != - ] && [ -n "$a" ] || return 0
+  rest=$a
+  while [ -n "$rest" ]; do
+    name=${rest%% *}
+    case "$rest" in
+      *' '*) rest=${rest#* } ;;
+      *) rest= ;;
+    esac
+    case " $b " in
+      *" $name "*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+fm_bw_list_union() {
+  local a=${1-} b=${2-} out name rest
+  out=''
+  [ "$a" = - ] || out=$a
+  if [ "$b" != - ] && [ -n "$b" ]; then
+    rest=$b
+    while [ -n "$rest" ]; do
+      name=${rest%% *}
+      case "$rest" in
+        *' '*) rest=${rest#* } ;;
+        *) rest= ;;
+      esac
+      case " $out " in
+        *" $name "*) ;;
+        *) out="${out:+$out }$name" ;;
+      esac
+    done
+  fi
+  printf '%s\n' "${out:--}"
 }
 
 fm_bw_list_count() {
@@ -311,13 +364,14 @@ fm_bw_watermark_valid() {
 }
 
 fm_bw_sweep_read() {
-  local state=$1 file version resume unreached failed fleet surfaced watermark observed extra
+  local state=$1 file version resume unreached failed fleet surfaced watermark delivered observed extra
   FM_BW_SWEEP_RESUME=
   FM_BW_SWEEP_UNREACHED=
   FM_BW_SWEEP_FAILED=
   FM_BW_SWEEP_FLEET=
   FM_BW_SWEEP_SURFACED=
   FM_BW_SWEEP_WATERMARK=
+  FM_BW_SWEEP_DELIVERED=
   FM_BW_SWEEP_OBSERVED=
   file=$(fm_bw_sweep_path "$state")
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
@@ -329,6 +383,7 @@ fm_bw_sweep_read() {
   IFS= read -r fleet <&6 || { exec 6<&-; return 1; }
   IFS= read -r surfaced <&6 || { exec 6<&-; return 1; }
   IFS= read -r watermark <&6 || { exec 6<&-; return 1; }
+  IFS= read -r delivered <&6 || { exec 6<&-; return 1; }
   IFS= read -r observed <&6 || { exec 6<&-; return 1; }
   if IFS= read -r extra <&6; then
     exec 6<&-
@@ -342,6 +397,7 @@ fm_bw_sweep_read() {
   fm_bw_list_valid "$fleet" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   fm_bw_watermark_valid "$watermark" || return 1
+  fm_bw_list_valid "$delivered" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   FM_BW_SWEEP_RESUME=$resume
   FM_BW_SWEEP_UNREACHED=$unreached
@@ -349,12 +405,14 @@ fm_bw_sweep_read() {
   FM_BW_SWEEP_FLEET=$fleet
   FM_BW_SWEEP_SURFACED=$surfaced
   FM_BW_SWEEP_WATERMARK=$watermark
+  FM_BW_SWEEP_DELIVERED=$delivered
   FM_BW_SWEEP_OBSERVED=$observed
 }
 
-# fm_bw_sweep_write <state> <resume> <unreached> <failed> <fleet> <surfaced> <watermark> <observed>
+# fm_bw_sweep_write <state> <resume> <unreached> <failed> <fleet> <surfaced> <watermark> <delivered> <observed>
 fm_bw_sweep_write() {
-  local state=$1 resume=$2 unreached=$3 failed=$4 fleet=$5 surfaced=$6 watermark=$7 observed=$8
+  local state=$1 resume=$2 unreached=$3 failed=$4 fleet=$5 surfaced=$6 watermark=$7
+  local delivered=$8 observed=$9
   local dir file
   # Validate exactly what fm_bw_sweep_read demands. A cursor this writes but the
   # reader then refuses would restart every pass at the beginning, which quietly
@@ -365,12 +423,13 @@ fm_bw_sweep_write() {
   fm_bw_list_valid "$fleet" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   fm_bw_watermark_valid "$watermark" || return 1
+  fm_bw_list_valid "$delivered" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   dir=$(fm_bw_dir "$state")
   file=$(fm_bw_sweep_path "$state")
-  fm_bw_publish "$dir" "$file" "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+  fm_bw_publish "$dir" "$file" "$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
     "$FM_BW_SWEEP_VERSION" "$resume" "$unreached" "$failed" "$fleet" "$surfaced" \
-    "$watermark" "$observed")"
+    "$watermark" "$delivered" "$observed")"
 }
 
 # How many passes a fleet of <fleet> needs at the coverage a pass achieved, where
