@@ -38,6 +38,10 @@
 #     pass that reached nothing counts as worse than any finite figure;
 #   - a pass killed before it could report leaves the gap it actually had rather
 #     than the previous pass's cleaner one;
+#   - a complete pass does not discard the coverage already reported, so a fleet
+#     alternating complete and truncated does not re-notify every other sweep;
+#   - a red whose verdict cannot be recorded is still reported, says so inline,
+#     and never claims a first observation it already made;
 #   - green records silently and clears the pre-launch advisory;
 #   - config/branch-watch "off", a clone with no origin, and a non-GitHub origin
 #     are all silent.
@@ -576,6 +580,84 @@ assert_contains "$OUT" "branch-watch-incomplete" \
   "a fleet change must reset the watermark and surface again"
 pass "a change to the fleet resets the watermark and surfaces again"
 
+# --- a complete pass is a recovery, and recovery is never news --------------
+#
+# A fleet sitting on the budget boundary crosses it on forge jitter alone, so it
+# alternates complete and truncated passes. If a complete pass cleared what had
+# already been reported, every truncated pass after one would announce the same
+# unchanged coverage again - a wake every other sweep for a fleet whose coverage
+# never got worse.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+add_project "$H" delta >/dev/null
+
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "covering the fleet within 2 passes" "the first truncation states its pass count"
+poll "$H" "$BIN" --ack :sweep
+[ "$(sweep_field "$H" 6)" = 2 ] || fail "the delivered pass count must be recorded, got $(sweep_field "$H" 6)"
+
+# A pass that fits in its budget reaches everything.
+FAST=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$FAST")
+[ -z "$OUT" ] || fail "a complete pass must wake nothing, got: $OUT"
+assert_contains "$(poll "$H" "$FAST" --status)" "sweep: the last pass reached every project" \
+  "a complete pass must report complete coverage"
+[ "$(sweep_field "$H" 6)" = 2 ] \
+  || fail "a complete pass must not discard the coverage already reported, got $(sweep_field "$H" 6)"
+
+# Back to the same truncated coverage. Nothing about it is new. The complete pass
+# above resumed the ring at charlie, so the stall goes on delta to land second in
+# THIS pass - a stall on the ring's last project would let the pass finish and
+# make the silence below prove nothing.
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" delta)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "coverage already reported must stay quiet after a complete pass, got: $OUT"
+assert_contains "$(poll "$H" "$BIN" --status)" "sweep: the last pass did not reach" \
+  "the quiet pass must have been truncated, or its silence proves nothing"
+pass "a complete pass does not discard what was already reported, so recovery never re-notifies"
+
+# A fleet change must still reset, rather than inheriting the old fleet's figure.
+add_project "$H" echo-svc >/dev/null
+BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" alpha)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-watch-incomplete" \
+  "a fleet change after a complete pass must still surface rather than inherit a figure measured elsewhere"
+pass "a fleet change after a complete pass still resets the watermark"
+
+# --- a red that cannot be recorded is still reported ------------------------
+#
+# The state directory goes unwritable when the disk is full or permissions have
+# gone wrong - the same conditions under which a default branch is most likely to
+# be broken. Going quiet then would correlate this watch's own failure with the
+# thing it watches for.
+
+H=$(new_home)
+add_project "$H" storage-manager >/dev/null
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-1" "$TMP_ROOT/jobs-1")
+mkdir -p "$H/state/elsewhere"
+ln -s "$H/state/elsewhere" "$H/state/branch-watch"
+OUT=$(poll "$H" "$BIN")
+assert_contains "$OUT" "branch-red: storage-manager/main" \
+  "a red whose verdict cannot be recorded must still be reported"
+assert_contains "$OUT" "could not be recorded" \
+  "the report must say inline that the verdict was not recorded"
+assert_contains "$OUT" "repeats until it can be" \
+  "the report must say that it will repeat, so the repeat explains itself"
+assert_contains "$OUT" 'job="build" steps=14 duration=401s' \
+  "the evidence that separates a failure from a refusal must survive the unrecorded path"
+assert_not_contains "$OUT" "was already red when the watch started" \
+  "an unrecordable verdict must not claim a first observation"
+OUT=$(poll "$H" "$BIN")
+assert_contains "$OUT" "could not be recorded" \
+  "a later sweep must keep reporting the red while the record cannot be written"
+assert_not_contains "$OUT" "was already red when the watch started" \
+  "a later sweep must not claim a first observation it already made"
+pass "a red verdict that cannot be recorded is still reported, and says so rather than claiming a first sighting"
+
 # --- a pass that reached nothing is the worst coverage there is -------------
 #
 # The sweep always attempts its first project, so this state is reachable
@@ -617,13 +699,28 @@ OUT=$(poll "$H" "$BIN" --status)
 assert_contains "$OUT" "sweep: the last pass reached every project" \
   "a complete pass must report complete coverage"
 
-# Now kill a pass mid-flight, the way the watcher's per-check timeout does.
+# Now kill a pass mid-flight, the way the watcher's per-check timeout does: the
+# sweep runs as its own process group leader and the whole group is killed, so
+# the forge call it is blocked in dies with it rather than outliving this case
+# and overwriting the cursor it was supposed to leave behind. The executable is
+# backgrounded directly rather than through the poll helper, because
+# backgrounding a shell function yields the wrapper subshell's pid and killing
+# that would leave the real sweep running.
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" bravo)
-FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN" >/dev/null &
+set -m
+PATH="$BIN:$PATH" FM_HOME="$H" FM_BRANCH_WATCH_BUDGET=999 \
+  "$ROOT/bin/fm-branch-poll.sh" >/dev/null 2>&1 &
 POLL_PID=$!
+set +m
 sleep 1
-kill -KILL "$POLL_PID" 2>/dev/null || true
+POLL_PGID=$(ps -o pgid= -p "$POLL_PID" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$POLL_PGID" ] && [ "$POLL_PGID" = "$POLL_PID" ]; then
+  kill -KILL -- "-$POLL_PGID" 2>/dev/null || true
+else
+  kill -KILL "$POLL_PID" 2>/dev/null || true
+fi
 wait "$POLL_PID" 2>/dev/null || true
+is_live_non_zombie "$POLL_PID" && fail "the killed sweep must not outlive the case"
 OUT=$(poll "$H" "$BIN" --status)
 assert_not_contains "$OUT" "reached every project" \
   "a pass killed before its report must never be read as having reached every project"

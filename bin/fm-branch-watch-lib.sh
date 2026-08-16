@@ -38,7 +38,7 @@
 #   1  fm-branch-sweep-v2     version tag; anything else is refused, not guessed
 #   2  resume                 last project the previous pass ATTEMPTED, or "-"
 #   3  unreached              projects that pass never reached, space-joined, or "-"
-#   4  fleet                  the project list whose truncation was last reported
+#   4  fleet                  the project list line 6's watermark was measured on
 #   5  yes|no                 whether line 4's truncation notice was surfaced
 #   6  watermark              the worst pass count DELIVERED for line 4's fleet, or "-"
 #   7  observed               unix epoch of the observation

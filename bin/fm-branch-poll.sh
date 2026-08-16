@@ -298,7 +298,7 @@ sweep_project() {
   local project=$1 dir repo branch runs verdict fields
   local sha run url workflow conclusion last_green
   local had_prev=0 prev_state='' prev_sha='' prev_green='' prev_surfaced=''
-  local evidence job steps duration jobs max_steps phrase classification subject line
+  local evidence job steps duration jobs max_steps phrase classification subject detail
 
   dir="$PROJECTS/$project"
   repo=$(fm_gh_repo_from_remote "$dir" 2>/dev/null) || return 0
@@ -379,15 +379,28 @@ EOF
     phrase='is red at a new commit'
   fi
 
-  line="branch-red: $project/$branch $phrase - $classification; conclusion=$conclusion $evidence"
-  line="$line suspect=$(fm_bw_short "$sha") last_green=$(fm_bw_short "$last_green")"
-  line="$line workflow=\"$workflow\" run=$url"
+  detail="$classification; conclusion=$conclusion $evidence"
+  detail="$detail suspect=$(fm_bw_short "$sha") last_green=$(fm_bw_short "$last_green")"
+  detail="$detail workflow=\"$workflow\" run=$url"
   if subject=$(commit_subject "$repo" "$sha"); then
-    line="$line subject=\"$subject\""
+    detail="$detail subject=\"$subject\""
   fi
 
-  fm_bw_write "$STATE" "$project" "$repo" "$branch" red "$sha" "$run" "$last_green" no "$(date +%s)" || return 0
-  printf '%s\t%s\n' "$project" "$line"
+  # A verdict that cannot be written is still reported. An unwritable state
+  # directory is not an independent random fault: it means a full disk, or
+  # permissions gone wrong, or a machine already in trouble - exactly the
+  # conditions under which a default branch is most likely to be broken and
+  # least affordable to miss. Going quiet here would correlate this watch's own
+  # failure with the thing it watches for, which is the worst possible moment to
+  # say nothing, and two failures arriving together are far worse than either
+  # alone. Without a record nothing pins the sha, so the report repeats; it says
+  # so inline, because an operator who sees the same red twice with no
+  # explanation starts doubting the watcher instead of the branch.
+  if ! fm_bw_write "$STATE" "$project" "$repo" "$branch" red "$sha" "$run" \
+    "$last_green" no "$(date +%s)"; then
+    phrase='is red and its verdict could not be recorded, so this repeats until it can be'
+  fi
+  printf '%s\t%s\n' "$project" "branch-red: $project/$branch $phrase - $detail"
 }
 
 # Mark surfaced exactly the records the caller names, and no others. The caller
@@ -557,7 +570,15 @@ UNREACHED=$REMAINING
 
 NOW=$(date +%s)
 if [ "$UNREACHED" = - ]; then
-  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - - yes - "$NOW" || true
+  # A complete pass clears the gap and nothing else. The watermark and the fleet
+  # it was measured on carry through untouched, because a complete pass is the
+  # fullest recovery there is and recovery is never news: clearing them here
+  # would make a fleet sitting on the budget boundary alternate complete and
+  # truncated and announce the same unchanged coverage every other sweep. They
+  # are carried through rather than restated from this pass, so a fleet that
+  # changes still resets and never inherits a figure measured on another one.
+  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - "$PREV_FLEET" "$PREV_SURFACED" \
+    "$PREV_WATERMARK" "$NOW" || true
   exit 0
 fi
 
