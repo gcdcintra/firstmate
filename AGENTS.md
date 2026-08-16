@@ -105,7 +105,7 @@ state/               volatile runtime signals; gitignored
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
   procevent/         registered process-to-event sources, one private record per canonical source id; written only by bin/fm-procevent.sh, and their presence alone keeps supervision required (section 13)
   procevent-inbox/   private captured results and their durable handled-acknowledgement markers; source output lives here and never in an event line
-  branch-watch/      one private per-project default-branch verdict, written only by bin/fm-branch-poll.sh and read by the pre-launch advisory in bin/fm-spawn.sh
+  branch-watch/      one private per-project default-branch verdict plus the sweep's own `.sweep` cursor (where the next pass resumes, and which clones the last pass could not reach), written only by bin/fm-branch-poll.sh and read by the pre-launch advisory in bin/fm-spawn.sh
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
@@ -378,6 +378,7 @@ Handle actionable wakes as follows:
 3. For `gone:`, the endpoint was confidently killed or left agent-less, so it will never clear on its own and is never a wedge; load `stuck-crewmate-recovery`, and check what the worker had already committed before relaunching, because a killed worker's branch and running validation usually survive it.
 4. For `check:`, act on the named poll result, including merges, X-mode events, and process-to-event source results.
    A `branch-red` result means a project's default branch settled red: relay it with the suspect merge and the inline evidence that separates a check that ran and failed from one that never started, and never revert or force-push in response, because the breaking merge may not be this fleet's to undo.
+   A `branch-watch-incomplete` result names the clones that sweep did not reach, so nothing it reports may be relayed as covering them; the next pass resumes there.
 5. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.

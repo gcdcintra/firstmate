@@ -34,6 +34,31 @@
 # would reproduce the exact silence this exists to end. Recovery to green is
 # recorded but does not wake - it clears the pre-launch advisory instead.
 #
+# COVERING THE FLEET WITHOUT PRETENDING TO
+# A pass costs one `gh run list` per project plus two further calls per red one,
+# and it runs inside the watcher's per-check budget, so a large enough fleet
+# cannot be swept in one pass. Two things keep that from becoming a blind spot.
+#
+# The pass SELF-BOUNDS: once FM_BRANCH_WATCH_BUDGET seconds have gone it starts
+# no further project. Exiting on its own terms rather than being killed is what
+# lets it report and record anything at all - a killed process prints no trailing
+# line. And the next pass RESUMES at the project after the last one it attempted,
+# wrapping around, so a fleet too large for one pass loses a rotating slice for a
+# pass each instead of the same tail every time. The cursor advances BEFORE each
+# attempt, so a forge call that hangs until the watcher kills the sweep costs its
+# project one rotation rather than parking every later pass on the same stall.
+#
+# A truncated pass SAYS SO and names every project it did not reach, because a
+# partial sweep is indistinguishable from a clean one when silence is the "green"
+# signal. Repeat suppression is keyed on the FLEET, not on the set that was
+# missed: rotation changes that set on every pass by construction, so keying on
+# it would wake once per sweep forever, which is what the suppression exists to
+# avoid. The fleet is what changes when a home starts, or stops, being too large
+# to sweep in one pass. Any red report in a truncated pass carries the unreached
+# names with it whether or not the notice is suppressed, so a red wake can never
+# be read as "and the rest of the fleet is fine", and --status prints the current
+# gap on demand.
+#
 # NOT COVERED, deliberately. Each of these is a real limit, not an oversight:
 #   - projects with no origin remote, and projects whose origin is not GitHub
 #     (bin/fm-gh-lib.sh refuses rather than guessing, and this skips them);
@@ -44,22 +69,34 @@
 #     query wired here;
 #   - a workflow whose newest run is older than the assessed commit: the verdict
 #     describes the commit, so a failure that only ever ran on an older commit
-#     is not carried forward.
+#     is not carried forward;
+#   - the whole fleet in a single pass, past roughly 25 clones. One `gh run list`
+#     against the real GitHub forge measured 0.93s, 0.95s, 1.01s, 1.13s and 1.21s
+#     over five consecutive calls, a median of about 1.0s, and a red project costs
+#     two further calls - so about 25 projects fit in one 30s pass. Rotation makes
+#     the residual limit LATENCY rather than coverage, proportional to fleet size:
+#     about 50 clones are covered in full within two passes, so at the default
+#     900s cadence the worst-case notice for the far side of the ring is one extra
+#     sweep, roughly 15 minutes, and never "not at all".
 #
 # OUTPUT SHAPE
-# A sweep prints one tab-separated "<project><TAB><wake line>" record per newly
-# red project, and nothing at all otherwise. It is one record per project rather
-# than one joined line because the durable wake queue collapses records sharing a
-# kind and key: a single key for every project would let one project's red
-# silently replace another's, which is the loss this whole mechanism exists to
-# prevent. The caller keys each queue record on the project name it is given.
+# A sweep prints one tab-separated "<key><TAB><wake line>" record per thing worth
+# waking on, and nothing at all otherwise. The key is the project name for a red
+# branch, and ":sweep" for the one truncation notice - a key deliberately outside
+# the project-name charset, because the durable wake queue collapses records
+# sharing a kind and key, and one key covering two things would let one silently
+# replace the other. That is the loss this whole mechanism exists to prevent. The
+# caller keys each queue record on the key it is given, and acknowledges by those
+# same keys once it has committed them.
 #
 # Usage:
-#   fm-branch-poll.sh            one sweep; prints one record per newly red project
-#   fm-branch-poll.sh --ack      mark every pending red verdict as surfaced
-#   fm-branch-poll.sh --status   human-readable current verdict per project
+#   fm-branch-poll.sh                  one sweep; prints one record per key to wake on
+#   fm-branch-poll.sh --ack <key>...   mark exactly these records surfaced
+#   fm-branch-poll.sh --status         human-readable current verdict per project
 #
-# Environment: FM_BRANCH_WATCH_LIMIT (runs fetched per project, default 30).
+# Environment: FM_BRANCH_WATCH_LIMIT (runs fetched per project, default 30),
+# FM_BRANCH_WATCH_BUDGET (seconds one pass may spend starting projects, default
+# 25, which is the watcher's 30s per-check budget with room to exit cleanly).
 # Disable entirely with a config/branch-watch file containing "off".
 set -u
 
@@ -80,24 +117,42 @@ case "$RUN_LIMIT" in
   ''|*[!0-9]*|0) RUN_LIMIT=30 ;;
 esac
 
+BUDGET=${FM_BRANCH_WATCH_BUDGET:-25}
+case "$BUDGET" in
+  ''|*[!0-9]*|0) BUDGET=25 ;;
+esac
+
+USAGE='usage: fm-branch-poll.sh [--ack <key>... | --status]'
 MODE=poll
 case "${1-}" in
   '') ;;
-  --ack) MODE=ack ;;
-  --status) MODE=status ;;
+  --ack)
+    MODE=ack
+    shift
+    # An acknowledgement names what the caller committed. A bare --ack used to
+    # mean "everything pending", which could mark a verdict delivered that
+    # nothing ever carried, so it is now a usage error rather than a silent
+    # over-reach.
+    [ "$#" -gt 0 ] || { echo "$USAGE" >&2; exit 2; }
+    ;;
+  --status)
+    [ "$#" = 1 ] || { echo "$USAGE" >&2; exit 2; }
+    MODE=status
+    ;;
   -h|--help)
     awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
     exit 0
     ;;
   *)
-    echo "usage: fm-branch-poll.sh [--ack|--status]" >&2
+    echo "$USAGE" >&2
     exit 2
     ;;
 esac
 
-# Every project directory under this home, in a stable order so a sweep cut
-# short by the watcher's per-check timeout always loses the same tail rather
-# than a random project each time.
+# Every project directory under this home, in one stable order. The order is the
+# ring that rotation walks, not the point every pass starts from: a pass resumes
+# after the project it last attempted, so a stable order buys a repeatable ring
+# rather than - as it did before rotation existed - a repeatable blind spot.
 list_projects() {
   local dir name
   [ -d "$PROJECTS" ] || return 0
@@ -265,6 +320,12 @@ EOF
   [ -n "${last_green:-}" ] || last_green=-
   [ "$last_green" != - ] || last_green=${prev_green:--}
   [ "$last_green" = - ] || fm_bw_sha_valid "$last_green" || last_green=-
+  # The last green commit is the one BEHIND the suspect. A commit recorded green
+  # and then failed again on a rerun, a workflow_dispatch, or a nightly schedule
+  # would otherwise fall back onto itself and produce "suspect=abc1234
+  # last_green=abc1234" - incoherent evidence in the one line that has to be
+  # right. "none" is the honest answer when nothing green is behind it.
+  [ "$last_green" != "$sha" ] || last_green=-
 
   if [ "$verdict" = green ]; then
     fm_bw_write "$STATE" "$project" "$repo" "$branch" green "$sha" - - yes "$(date +%s)" || true
@@ -316,15 +377,28 @@ EOF
   printf '%s\t%s\n' "$project" "$line"
 }
 
+# Mark surfaced exactly the records the caller names, and no others. The caller
+# knows which wakes it committed to the durable queue; this script does not, and
+# a record written unsurfaced by an earlier pass whose wake never reached the
+# queue must stay unsurfaced so the next pass re-emits it. An unknown or already
+# surfaced key is skipped rather than treated as an error, because failing to
+# acknowledge only costs a duplicate report - the safe direction.
 run_ack() {
-  local project
-  while IFS= read -r project; do
-    [ -n "$project" ] || continue
-    fm_bw_read "$STATE" "$project" || continue
+  local key
+  for key in "$@"; do
+    [ -n "$key" ] || continue
+    if [ "$key" = "$FM_BW_SWEEP_KEY" ]; then
+      fm_bw_sweep_read "$STATE" || continue
+      [ "$FM_BW_SWEEP_SURFACED" = no ] || continue
+      fm_bw_sweep_write "$STATE" "$FM_BW_SWEEP_RESUME" "$FM_BW_SWEEP_UNREACHED" \
+        "$FM_BW_SWEEP_FLEET" yes "$FM_BW_SWEEP_OBSERVED" || true
+      continue
+    fi
+    fm_bw_read "$STATE" "$key" || continue
     [ "$FM_BW_SURFACED" = no ] || continue
-    fm_bw_write "$STATE" "$project" "$FM_BW_REPO" "$FM_BW_BRANCH" "$FM_BW_STATE" \
+    fm_bw_write "$STATE" "$key" "$FM_BW_REPO" "$FM_BW_BRANCH" "$FM_BW_STATE" \
       "$FM_BW_SHA" "$FM_BW_RUN" "$FM_BW_LAST_GREEN" yes "$FM_BW_OBSERVED" || true
-  done < <(list_projects)
+  done
 }
 
 run_status() {
@@ -342,11 +416,21 @@ run_status() {
     printf '\n'
   done < <(list_projects)
   [ "$found" = 1 ] || printf 'no default-branch verdicts recorded in %s\n' "$(fm_bw_dir "$STATE")"
+  # Coverage is part of the verdict: a reader has to be able to tell "every
+  # project reads green" from "every project I got to reads green".
+  if fm_bw_sweep_read "$STATE"; then
+    if [ "$FM_BW_SWEEP_UNREACHED" = - ]; then
+      printf 'sweep: the last pass reached every project\n'
+    else
+      printf 'sweep: the last pass did not reach %s (truncation surfaced=%s)\n' \
+        "$FM_BW_SWEEP_UNREACHED" "$FM_BW_SWEEP_SURFACED"
+    fi
+  fi
 }
 
 case "$MODE" in
   ack)
-    run_ack
+    run_ack "$@"
     exit 0
     ;;
   status)
@@ -359,10 +443,94 @@ fm_bw_enabled "$CONFIG" || exit 0
 [ -d "$PROJECTS" ] || exit 0
 command -v gh >/dev/null 2>&1 || exit 0
 
+PROJECT_LIST=()
 while IFS= read -r PROJECT; do
   [ -n "$PROJECT" ] || continue
-  RECORD=$(sweep_project "$PROJECT") || continue
-  [ -n "$RECORD" ] || continue
-  printf '%s\n' "$RECORD"
+  PROJECT_LIST+=("$PROJECT")
 done < <(list_projects)
+COUNT=${#PROJECT_LIST[@]}
+[ "$COUNT" -gt 0 ] || exit 0
+FLEET=$(printf '%s ' "${PROJECT_LIST[@]}")
+FLEET=${FLEET% }
+
+PREV_UNREACHED=-
+PREV_FLEET=-
+PREV_SURFACED=yes
+RESUME=-
+if fm_bw_sweep_read "$STATE"; then
+  RESUME=$FM_BW_SWEEP_RESUME
+  PREV_UNREACHED=$FM_BW_SWEEP_UNREACHED
+  PREV_FLEET=$FM_BW_SWEEP_FLEET
+  PREV_SURFACED=$FM_BW_SWEEP_SURFACED
+fi
+
+# Resume after the project the previous pass last attempted. An unreadable,
+# malformed, or since-removed position falls back to the start of the ring:
+# starting over costs a duplicate look, while guessing forward would skip
+# projects, and skipping is the whole failure this rotation removes.
+START=0
+if [ "$RESUME" != - ]; then
+  I=0
+  while [ "$I" -lt "$COUNT" ]; do
+    if [ "${PROJECT_LIST[$I]}" = "$RESUME" ]; then
+      START=$(( (I + 1) % COUNT ))
+      break
+    fi
+    I=$((I + 1))
+  done
+fi
+
+SWEEP_START=$SECONDS
+RED=0
+K=0
+LAST_ATTEMPTED=$RESUME
+while [ "$K" -lt "$COUNT" ]; do
+  # The first project of a pass is always attempted. A deadline that could stop
+  # a pass before it started anything would leave the cursor where it was and
+  # make "every project is reached within a bounded number of passes" false.
+  if [ "$K" -gt 0 ] && [ "$((SECONDS - SWEEP_START))" -ge "$BUDGET" ]; then
+    break
+  fi
+  PROJECT=${PROJECT_LIST[$(( (START + K) % COUNT ))]}
+  # Advance the cursor BEFORE the attempt, not after it. A forge call that hangs
+  # until the watcher's per-check timeout kills this sweep writes nothing on the
+  # way out, and a cursor moved only on success would send every later pass back
+  # into that same stall - a permanent blind spot behind one slow project.
+  fm_bw_sweep_write "$STATE" "$PROJECT" "$PREV_UNREACHED" "$PREV_FLEET" \
+    "$PREV_SURFACED" "$(date +%s)" || true
+  LAST_ATTEMPTED=$PROJECT
+  RECORD=$(sweep_project "$PROJECT") || RECORD=
+  if [ -n "$RECORD" ]; then
+    printf '%s\n' "$RECORD"
+    RED=1
+  fi
+  K=$((K + 1))
+done
+
+REACHED=$K
+UNREACHED=
+while [ "$K" -lt "$COUNT" ]; do
+  UNREACHED="$UNREACHED ${PROJECT_LIST[$(( (START + K) % COUNT ))]}"
+  K=$((K + 1))
+done
+UNREACHED=${UNREACHED# }
+[ -n "$UNREACHED" ] || UNREACHED=-
+
+NOW=$(date +%s)
+if [ "$UNREACHED" = - ]; then
+  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - - yes "$NOW" || true
+  exit 0
+fi
+
+# Truncated. Report it when this fleet has not been reported yet, when a red
+# report is going out in the same pass (so it can never be read as covering a
+# fleet it did not look at), or when the last notice was never acknowledged and
+# so may never have been delivered.
+if [ "$RED" = 1 ] || [ "$FLEET" != "$PREV_FLEET" ] || [ "$PREV_SURFACED" = no ]; then
+  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FLEET" no "$NOW" || exit 0
+  printf '%s\t%s\n' "$FM_BW_SWEEP_KEY" \
+    "branch-watch-incomplete: this pass reached $REACHED of $COUNT projects inside its ${BUDGET}s budget - not reached this pass: $UNREACHED; the next pass resumes there, covering the fleet within $(( (COUNT + REACHED - 1) / REACHED )) passes"
+else
+  fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" "$UNREACHED" "$FLEET" yes "$NOW" || true
+fi
 exit 0

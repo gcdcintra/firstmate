@@ -25,6 +25,14 @@
 #     evidence gap stated rather than the wake dropped;
 #   - two red projects reach the durable queue under two keys and both survive a
 #     drain, which collapses records sharing a kind and key;
+#   - an acknowledgement marks only the records it names, so a verdict written
+#     in the same pass but never queued is re-emitted rather than swallowed;
+#   - the last green commit is never the suspect commit itself;
+#   - a pass too slow to reach the whole fleet resumes at the next project,
+#     reaches every project within a bounded number of passes, names what it did
+#     not reach, and does not repeat that notice on every sweep;
+#   - a corrupt or unknown resume position restarts at the beginning rather than
+#     skipping projects;
 #   - green records silently and clears the pre-launch advisory;
 #   - config/branch-watch "off", a clone with no origin, and a non-GitHub origin
 #     are all silent.
@@ -32,6 +40,10 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-branch-watch-lib.sh
+# Sourced here rather than mid-file so the cases below can read back a recorded
+# verdict through the same reader the pre-launch advisory uses.
+. "$ROOT/bin/fm-branch-watch-lib.sh"
 
 fm_git_identity fmtest fmtest@example.invalid
 
@@ -66,14 +78,16 @@ add_project() {
   printf '%s\n' "$dir"
 }
 
-# fake_gh <home> <runs-file> <jobs-file>: a `gh` that answers `run list` from
-# <runs-file> and `run view` from <jobs-file>, both already in the tab-separated
-# shape the real `gh ... -q '... | @tsv'` produces. Either file may be the
-# literal word "fail", which makes that subcommand exit non-zero the way an
-# expired log or an unreachable forge does.
+# fake_gh <home> <runs-file> <jobs-file> [list-delay]: a `gh` that answers
+# `run list` from <runs-file> and `run view` from <jobs-file>, both already in
+# the tab-separated shape the real `gh ... -q '... | @tsv'` produces. Either file
+# may be the literal word "fail", which makes that subcommand exit non-zero the
+# way an expired log or an unreachable forge does. <list-delay> makes each
+# `run list` take that many seconds, which is how the cases below drive a sweep
+# past its own budget the way a real fleet's forge round-trips do.
 FAKE_SUBJECT='Merge pull request #36 from acme/nf-9'
 fake_gh() {
-  local home=$1 runs=$2 jobs=$3 fakebin
+  local home=$1 runs=$2 jobs=$3 delay=${4:-0} fakebin
   fakebin=$(fm_fakebin "$home")
   cat > "$fakebin/gh" <<SH
 #!/usr/bin/env bash
@@ -89,6 +103,7 @@ case "\$1" in
     case "\$2" in
       list)
         [ "$runs" != fail ] || exit 1
+        [ "$delay" = 0 ] || sleep "$delay"
         cat "$runs"
         exit 0
         ;;
@@ -143,6 +158,22 @@ poll() {
   shift 2
   PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-branch-poll.sh" "$@"
 }
+
+# surfaced_of <home> <project>: the recorded verdict's surfaced flag, read back
+# through the same reader the watcher and the pre-launch advisory use.
+surfaced_of() {
+  fm_bw_read "$1/state" "$2" || { printf 'unreadable\n'; return 0; }
+  printf '%s\n' "$FM_BW_SURFACED"
+}
+
+# one_pass_bin <home> <runs-file> <jobs-file>: a fake gh slow enough that a pass
+# with a one-second budget always attempts exactly one project - the first is
+# attempted unconditionally, and the second is never started because the sleep
+# has already spent the whole budget.
+one_pass_bin() {
+  fake_gh "$1" "$2" "$3" 1.1
+}
+ONE_PASS_BUDGET=1
 
 # --- green to red names the project and the suspect merge -------------------
 
@@ -261,7 +292,7 @@ assert_not_contains "$OUT" "at a new commit" \
   "the same red commit must never be described as a new one"
 pass "a red verdict whose wake was never acknowledged is re-emitted, and says it is a repeat"
 
-poll "$H" "$BIN" --ack
+poll "$H" "$BIN" --ack storage-manager
 OUT=$(poll "$H" "$BIN")
 [ -z "$OUT" ] || fail "the same red commit must not wake twice once acknowledged, got: $OUT"
 pass "an acknowledged red commit does not wake again"
@@ -335,6 +366,156 @@ assert_contains "$OUT" "$(printf 'storage-manager\tbranch-red: storage-manager/m
   "each record must carry the project name that keys its durable wake"
 pass "two red projects produce two separately keyed records"
 
+# --- an acknowledgement covers what was delivered, and nothing else ----------
+#
+# Both verdicts are written unsurfaced in one pass, but only one project's wake
+# reaches the durable queue - the watcher can die, or the append can fail,
+# between the two. Acknowledging the whole fleet would mark the undelivered one
+# delivered too, and since the same red commit at the same sha never wakes twice
+# once surfaced, that red would be swallowed for good.
+
+H=$(new_home)
+add_project "$H" storage-manager >/dev/null
+add_project "$H" nf-service >/dev/null
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-1" "$TMP_ROOT/jobs-1")
+OUT=$(poll "$H" "$BIN")
+assert_contains "$OUT" "branch-red: nf-service/main" "both projects must report red in the first pass"
+assert_contains "$OUT" "branch-red: storage-manager/main" "both projects must report red in the first pass"
+poll "$H" "$BIN" --ack storage-manager
+[ "$(surfaced_of "$H" storage-manager)" = yes ] \
+  || fail "the acknowledged project's verdict must be marked surfaced"
+[ "$(surfaced_of "$H" nf-service)" = no ] \
+  || fail "a verdict whose wake was never queued must stay unsurfaced"
+OUT=$(poll "$H" "$BIN")
+assert_contains "$OUT" "branch-red: nf-service/main" \
+  "a red whose wake was never queued must be re-emitted on the next pass"
+assert_not_contains "$OUT" "branch-red: storage-manager/main" \
+  "an acknowledged red must not be re-emitted"
+pass "an acknowledgement marks only the projects it names, and the rest are re-emitted"
+
+# --- the last green commit is never the suspect itself ----------------------
+#
+# A commit recorded green can go red without any new commit: a rerun, a
+# workflow_dispatch, or a nightly schedule all run against the same HEAD. The
+# green record behind it is then that same commit, and reporting it as the last
+# green would make the wake contradict itself about the one thing it must state
+# exactly.
+
+H=$(new_home)
+add_project "$H" storage-manager >/dev/null
+seed_record "$H" storage-manager acme/storage-manager main green "$RED_SHA" - - yes
+runs_file "$TMP_ROOT/runs-rerun" "$RED_SHA|completed|failure|907|https://forge/runs/907|CI"
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-rerun" "$TMP_ROOT/jobs-1")
+OUT=$(poll "$H" "$BIN")
+assert_contains "$OUT" "suspect=${RED_SHA:0:7}" "the suspect commit must still be named"
+assert_contains "$OUT" "last_green=none" \
+  "with nothing green behind the suspect, the last green commit must read none"
+assert_not_contains "$OUT" "last_green=${RED_SHA:0:7}" \
+  "the suspect commit must never be reported as its own last green commit"
+pass "a commit that went red on a rerun never names itself as its own last green commit"
+
+# --- a pass too slow for the whole fleet rotates instead of losing a tail ----
+#
+# One `gh run list` here takes longer than the whole budget, so each pass
+# attempts exactly one project: the first is always attempted, and the next is
+# never started. Which one that is has to move every pass, or the far end of the
+# fleet is never watched at all and the sweep's silence still reads as green.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+runs_file "$TMP_ROOT/runs-green" "$GREEN_SHA|completed|success|899|https://forge/runs/899|CI"
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+assert_present "$H/state/branch-watch/alpha" "the first pass must reach the first project"
+assert_absent "$H/state/branch-watch/bravo" "a pass out of budget must not reach the rest"
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+assert_present "$H/state/branch-watch/bravo" "the next pass must resume at the project after the last one attempted"
+assert_absent "$H/state/branch-watch/charlie" "rotation must advance by a pass, not restart"
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+assert_present "$H/state/branch-watch/charlie" \
+  "every project must be reached within a bounded number of passes"
+pass "a pass that cannot reach the whole fleet resumes at the next project and covers all of them"
+
+# --- a truncated pass says what it did not reach ----------------------------
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-1" "$TMP_ROOT/jobs-1")
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-red: alpha/main" "the project the pass did reach must still report red"
+INCOMPLETE=$(printf '%s\n' "$OUT" | grep 'branch-watch-incomplete' || true)
+[ -n "$INCOMPLETE" ] || fail "a truncated pass must say so, got: $OUT"
+assert_contains "$INCOMPLETE" "not reached this pass: bravo charlie" \
+  "a truncated pass must name every project it did not reach"
+assert_contains "$INCOMPLETE" "reached 1 of 3 projects" "the truncated pass must state its own coverage"
+pass "a truncated pass names the projects it did not reach, alongside the red it did find"
+
+OUT=$(poll "$H" "$BIN" --status)
+assert_contains "$OUT" "sweep: the last pass did not reach bravo charlie" \
+  "--status must report the coverage gap on demand"
+pass "the coverage gap of the last pass is readable through --status"
+
+# --- the truncation notice repeats per fleet, not per sweep -----------------
+#
+# Rotation changes which projects are missed on every single pass by
+# construction, so a notice keyed on that set would wake once per sweep forever.
+# What changes when a home starts, or stops, being too large to sweep in one
+# pass is the fleet, and that is what may speak up again.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-watch-incomplete" "a newly truncating fleet must surface once"
+assert_contains "$OUT" "$(printf ':sweep\tbranch-watch-incomplete')" \
+  "the notice must carry its own queue key, which no project name can collide with"
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-watch-incomplete" \
+  "an unacknowledged truncation notice must be re-emitted, not swallowed"
+poll "$H" "$BIN" --ack :sweep
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "an acknowledged truncation must not wake again on the same fleet, got: $OUT"
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "a persistently truncating fleet must not wake on every sweep, got: $OUT"
+add_project "$H" delta >/dev/null
+OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "branch-watch-incomplete" \
+  "a change to the fleet being missed must surface again"
+pass "a truncated pass with nothing red surfaces once per fleet, not once per sweep"
+
+# --- an unusable resume position restarts, and never skips -------------------
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+mkdir -p "$H/state/branch-watch"
+printf 'fm-branch-sweep-v0\nbravo\n-\n-\nyes\n1\n' > "$H/state/branch-watch/.sweep"
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+assert_present "$H/state/branch-watch/alpha" \
+  "a resume position that cannot be validated must restart at the beginning"
+assert_absent "$H/state/branch-watch/charlie" "a corrupt resume position must never skip projects"
+pass "a corrupt resume position restarts the ring rather than skipping projects"
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+mkdir -p "$H/state/branch-watch"
+printf 'fm-branch-sweep-v1\nzulu\n-\n-\nyes\n1\n' > "$H/state/branch-watch/.sweep"
+BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
+FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
+assert_present "$H/state/branch-watch/alpha" \
+  "a resume position naming no current project must restart at the beginning"
+pass "a resume position naming a project that no longer exists restarts at the beginning"
+
 # --- the watcher actually turns a red branch into a durable wake ------------
 #
 # The sweep printing a line is only half the contract: the supervisor has to
@@ -366,8 +547,10 @@ assert_grep "branch-watch:storage-manager" "$H/state/.wake-queue" \
   "each red project must reach the durable wake queue under its own key"
 assert_grep "branch-watch:nf-service" "$H/state/.wake-queue" \
   "each red project must reach the durable wake queue under its own key"
-assert_grep "yes" "$H/state/branch-watch/storage-manager" \
-  "the watcher must acknowledge the verdict after queueing it, so it does not repeat"
+[ "$(surfaced_of "$H" storage-manager)" = yes ] \
+  || fail "the watcher must acknowledge each queued verdict, so it does not repeat"
+[ "$(surfaced_of "$H" nf-service)" = yes ] \
+  || fail "the watcher must acknowledge every verdict it queued, not just the first"
 
 # The drain keeps only the newest record per (kind, key), so distinct keys are
 # what stops one project's red from silently replacing the other's - and the
@@ -395,8 +578,6 @@ pass "a watcher supervising a home with no clones never runs the default-branch 
 
 # --- the cursor refuses a record it cannot trust ----------------------------
 
-# shellcheck source=bin/fm-branch-watch-lib.sh
-. "$ROOT/bin/fm-branch-watch-lib.sh"
 H=$(new_home)
 mkdir -p "$H/state/branch-watch"
 printf 'fm-branch-watch-v0\np\nacme/p\nmain\ngreen\n%s\n-\n-\nyes\n1\n' "$GREEN_SHA" \
@@ -409,6 +590,21 @@ printf 'fm-branch-watch-v1\np\nacme/p\nmain\ngreen\n%s\n-\n-\nyes\n1\nextra\n' "
   > "$H/state/branch-watch/p"
 fm_bw_read "$H/state" p && fail "a record with a trailing field must be refused"
 pass "the default-branch cursor refuses a record it cannot fully validate"
+
+# Writing a verdict must not change the umask of the script that wrote it. The
+# record itself stays private, but bin/fm-spawn.sh sources this library and lives
+# for a whole launch, so a umask left behind here would silently privatize every
+# file it creates afterwards.
+H=$(new_home)
+UMASK_BEFORE=$(umask)
+fm_bw_write "$H/state" p acme/p main red "$RED_SHA" 900 "$GREEN_SHA" no 1 \
+  || fail "writing a verdict must succeed"
+[ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_write must restore the caller's umask, got $(umask)"
+fm_bw_sweep_write "$H/state" p - - yes 1 || fail "writing the sweep cursor must succeed"
+[ "$(umask)" = "$UMASK_BEFORE" ] || fail "fm_bw_sweep_write must restore the caller's umask, got $(umask)"
+[ -n "$(find "$H/state/branch-watch/p" -perm 0600 2>/dev/null)" ] \
+  || fail "the verdict record must still be written private to its owner"
+pass "writing a record keeps it private without leaving the caller's umask changed"
 
 # --- the pre-launch advisory reads the same cursor --------------------------
 
