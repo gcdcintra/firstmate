@@ -1443,8 +1443,9 @@ if [ "$KIND" != secondmate ]; then
       # matcher is `.*` for the reason docs/subagent-guard.md gives - the script
       # is the single owner of the shape test, so a future delegation tool name
       # is covered without editing a matcher. Every turn-close hook also clears
-      # the whole record, which bounds a call whose PostToolUse never fires to
-      # one turn.
+      # the whole record, and bin/fm-send.sh clears it on a firstmate interrupt,
+      # which Claude answers with no hook of its own; together they bound a call
+      # whose PostToolUse never fires to one turn.
       mkdir -p "$WT/.claude"
       busy_cmd_prefix="$(shell_quote "$FM_ROOT/bin/fm-busy-event.sh") apply $(shell_quote "$STATE_REAL") $(shell_quote "$ID")"
       busy_suffix="--gen $(shell_quote "$BUSY_GEN") --source claude-hook"

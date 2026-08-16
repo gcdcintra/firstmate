@@ -12,12 +12,21 @@
 #   2. FM_SEND_SETTLE=0 produces no pause at all (sleep is never invoked for it).
 #   3. The pause is tunable (FM_SEND_SETTLE=7 pauses 7).
 #   4. The --key path never pauses (it bypasses the submit/settle path entirely).
+#
+# The same file also owns the --key path's other duty. Claude fires NO hook for a
+# manual interrupt, so every per-turn record its hooks would have closed has to be
+# closed by fm-send itself: the busy edge, and the open delegation records that
+# tell supervision a worker is blocked behind a helper of its own. Interrupt-then-
+# steer is the prescribed recovery for exactly that shape, so a record left behind
+# here would keep accusing a helper the captain already killed.
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-busy-lib.sh"
+# shellcheck source=bin/fm-delegation-lib.sh
+. "$ROOT/bin/fm-delegation-lib.sh"
 
 SEND="$ROOT/bin/fm-send.sh"
 
@@ -118,6 +127,16 @@ test_key_path_never_pauses() {
   pass "fm-send: the --key path never pauses (settle scoped to text submit)"
 }
 
+# Seed one genuinely open delegation call through the real writer, then prove the
+# setup landed: that writer is silent by contract, so a seed that quietly failed
+# would make every clear assertion below pass for the wrong reason.
+seed_open_delegation() {  # <state-dir> <task> <call-id>
+  printf '{"tool_name":"Agent","tool_use_id":"%s"}' "$3" \
+    | "$ROOT/bin/fm-delegation-event.sh" open "$1" "$2"
+  fm_delegation_open_age "$1" "$2" >/dev/null \
+    || fail "setup: seeding an open delegation call for '$2' recorded nothing"
+}
+
 test_claude_escape_records_interrupt_idle() {
   local dir fb log rc home gen out
   dir="$TMP_ROOT/claude-interrupt"; mkdir -p "$dir"
@@ -128,6 +147,7 @@ test_claude_escape_records_interrupt_idle() {
     "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off"
   gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" task)
   printf 'busy_gen=%s\n' "$gen" >> "$home/state/task.meta"
+  seed_open_delegation "$home/state" task toolu_blocked
   : > "$log"
 
   env PATH="$fb:$PATH" FM_HOME="$home" FM_SLEEP_LOG="$log" \
@@ -136,7 +156,34 @@ test_claude_escape_records_interrupt_idle() {
   out=$(fm_busy_classify tmux sess:win claude task "$home/state")
   [ "$out" = "idle fm-interrupt" ] \
     || fail "Claude Escape must classify idle/fm-interrupt, got '$out'"
-  pass "fm-send: a successful Claude Escape records the interrupt lifecycle edge"
+  fm_delegation_open_age "$home/state" task >/dev/null \
+    && fail "Claude Escape left an open delegation call behind, so the wedge alarm would keep naming a helper the captain already killed"
+  pass "fm-send: a successful Claude Escape records the interrupt lifecycle edge and retires the open delegation"
+}
+
+# The busy-gen precondition is busy-specific: an unarmed task still holds
+# delegation records, and Escape is still the only thing that will ever close
+# them. So the delegation clear must sit ahead of that gate, and the interrupt
+# must still succeed with nothing to record on the busy side.
+test_claude_escape_clears_delegation_without_a_busy_generation() {
+  local dir fb log rc home
+  dir="$TMP_ROOT/claude-interrupt-unarmed"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/sleep.log"
+  home="$dir/home"; mkdir -p "$home/state"
+  fm_write_meta "$home/state/task.meta" \
+    "window=sess:win" "worktree=$home/wt" "project=$home/project" \
+    "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off"
+  seed_open_delegation "$home/state" task toolu_unarmed
+  [ ! -e "$home/state/task.busy-gen" ] \
+    || fail "setup: this case must run with no armed busy generation"
+  : > "$log"
+
+  env PATH="$fb:$PATH" FM_HOME="$home" FM_SLEEP_LOG="$log" \
+    "$SEND" task --key Escape 2>/dev/null; rc=$?
+  expect_code 0 "$rc" "an Escape to an unarmed Claude task must still succeed"
+  fm_delegation_open_age "$home/state" task >/dev/null \
+    && fail "the delegation clear was gated on the busy-gen precondition, so an unarmed task keeps a stale open call"
+  pass "fm-send: Escape clears the open delegation even with no armed busy generation"
 }
 
 test_default_send_pauses_one_second
@@ -144,3 +191,4 @@ test_zero_disables_pause
 test_pause_is_tunable
 test_key_path_never_pauses
 test_claude_escape_records_interrupt_idle
+test_claude_escape_clears_delegation_without_a_busy_generation

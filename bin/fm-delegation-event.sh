@@ -13,8 +13,10 @@
 #
 # open  records one open call, but only when the tool name is delegation-shaped.
 # close retires exactly the call whose id it is given.
-# clear retires every open call, and is what a turn-end or session-end hook
-#       calls: it bounds a record whose closing hook never fired to one turn.
+# clear retires every open call. A turn-end or session-end hook calls it, and so
+#       does bin/fm-send.sh on a firstmate interrupt, for which Claude fires no
+#       hook of its own: together they bound a record whose closing hook never
+#       fired to one turn.
 #
 # With no --tool or --call, a Claude/Codex-shaped PreToolUse or PostToolUse
 # payload is read from stdin (.tool_name and .tool_use_id, or Grok's .toolName
@@ -32,7 +34,7 @@ MODE=${1:-}
 case "$MODE" in
   open|close|clear) shift ;;
   -h|--help)
-    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *) exit 0 ;;
@@ -67,14 +69,26 @@ if [ "$MODE" = clear ]; then
   exit 0
 fi
 
+# A close with no directory has no record to retire, so both mutations below are
+# already no-ops. Leaving before the payload read keeps that case - the common
+# one, since PostToolUse fires for every tool call a crewmate makes - off jq
+# entirely, inside the worker's own tool-call latency.
+[ "$MODE" != close ] || [ -d "$DIR" ] || exit 0
+
 # Read the payload only when the caller did not already hand over both fields,
-# so a hook that passes them on the command line never pays for jq.
+# so a hook that passes them on the command line never pays for jq. One jq
+# invocation yields both, because this sits in that same latency.
 if [ -z "$CALL" ] || { [ "$MODE" = open ] && [ -z "$TOOL" ]; }; then
   if [ ! -t 0 ] && command -v jq >/dev/null 2>&1; then
     PAYLOAD=$(cat 2>/dev/null || true)
     if [ -n "$PAYLOAD" ]; then
-      [ -n "$TOOL" ] || TOOL=$(printf '%s' "$PAYLOAD" | jq -r '(.tool_name // .toolName // empty)' 2>/dev/null) || TOOL=""
-      [ -n "$CALL" ] || CALL=$(printf '%s' "$PAYLOAD" | jq -r '(.tool_use_id // .toolUseId // empty)' 2>/dev/null) || CALL=""
+      # @tsv rather than two lines: it escapes any control character in either
+      # field, so no harness value can break the split.
+      PARSED=$(printf '%s' "$PAYLOAD" | jq -r '[(.tool_name // .toolName // ""), (.tool_use_id // .toolUseId // "")] | @tsv' 2>/dev/null) || PARSED=""
+      if [ -n "$PARSED" ]; then
+        [ -n "$TOOL" ] || TOOL=${PARSED%%$'\t'*}
+        [ -n "$CALL" ] || CALL=${PARSED#*$'\t'}
+      fi
     fi
   fi
 fi

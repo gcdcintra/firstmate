@@ -53,9 +53,11 @@
 #     per-harness status and the precedent that an unvalidated hook is worse
 #     than a missing one.
 #   - A delegation whose closing hook never fires. Turn end clears the whole
-#     directory, so staleness is bounded by one turn, and a stale record can
-#     only cost a deferral the pane would otherwise have been granted - noise,
-#     never blindness.
+#     directory, and so does a firstmate interrupt from bin/fm-send.sh, which
+#     Claude answers with no hook at all - so staleness is bounded by one turn
+#     even on the interrupt-then-steer path a blocked worker is most likely to
+#     be given, and a stale record can only cost a deferral the pane would
+#     otherwise have been granted - noise, never blindness.
 #
 # Sourcing: set -u and set -e safe, and dependency-free on purpose, because a
 # PreToolUse hook sources it on every tool call a crewmate makes.
