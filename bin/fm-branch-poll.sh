@@ -63,8 +63,13 @@
 # worse than none. Recovery is not news and stays quiet, which is also what stops
 # a fleet hovering on a boundary from reporting every other pass. It speaks up a
 # third time when a project starts failing its query that was never reported
-# failing, because that gap can grow while the pass count sits still and it is
-# the one rotation can never close. Any red report in a truncated pass carries
+# failing, or whose earlier failure has been forgotten after it answered enough
+# consecutive queries to call the fault over, because that gap can grow while the
+# pass count sits still and it is the one rotation can never close. The residual
+# there is deliberate: a relapse arriving before that forgetting completes stays
+# quiet, on the reading that inside such a window it is most likely the same
+# fault still settling rather than a new one, and it is still visible on demand
+# through --status. Any red report in a truncated pass carries
 # the unreached names with it whether or not the notice is suppressed, so a red
 # wake can never be read as "and the rest of the fleet is fine", and --status
 # prints the current gap on demand.
@@ -81,7 +86,9 @@
 # THE COVERAGE NUMBER IS LOAD-BEARING. It is what tells an operator how much of
 # the fleet was actually looked at, so every path that increments it has to be
 # honest. Read any future change that touches that counter with one question:
-# can this increment without a successful check?
+# can this increment without a successful check? The same question applies to
+# anything that makes a gap stop being reported: what evidence retires it, and
+# could that evidence arrive without the gap actually closing?
 #
 # NOT COVERED, deliberately. Each of these is a real limit, not an oversight:
 #   - projects with no origin remote, and projects whose origin is not GitHub
@@ -441,11 +448,12 @@ run_ack() {
       if [ "$mark" = - ] || [ "$level" -gt "$mark" ]; then
         mark=$level
       fi
-      # The delivered failures only ever grow, for the same reason the watermark
-      # only ever rises: a project that failed, recovered, and failed again was
-      # already said out loud once, and saying it again on every relapse is the
-      # flapping this suppression exists to avoid.
-      seen=$(fm_bw_list_union "$FM_BW_SWEEP_DELIVERED" "$FM_BW_SWEEP_FAILED")
+      # A failure joins the delivered set only once its notice has been handed
+      # over, at a zero streak. It leaves again from the other side, once the
+      # sweep has watched that project answer enough consecutive queries to call
+      # the fault over - membership that only ever grew would pre-forgive the
+      # whole fleet one blip at a time.
+      seen=$(fm_bw_delivered_add "$FM_BW_SWEEP_DELIVERED" "$FM_BW_SWEEP_FAILED")
       fm_bw_sweep_write "$STATE" "$FM_BW_SWEEP_RESUME" "$FM_BW_SWEEP_UNREACHED" \
         "$FM_BW_SWEEP_FAILED" "$FM_BW_SWEEP_FLEET" yes "$mark" "$seen" \
         "$FM_BW_SWEEP_OBSERVED" || true
@@ -630,8 +638,12 @@ if [ "$UNREACHED" = - ] && [ "$FAILED" = - ]; then
   # truncated and announce the same unchanged coverage every other sweep. They
   # are carried through rather than restated from this pass, so a fleet that
   # changes still resets and never inherits a figure measured on another one.
+  # Every project answered, which is the strongest recovery evidence there is, so
+  # the delivered failures advance toward being forgotten even though the fleet
+  # and the watermark they were measured against carry through untouched.
   fm_bw_sweep_write "$STATE" "$LAST_ATTEMPTED" - - "$PREV_FLEET" "$PREV_SURFACED" \
-    "$PREV_WATERMARK" "$PREV_DELIVERED" "$NOW" || true
+    "$PREV_WATERMARK" "$(fm_bw_delivered_advance "$PREV_DELIVERED" "$FLEET" - -)" \
+    "$NOW" || true
   exit 0
 fi
 
@@ -652,7 +664,7 @@ if [ "$RED" = 1 ] || [ "$FLEET" != "$PREV_FLEET" ] || [ "$PREV_SURFACED" = no ];
   NOTIFY=1
 elif [ "$PREV_WATERMARK" = - ] || [ "$PASSES" -gt "$PREV_WATERMARK" ]; then
   NOTIFY=1
-elif ! fm_bw_list_subset "$FAILED" "$PREV_DELIVERED"; then
+elif ! fm_bw_list_subset "$FAILED" "$(fm_bw_delivered_names "$PREV_DELIVERED")"; then
   NOTIFY=1
 fi
 
@@ -661,7 +673,7 @@ fi
 # acknowledgement, not here: a report this pass never managed to deliver must not
 # silence the one after it.
 WATERMARK=$PREV_WATERMARK
-DELIVERED=$PREV_DELIVERED
+DELIVERED=$(fm_bw_delivered_advance "$PREV_DELIVERED" "$FLEET" "$UNREACHED" "$FAILED")
 if [ "$FLEET" != "$PREV_FLEET" ]; then
   WATERMARK=-
   DELIVERED=-

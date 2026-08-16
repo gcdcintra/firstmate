@@ -35,14 +35,16 @@
 #
 # The sweep's own cursor is a second record, state/branch-watch/.sweep, nine
 # lines and one per line:
-#   1  fm-branch-sweep-v4     version tag; anything else is refused, not guessed
+#   1  fm-branch-sweep-v5     version tag; anything else is refused, not guessed
 #   2  resume                 last project the previous pass ATTEMPTED, or "-"
 #   3  unreached              projects that pass never reached, space-joined, or "-"
 #   4  failed                 projects it reached whose forge query would not answer
 #   5  fleet                  the project list lines 7 and 8 were measured on
 #   6  yes|no                 whether line 5's truncation notice was surfaced
 #   7  watermark              the worst pass count DELIVERED for line 5's fleet, or "-"
-#   8  delivered              the failed-query projects already DELIVERED, or "-"
+#   8  delivered              "<project>:<streak>" per failed query already
+#                             DELIVERED, streak being its consecutive answered
+#                             queries since, or "-"
 #   9  observed               unix epoch of the observation
 # Line 2 is what makes a fleet too large for one pass lose a rotating slice
 # instead of the same tail forever, so it is written before each attempt rather
@@ -66,14 +68,26 @@
 # number, so a fleet already reported at some pass count can start failing
 # queries without that number moving at all, and the failure would never be
 # said out loud. Line 8 is compared as a SET, not as a signature: a failure that
-# is not already in it is news, and anything that is - including a project that
-# recovered and is simply absent now - is not. Unlike the rotation gap, which
-# churns every pass by construction, this set is stable exactly while the fault
-# lasts, so keying on it cannot wake every sweep.
+# is not already in it is news, and one that is already in it is not. Unlike the
+# rotation gap, which churns every pass by construction, this set is stable
+# exactly while the fault lasts, so keying on it cannot wake every sweep.
 #
-# Both are raised only by the acknowledgement, never by the write that produces
-# the notice, because they record what a caller actually delivered - raising
-# either any earlier would let an undelivered report silence the one after it.
+# Membership alone would only ever grow, and a set that never forgets converges
+# on forgiving the whole fleet: one transient blip would inoculate a project
+# against ever reporting the permanent failure that arrives later, which is the
+# case this disclosure exists to catch. So each entry carries how many
+# consecutive queries have been ANSWERED for that project since, and an entry
+# leaves once that reaches FM_BW_FORGET_AFTER. A failed query resets its own
+# entry to zero. A project a pass never attempted is left exactly as it was:
+# not looking at something is not evidence that it recovered, and crediting it
+# would let a truncated fleet forget failures it never even queried.
+#
+# The streak is observation, not delivery, so it moves on the ordinary pass
+# write. Only membership is delivery state: it grows solely at the
+# acknowledgement, never at the write that produces the notice, because that is
+# what an undelivered report must not be able to silence. The streak is exempt
+# because it only ever REMOVES entries, which makes a failure more visible
+# rather than less - the direction that needs no delivery gate.
 #
 # The record is data, never authority: nothing here is interpolated into shell
 # source, and every field is revalidated on read rather than trusted from disk.
@@ -92,7 +106,10 @@ FM_BW_LAST_GREEN=
 FM_BW_SURFACED=
 FM_BW_OBSERVED=
 
-FM_BW_SWEEP_VERSION=fm-branch-sweep-v4
+FM_BW_SWEEP_VERSION=fm-branch-sweep-v5
+# How many consecutive answered queries retire a project from the delivered
+# failure set, so its next failure is news again rather than pre-forgiven.
+FM_BW_FORGET_AFTER=4
 # The sweep's own record is addressed by a key that is deliberately outside the
 # project-name charset, so the truncation notice can never share a durable wake
 # key with a project called anything at all - two records under one key collapse
@@ -168,22 +185,94 @@ fm_bw_list_subset() {
   done
 }
 
-fm_bw_list_union() {
-  local a=${1-} b=${2-} out name rest
+# The delivered set: "-" or space-joined "<project>:<streak>" tokens. The colon
+# is outside the project-name charset, so a token can never be read two ways.
+fm_bw_delivered_valid() {
+  local field=${1-} tok rest name count
+  [ "$field" != - ] || return 0
+  [ -n "$field" ] || return 1
+  rest=$field
+  while [ -n "$rest" ]; do
+    tok=${rest%% *}
+    case "$rest" in
+      *' '*) rest=${rest#* } ;;
+      *) rest= ;;
+    esac
+    name=${tok%%:*}
+    count=${tok#*:}
+    [ "$name" != "$tok" ] || return 1
+    fm_bw_project_valid "$name" || return 1
+    case "$count" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#count}" -le 3 ] || return 1
+  done
+}
+
+# Just the names, which is what the subset comparison is about.
+fm_bw_delivered_names() {
+  local field=${1-} tok rest out
   out=''
-  [ "$a" = - ] || out=$a
-  if [ "$b" != - ] && [ -n "$b" ]; then
-    rest=$b
+  [ "$field" != - ] && [ -n "$field" ] || { printf '%s\n' -; return 0; }
+  rest=$field
+  while [ -n "$rest" ]; do
+    tok=${rest%% *}
+    case "$rest" in
+      *' '*) rest=${rest#* } ;;
+      *) rest= ;;
+    esac
+    out="${out:+$out }${tok%%:*}"
+  done
+  printf '%s\n' "${out:--}"
+}
+
+# fm_bw_delivered_advance <delivered> <fleet> <unreached> <failed>
+# One pass's observations. A project this pass asked about and got an answer for
+# moves one step toward being forgotten and leaves at FM_BW_FORGET_AFTER; one
+# whose query failed goes back to zero; one this pass never attempted is left
+# untouched, because not asking is not evidence of recovery.
+fm_bw_delivered_advance() {
+  local delivered=${1-} fleet=${2-} unreached=${3-} failed=${4-}
+  local tok rest name count out
+  out=''
+  [ "$delivered" != - ] && [ -n "$delivered" ] || { printf '%s\n' -; return 0; }
+  rest=$delivered
+  while [ -n "$rest" ]; do
+    tok=${rest%% *}
+    case "$rest" in
+      *' '*) rest=${rest#* } ;;
+      *) rest= ;;
+    esac
+    name=${tok%%:*}
+    count=${tok#*:}
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    if fm_bw_list_subset "$name" "$failed"; then
+      count=0
+    elif fm_bw_list_subset "$name" "$unreached"; then
+      :
+    elif fm_bw_list_subset "$name" "$fleet"; then
+      count=$((count + 1))
+      [ "$count" -lt "$FM_BW_FORGET_AFTER" ] || continue
+    fi
+    out="${out:+$out }$name:$count"
+  done
+  printf '%s\n' "${out:--}"
+}
+
+# fm_bw_delivered_add <delivered> <failed>: a failure joins at a zero streak the
+# moment its notice is delivered, and one already there keeps the streak it has.
+fm_bw_delivered_add() {
+  local delivered=${1-} failed=${2-} rest name out names
+  out=''
+  [ "$delivered" = - ] || out=$delivered
+  names=$(fm_bw_delivered_names "$delivered")
+  if [ "$failed" != - ] && [ -n "$failed" ]; then
+    rest=$failed
     while [ -n "$rest" ]; do
       name=${rest%% *}
       case "$rest" in
         *' '*) rest=${rest#* } ;;
         *) rest= ;;
       esac
-      case " $out " in
-        *" $name "*) ;;
-        *) out="${out:+$out }$name" ;;
-      esac
+      fm_bw_list_subset "$name" "$names" || out="${out:+$out }$name:0"
     done
   fi
   printf '%s\n' "${out:--}"
@@ -397,7 +486,7 @@ fm_bw_sweep_read() {
   fm_bw_list_valid "$fleet" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   fm_bw_watermark_valid "$watermark" || return 1
-  fm_bw_list_valid "$delivered" || return 1
+  fm_bw_delivered_valid "$delivered" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   FM_BW_SWEEP_RESUME=$resume
   FM_BW_SWEEP_UNREACHED=$unreached
@@ -423,7 +512,7 @@ fm_bw_sweep_write() {
   fm_bw_list_valid "$fleet" || return 1
   case "$surfaced" in yes|no) ;; *) return 1 ;; esac
   fm_bw_watermark_valid "$watermark" || return 1
-  fm_bw_list_valid "$delivered" || return 1
+  fm_bw_delivered_valid "$delivered" || return 1
   case "$observed" in ''|*[!0-9]*) return 1 ;; esac
   dir=$(fm_bw_dir "$state")
   file=$(fm_bw_sweep_path "$state")

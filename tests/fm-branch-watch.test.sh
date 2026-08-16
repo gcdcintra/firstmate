@@ -52,6 +52,10 @@
 #     recovery does not;
 #   - a pass with both gaps claims only what is true and states the latency at
 #     the rate the ring actually advances;
+#   - a reported failure is forgotten only after sustained recovery, judged per
+#     project rather than on the fleet being clean, so a transient blip cannot
+#     pre-forgive a later permanent failure, an intermittent one does not report
+#     every cycle, and passes that never attempted a project forget nothing;
 #   - a fleet that grew during a complete pass still reports its own first
 #     truncation rather than inheriting the old fleet's figure;
 #   - green records silently and clears the pre-launch advisory;
@@ -222,7 +226,8 @@ STALL_BUDGET=2
 # sweep_field <home> <line>: one line of the sweep cursor, which is this
 # feature's own persisted record format (bin/fm-branch-watch-lib.sh documents the
 # nine lines); line 3 is the coverage gap, line 7 the delivered watermark, and
-# line 8 the failed-query projects already delivered.
+# line 8 the delivered failed-query projects, each with the consecutive answered
+# queries counted since.
 sweep_field() {
   sed -n "${2}p" "$1/state/branch-watch/.sweep" 2>/dev/null || true
 }
@@ -740,7 +745,7 @@ OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$BIN")
 assert_contains "$OUT" "forge query failed, so no verdict at all for: charlie" \
   "a query that starts failing must surface even when the pass count did not move"
 poll "$H" "$BIN" --ack :sweep
-[ "$(sweep_field "$H" 8)" = charlie ] \
+[ "$(sweep_field "$H" 8)" = "charlie:0" ] \
   || fail "the delivered failure must be recorded, got $(sweep_field "$H" 8)"
 pass "a newly failing query surfaces even when the pass count is unchanged"
 
@@ -766,6 +771,114 @@ OUT=$(FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN")
 assert_contains "$OUT" "reached 1 of 4 projects" "coverage worse than the figure delivered must still surface"
 assert_not_contains "$OUT" "forge query failed" "this pass had no failing query to report"
 pass "the pass-count arm keeps working independently of the failed-query arm"
+
+# --- a failure is forgotten only on sustained recovery ----------------------
+#
+# A set of already-reported failures that only ever grows pre-forgives the fleet
+# one blip at a time: the renamed repository or the lapsed token grant that this
+# disclosure exists to catch arrives AFTER the transient blip, and would then be
+# read as already said. A failure is retired only by watching that project answer
+# repeatedly, which is the one thing that means the fault is actually over.
+
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+# fail_bin/well_bin regenerate the fake gh in place: fm_fakebin is per home, so
+# two handles would be the same script and the later one would win.
+fail_bin() { fake_gh "$1" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 0 "" "$2"; }
+well_bin() { fake_gh "$1" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1"; }
+
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)")
+assert_contains "$OUT" "forge query failed, so no verdict at all for: alpha" \
+  "the first failure is reported"
+poll "$H" "$(fail_bin "$H" alpha)" --ack :sweep
+I=0
+while [ "$I" -lt 4 ]; do
+  OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(well_bin "$H")")
+  [ -z "$OUT" ] || fail "a project that recovered must never nag, got: $OUT"
+  I=$((I + 1))
+done
+pass "a project that recovers and stays healthy is never reported again"
+
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)")
+assert_contains "$OUT" "forge query failed, so no verdict at all for: alpha" \
+  "a failure after sustained recovery must be reported, not pre-forgiven by the earlier blip"
+pass "a transient failure does not inoculate a project against reporting its later permanent failure"
+
+# The same, with a second project failing throughout. A recovery signal shared
+# across the fleet would never advance while bravo keeps failing, and alpha's
+# relapse would go unreported.
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+add_project "$H" charlie >/dev/null
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" "alpha bravo")")
+assert_contains "$OUT" "forge query failed" "both failures are reported first"
+poll "$H" "$(fail_bin "$H" "alpha bravo")" --ack :sweep
+I=0
+while [ "$I" -lt 4 ]; do
+  OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" bravo)")
+  [ -z "$OUT" ] || fail "bravo still failing is not news, got: $OUT"
+  I=$((I + 1))
+done
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" "alpha bravo")")
+assert_contains "$OUT" "alpha" \
+  "alpha's relapse must be reported even while another project fails throughout"
+pass "one project's recovery is judged on its own queries, not on the fleet being clean"
+
+# A persistent failure is reported once, and an intermittent one does not
+# re-report every fault cycle - it never answers long enough to be forgotten.
+H=$(new_home)
+add_project "$H" alpha >/dev/null
+add_project "$H" bravo >/dev/null
+OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)")
+assert_contains "$OUT" "forge query failed" "the persistent failure is reported once"
+poll "$H" "$(fail_bin "$H" alpha)" --ack :sweep
+I=0
+while [ "$I" -lt 3 ]; do
+  OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)")
+  [ -z "$OUT" ] || fail "a persistent failure must not be reported every pass, got: $OUT"
+  I=$((I + 1))
+done
+pass "a persistently failing query is reported once, not on every pass"
+
+I=0
+while [ "$I" -lt 3 ]; do
+  OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(well_bin "$H")")
+  [ -z "$OUT" ] || fail "a healthy pass must be quiet, got: $OUT"
+  OUT=$(FM_BRANCH_WATCH_BUDGET=999 poll "$H" "$(fail_bin "$H" alpha)")
+  [ -z "$OUT" ] || fail "an intermittent failure must not re-report every cycle, got: $OUT"
+  I=$((I + 1))
+done
+pass "a query failing on alternating passes does not re-report once per fault cycle"
+
+# --- a pass that never asked is not evidence that anything recovered --------
+#
+# Under truncation a project can go many passes unattempted. Counting those as
+# recovery would let a fleet forget failures for clones it never even queried,
+# and the next pass that did query one would report it as though it were new.
+
+H=$(new_home)
+for P in alpha bravo charlie delta echo-svc foxtrot; do
+  add_project "$H" "$P" >/dev/null
+done
+BIN=$(fake_gh "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" 2.2 "" alpha)
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+assert_contains "$OUT" "forge query failed, so no verdict at all for: alpha" \
+  "alpha's failure is reported on the pass that found it"
+poll "$H" "$BIN" --ack :sweep
+I=0
+while [ "$I" -lt 4 ]; do
+  OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+  [ -z "$OUT" ] || fail "a pass that never reached alpha must be quiet, got: $OUT"
+  I=$((I + 1))
+done
+OUT=$(FM_BRANCH_WATCH_BUDGET=$STALL_BUDGET poll "$H" "$BIN")
+[ -z "$OUT" ] || fail "alpha was never asked in between, so its failure must not read as new, got: $OUT"
+assert_contains "$(poll "$H" "$BIN" --status)" "sweep: the last pass could not query alpha" \
+  "the pass must genuinely have queried alpha again, or this case proves nothing"
+pass "a failure is not forgotten by passes that never attempted that project"
 
 # --- the coverage claim stays true when both gaps are present ---------------
 #
@@ -860,7 +973,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v4\nalpha\n%s\n-\n%s\nyes\n3\n-\n1\n' \
+printf 'fm-branch-sweep-v5\nalpha\n%s\n-\n%s\nyes\n3\n-\n1\n' \
   "bravo charlie" "alpha bravo charlie" > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 chmod 555 "$H/state/branch-watch"
@@ -924,7 +1037,7 @@ add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 add_project "$H" delta >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v4\ndelta\n%s\n-\n%s\nno\n-\n-\n1\n' \
+printf 'fm-branch-sweep-v5\ndelta\n%s\n-\n%s\nno\n-\n-\n1\n' \
   "alpha bravo charlie delta" "alpha bravo charlie delta" > "$H/state/branch-watch/.sweep"
 BIN=$(stall_at_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1" alpha)
 poll "$H" "$BIN" --ack :sweep
@@ -1003,7 +1116,7 @@ add_project "$H" alpha >/dev/null
 add_project "$H" bravo >/dev/null
 add_project "$H" charlie >/dev/null
 mkdir -p "$H/state/branch-watch"
-printf 'fm-branch-sweep-v4\nzulu\n-\n-\n-\nyes\n-\n-\n1\n' > "$H/state/branch-watch/.sweep"
+printf 'fm-branch-sweep-v5\nzulu\n-\n-\n-\nyes\n-\n-\n1\n' > "$H/state/branch-watch/.sweep"
 BIN=$(one_pass_bin "$H" "$TMP_ROOT/runs-green" "$TMP_ROOT/jobs-1")
 FM_BRANCH_WATCH_BUDGET=$ONE_PASS_BUDGET poll "$H" "$BIN" >/dev/null
 assert_present "$H/state/branch-watch/alpha" \
