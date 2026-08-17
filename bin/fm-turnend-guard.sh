@@ -65,12 +65,16 @@
 # FAILURE notice for this home - so step 3 above can never become reachable while
 # waiting on that failure.
 # The recorded owner may be a second session that owns recovery, or this
-# session's own displaced predecessor whose continuity could not be proven, so
-# the banner and the alarm name the recorded pid and both readings instead of
-# asserting either, and neither tells the operator to skip inspecting this
-# session's hook registration - a misconfigured hook is silent in exactly the
-# same way, and the 2026-08-14 incident stayed hidden for an evening behind a
-# message that ruled that inspection out.
+# session's own displaced predecessor whose continuity could not be proven. No
+# command available to the operator separates those readings - bin/fm-lock.sh
+# status prints the same live-pid line for both - so the banner and the alarm
+# name the recorded pid and REPORT which reading the refusing sub-check actually
+# supports (FM_SESSION_LOCK_OWNER_EVIDENCE, published by the shared predicate)
+# instead of asserting one or asking the operator to establish it. Neither tells
+# the operator to skip inspecting this session's hook registration - a
+# misconfigured hook is silent in exactly the same way, and the 2026-08-14
+# incident stayed hidden for an evening behind a message that ruled that
+# inspection out.
 # This guard treats the stood-down case as its own
 # first-class outcome: it accounts that case on the SAME bounded
 # state/.turnend-claude-blocks budget as step 3, incrementing once per turn
@@ -166,19 +170,50 @@ OWNER_LOCK="$STATE/.claude-autoarm.lock"
 FAILURE_NOTICE="$STATE/.claude-autoarm-failure-notified"
 FAILURE_ALARM="$STATE/.claude-autoarm-failure-alarmed"
 FOREIGN_LOCK_OWNER_ALIVE=0
-# The pid the stood-down outcome actually read, captured once at the read that
-# decided it so the banner and the alarm can never name a pid the decision did
-# not use. Naming it is what makes the outcome checkable instead of an assertion
-# about who owns the home; an unreadable or malformed lock reports "unknown".
-FOREIGN_LOCK_OWNER_PID=unknown
+# What the stood-down outcome actually read, taken from the shared predicate's
+# own published values so the banner and the alarm can never name a pid, a
+# session, or a reason the decision did not use - this guard never re-reads
+# state/.lock for its message. Naming them is what makes the outcome checkable
+# instead of an assertion about who owns the home.
+FOREIGN_LOCK_OWNER_PID='unknown'
+FOREIGN_LOCK_OWNER_SESSION=''
+FOREIGN_LOCK_OWNER_EVIDENCE='owner-unresolved'
 SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"' 2>/dev/null || printf 'unknown')
 
-recorded_lock_owner() {
-  local pid
-  pid=$(cat "$STATE/.lock" 2>/dev/null || true)
-  case "$pid" in
-    ''|*[!0-9]*) printf 'unknown' ;;
-    *) printf '%s' "$pid" ;;
+# Capture the deciding read of fm_session_lock_foreign_owner_alive(). Called
+# only where that predicate has just returned true, so these always describe a
+# read that actually produced the stood-down outcome.
+capture_standdown_owner() {
+  FOREIGN_LOCK_OWNER_PID=$FM_SESSION_LOCK_OWNER_PID
+  FOREIGN_LOCK_OWNER_SESSION=$FM_SESSION_LOCK_OWNER_SESSION
+  FOREIGN_LOCK_OWNER_EVIDENCE=$FM_SESSION_LOCK_OWNER_EVIDENCE
+}
+
+# The ONE rendering of what the refusal actually established, shared by the
+# stderr banner and the JSON alarm so the two operator-facing texts can never
+# disagree. It reports the evidence rather than directing the operator to
+# establish the reading themselves: no command available to them separates a
+# second live session from this session's own displaced predecessor, because
+# bin/fm-lock.sh status prints the same live-pid line for both (2026-08-14
+# incident). Apostrophe-free, because the JSON alarm below is a single-quoted
+# printf format that cannot carry one.
+standdown_evidence() {
+  case "$FOREIGN_LOCK_OWNER_EVIDENCE" in
+    transcript-diverged)
+      printf 'The evidence supports a second live session: that process runs Claude session %s, whose transcript has diverged from the transcript of this session, so it has taken turns of its own.' \
+        "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    transcript-missing)
+      printf 'The evidence is inconclusive: that process runs Claude session %s, but a transcript needed to compare the two could not be read, so continuity was never tested.' \
+        "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    owner-unresolved)
+      printf 'The evidence supports the displaced predecessor of this session: no live Claude session record vouches for that process or for the harness run it heads, which is how a fork-displaced predecessor reads, and equally how a non-Claude primary or an already-exited session reads.' ;;
+    job-record-unproven)
+      printf 'The evidence is inconclusive: this session runs inside a Claude Code background job whose own record does not name Claude session %s as the session it continues, so continuity was never tested.' \
+        "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    owner-is-this-session)
+      printf 'The evidence is contradictory: that process resolves to the session id of this very session while sitting outside the harness ancestry of this process.' ;;
+    *)
+      printf 'The evidence is inconclusive: this process carries no Claude session id, so no continuity evidence could be produced at all, which is itself worth diagnosing.' ;;
   esac
 }
 budget_reset() {
@@ -206,7 +241,7 @@ block_stop() {
   x_mode=0
   [ -f "$CONFIG/x-mode.env" ] && x_mode=1
   if [ "$CLAUDE_MODE" -eq 1 ] && [ "$FOREIGN_LOCK_OWNER_ALIVE" -eq 1 ] && [ "$afk" -eq 0 ]; then
-    reason="this home's fleet lock records live process $FOREIGN_LOCK_OWNER_PID, which this session could not match to its own, so the Stop-owned auto-arm stayed inert and will never record a failure here. That process may be a second live session that owns recovery, or this session's own displaced predecessor whose continuity could not be proven - establish which before you rely on supervision running anywhere. Run bin/fm-lock.sh status to see what the recorded owner is, and inspect this session's own Stop hook registration too, because a broken hook is silent in exactly this way."
+    reason="this home's fleet lock records live process $FOREIGN_LOCK_OWNER_PID, which this session could not match to its own, so the Stop-owned auto-arm stayed inert and will never record a failure here. $(standdown_evidence) Inspect the Stop hook registration of this session as well, because a broken hook is silent in exactly this way."
   else
     reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
       || printf '%s\n' 'tasks in flight, no live watcher - repair missing watcher supervision according to the session-start operating block before ending the turn')
@@ -458,6 +493,7 @@ standdown_terminal_fail_open() {
     return 2
   fi
   fm_session_lock_foreign_owner_alive "$STATE" || return 1
+  capture_standdown_owner
   (set -C; : > "$FAILURE_ALARM") 2>/dev/null
 }
 
@@ -487,14 +523,15 @@ fi
 # without spending any of that budget (see the header comment).
 if fm_session_lock_foreign_owner_alive "$STATE"; then
   FOREIGN_LOCK_OWNER_ALIVE=1
-  FOREIGN_LOCK_OWNER_PID=$(recorded_lock_owner)
+  capture_standdown_owner
   [ ! -e "$STATE/.afk" ] || block_stop
   standdown_account || block_stop
   standdown_terminal_fail_open
   standdown_status=$?
   if [ "$standdown_status" -eq 0 ]; then
     NEED_DESC=$(need_desc)
-    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, this home fleet lock records live process %s which this session could not match to its own so the Stop-owned auto-arm stayed inert and will never record a failure here, no watcher or automatic continuation exists here, and the block budget is exhausted. Keep this session attended and establish what that recorded owner is - a second live session that owns recovery, or this session own displaced predecessor - with bin/fm-lock.sh status, and inspect this session own Stop hook registration too, because a broken hook is silent in exactly this way."}\n' "$NEED_DESC" "$FOREIGN_LOCK_OWNER_PID"
+    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, this home fleet lock records live process %s which this session could not match to its own so the Stop-owned auto-arm stayed inert and will never record a failure here, no watcher or automatic continuation exists here, and the block budget is exhausted. %s Keep this session attended, and inspect the Stop hook registration of this session as well, because a broken hook is silent in exactly this way."}\n' \
+      "$NEED_DESC" "$FOREIGN_LOCK_OWNER_PID" "$(standdown_evidence)"
     exit 0
   fi
   [ "$standdown_status" -eq 2 ] && exit 0

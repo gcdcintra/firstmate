@@ -1034,10 +1034,53 @@ EOF
 # cooperates with the Stop-owned auto-arm instead: allow on health, live owner
 # claim, or a fresh rewake epoch; bounded re-block only when none materialize.
 
+# A private Claude Code configuration root and a fixed claimant identity, so the
+# stood-down evidence these cases assert is decided by fixtures below rather than
+# by whichever sessions the machine running this suite happens to be hosting.
+GUARD_CLAUDE_CONFIG="$TMP_ROOT/claude-config"
+mkdir -p "$GUARD_CLAUDE_CONFIG/sessions" "$GUARD_CLAUDE_CONFIG/projects/probe"
+GUARD_SESSION_ID=00000000-0000-4000-9000-00000000000a
+GUARD_OWNER_SESSION_ID=00000000-0000-4000-9000-00000000000b
+
 run_hook_claude() {
   local dir=$1 stop_active=$2 home
   home=$(cd "$dir" && pwd)
-  printf '{"stop_hook_active":%s,"session_id":"sess-claude-mode"}' "$stop_active" | CLAUDECODE=1 FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1
+  printf '{"stop_hook_active":%s,"session_id":"sess-claude-mode"}' "$stop_active" \
+    | CLAUDECODE=1 FM_HOME="$home" \
+      CLAUDE_CONFIG_DIR="$GUARD_CLAUDE_CONFIG" \
+      CLAUDE_CODE_SESSION_ID="$GUARD_SESSION_ID" \
+      CLAUDE_JOB_DIR='' \
+      bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1
+}
+
+# Claude Code's own live-session record and transcript shapes, in that private
+# root, so a recorded lock owner can be made resolvable on purpose.
+register_guard_session() {  # <pid> <session-id>
+  local pid=$1 session_id=$2 start=''
+  [ ! -r "/proc/$pid/stat" ] || start=$(awk '{ print $22 }' "/proc/$pid/stat")
+  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
+    "$pid" "$session_id" "$start" > "$GUARD_CLAUDE_CONFIG/sessions/$pid.json"
+}
+
+write_guard_transcript() {  # <session-id> <uuid>...
+  local session_id=$1 uuid file
+  shift
+  file="$GUARD_CLAUDE_CONFIG/projects/probe/$session_id.jsonl"
+  : > "$file"
+  for uuid in "$@"; do
+    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
+      "$uuid" "$session_id" >> "$file"
+  done
+}
+
+guard_msg_uuid() {  # <n>
+  printf '00000000-0000-4000-8000-%012d\n' "$1"
+}
+
+# The registry proof binds a record to a process start time read from /proc, so
+# a resolvable owner can only be staged where that evidence exists.
+guard_fork_evidence_available() {
+  [ -r "/proc/$$/stat" ]
 }
 
 seed_claude_failure() {
@@ -1604,6 +1647,51 @@ test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded() {
   pass "fm-turnend-guard --claude: stood-down path names the real cause and stays bounded like the ordinary path"
 }
 
+# The operator cannot tell the two readings apart from the outside: bin/fm-lock.sh
+# status prints the same live-pid line for both, so the old banner asked for a
+# judgement no available command supports. The guard's own predicate does know
+# which sub-check refused, and both operator-facing texts must state it.
+test_hook_claude_mode_standdown_reports_an_unresolvable_owner_as_such() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-evidence-unresolved")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  release_foreign_lock_owner
+  expect_code 2 "$status" "an unresolvable recorded owner must still block within the budget"
+  assert_contains "$out" 'no live Claude session record vouches for that process' \
+    "the banner must state the sub-check that actually refused"
+  assert_contains "$out" 'displaced predecessor' "the banner must name the reading that evidence supports"
+  assert_not_contains "$out" 'bin/fm-lock.sh status' \
+    "the banner must not point at a command whose output is identical for both readings"
+  assert_contains "$out" 'Stop hook registration' "the banner must keep the hook registration in scope"
+  pass "fm-turnend-guard --claude: an owner no session record vouches for is reported as the displaced-predecessor reading"
+}
+
+test_hook_claude_mode_standdown_reports_a_diverged_owner_as_a_second_session() {
+  local dir out status
+  guard_fork_evidence_available || { pass "fm-turnend-guard --claude: a resolvable owner needs a process start time, unavailable here"; return; }
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-evidence-diverged")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  # A recorded owner the registry does vouch for, whose transcript has diverged
+  # from this session's: the genuinely-competing reading, on real evidence.
+  register_guard_session "$FOREIGN_LOCK_PID" "$GUARD_OWNER_SESSION_ID"
+  write_guard_transcript "$GUARD_OWNER_SESSION_ID" "$(guard_msg_uuid 1)" "$(guard_msg_uuid 2)" "$(guard_msg_uuid 9)"
+  write_guard_transcript "$GUARD_SESSION_ID" "$(guard_msg_uuid 1)" "$(guard_msg_uuid 2)" "$(guard_msg_uuid 3)"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  release_foreign_lock_owner
+  rm -f "$GUARD_CLAUDE_CONFIG/sessions/$FOREIGN_LOCK_PID.json"
+  expect_code 2 "$status" "a resolvable diverged owner must still block within the budget"
+  assert_contains "$out" 'The evidence supports a second live session' \
+    "the banner must report the second-live-session reading when the transcripts have diverged"
+  assert_contains "$out" "$GUARD_OWNER_SESSION_ID" "the banner must name the session it resolved the recorded owner to"
+  assert_not_contains "$out" 'displaced predecessor' \
+    "a resolved, diverged owner must not be reported as this session's own displaced predecessor"
+  assert_contains "$out" 'Stop hook registration' "the banner must keep the hook registration in scope"
+  pass "fm-turnend-guard --claude: a resolved owner whose transcript diverged is reported as a second live session"
+}
+
 test_hook_claude_mode_standdown_reaches_fail_open() {
   local dir out i status
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-failopen")
@@ -1616,11 +1704,20 @@ test_hook_claude_mode_standdown_reaches_fail_open() {
   done
   out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
   expect_code 0 "$status" "exhausted stood-down progression must reach the bounded attended fail-open"
+  printf '%s' "$out" | jq -e '.systemMessage | type == "string"' >/dev/null 2>&1 \
+    || fail "the stood-down fail-open alarm is not a readable systemMessage object: $out"
   assert_contains "$out" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "stood-down fail-open alarm was not unmistakable"
   assert_contains "$out" "$FOREIGN_LOCK_PID" "stood-down fail-open alarm did not name the recorded lock owner it read"
   assert_contains "$out" 'Keep this session attended' "stood-down fail-open alarm omitted the attended-session action"
   assert_not_contains "$out" 'correctly stays inert' "stood-down fail-open alarm must not assert the inertness is correct"
   assert_not_contains "$out" 'wait for that other session' "stood-down fail-open alarm must not direct the operator to wait on an unproven second session"
+  assert_contains "$out" 'no live Claude session record vouches for that process' \
+    "stood-down fail-open alarm must carry the same discriminating evidence as the banner"
+  assert_not_contains "$out" 'bin/fm-lock.sh status' \
+    "stood-down fail-open alarm must not point at a command whose output is identical for both readings"
+  assert_contains "$out" 'the Stop hook registration of this session' \
+    "stood-down fail-open alarm must keep the hook registration in scope, in grammatical apostrophe-free wording"
+  assert_not_contains "$out" 'this session own ' "stood-down fail-open alarm printed a dropped possessive"
   assert_present "$dir/state/.claude-autoarm-failure-alarmed" "stood-down fail-open did not consume the shared episode alarm"
   out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
   release_foreign_lock_owner
@@ -1811,6 +1908,8 @@ test_hook_claude_mode_allow_resets_budget
 test_hook_claude_mode_waits_for_late_claim
 test_hook_claude_mode_secondmate_reblocks_like_primary
 test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded
+test_hook_claude_mode_standdown_reports_an_unresolvable_owner_as_such
+test_hook_claude_mode_standdown_reports_a_diverged_owner_as_a_second_session
 test_hook_claude_mode_standdown_reaches_fail_open
 test_hook_claude_mode_standdown_recovery_clears_episode_state
 test_hook_claude_mode_dead_foreign_lock_owner_uses_ordinary_path

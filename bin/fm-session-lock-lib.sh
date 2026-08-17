@@ -140,6 +140,24 @@ fm_harness_pid_alive() {
   fm_harness_process_matches "$comm" "$args"
 }
 
+# True when pid $1 is ANY harness ancestor of the current process, i.e. this
+# process runs inside the same contiguous verified-harness run as that pid.
+# ONE owner of that membership relation, so every predicate below decides "the
+# same run" the same way and none of them re-reads the lock to ask it.
+fm_harness_ancestry_contains_pid() {  # <pid>
+  local want=$1 pids pid
+  case "$want" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  pids=$(fm_harness_ancestry_pids) || return 1
+  while IFS= read -r pid; do
+    [ "$pid" = "$want" ] && return 0
+  done <<EOF
+$pids
+EOF
+  return 1
+}
+
 # True when state dir $1 holds a session lock whose pid is ANY harness ancestor
 # of the current process: this script runs inside the session that owns the
 # home's fleet lock. Membership is the honest test of that question, because the
@@ -149,18 +167,9 @@ fm_harness_pid_alive() {
 # lock, a malformed lock, a lock held by a harness outside this ancestry, or an
 # ancestry that cannot be resolved all fail closed.
 fm_session_lock_owned_by_self() {
-  local state=$1 lock_pid pids pid
+  local state=$1 lock_pid
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
-  case "$lock_pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  pids=$(fm_harness_ancestry_pids) || return 1
-  while IFS= read -r pid; do
-    [ "$pid" = "$lock_pid" ] && return 0
-  done <<EOF
-$pids
-EOF
-  return 1
+  fm_harness_ancestry_contains_pid "$lock_pid"
 }
 
 # --- fork descent ------------------------------------------------------------
@@ -234,9 +243,10 @@ fm_claude_record_field() {  # <file> <key>
   printf '%s\n' "$value"
 }
 
-# True when this process runs inside a Claude Code background job that the
-# harness created to CONTINUE another session - the only job shape a fork
-# continuation can have.
+# True when THIS claimant's own Claude Code background job was created to
+# CONTINUE the session that holds the lock - the only job shape a fork
+# continuation can have. $1 is this claimant's session id and $2 the session id
+# the recorded lock owner resolves to.
 #
 # Claude Code has exactly one background-session feature, `claude --bg`, and its
 # own help calls what that starts a background agent. The same feature serves
@@ -248,12 +258,22 @@ fm_claude_record_field() {  # <file> <key>
 #
 # The job's own record separates the two by construction: a job that resumed or
 # forked an existing session names that session in resumeSessionId, while a
-# task-seeded worker names its own id there and starts a transcript that shares
-# no message uuid with anyone. A worker is therefore refused here AND by the
-# transcript proof below. A record that is absent, unreadable, malformed, or
-# self-naming fails closed into today's refusal.
-fm_claude_job_continues_another_session() {
-  local dir=${CLAUDE_JOB_DIR:-} record own resumed
+# task-seeded worker names its own id there. Three facts are required, because
+# the record alone attributes nothing:
+#
+#   1. the record continues someone else at all (resumeSessionId != sessionId),
+#      which is what refuses a task-seeded worker before any transcript is read;
+#   2. the record is THIS claimant's own job, not one inherited through the
+#      environment - CLAUDE_JOB_DIR is exported to every descendant process, so a
+#      nested session started inside a backgrounded one reads its ANCESTOR's
+#      record and would otherwise claim on evidence about a different session;
+#   3. the session it continues is the one the lock actually records, so the
+#      record cannot vouch for continuity with a session that is not the owner.
+#
+# A record that is absent, unreadable, malformed, self-naming, or about anyone
+# other than this claimant and this lock owner fails closed into today's refusal.
+fm_claude_job_continues_another_session() {  # <own-session-id> <owner-session-id>
+  local own_session=$1 owner_session=$2 dir=${CLAUDE_JOB_DIR:-} record own resumed
   [ -n "$dir" ] || return 1
   record="$dir/state.json"
   [ -f "$record" ] && [ ! -L "$record" ] || return 1
@@ -262,14 +282,15 @@ fm_claude_job_continues_another_session() {
   case "$own$resumed" in
     *[!0-9a-fA-F-]*) return 1 ;;
   esac
-  [ "$resumed" != "$own" ]
+  [ "$resumed" != "$own" ] || return 1
+  [ "$own" = "$own_session" ] || return 1
+  [ "$resumed" = "$owner_session" ]
 }
 
-# Print the Claude session id that live pid $1 is running, proven by the
-# harness's own registry, or return 1. The record's own pid and process start
-# time must both match the live process, so a recycled pid can never inherit a
-# dead session's identity.
-fm_claude_session_id_of_pid() {  # <pid>
+# Print the Claude session id the harness registry vouches for live pid $1, or
+# return 1. The record's own pid and process start time must both match the live
+# process, so a recycled pid can never inherit a dead session's identity.
+fm_claude_session_record_id() {  # <pid>
   local pid=$1 cfg record record_pid record_start live_start session_id
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
@@ -287,6 +308,72 @@ fm_claude_session_id_of_pid() {  # <pid>
     ''|*[!0-9a-fA-F-]*) return 1 ;;
   esac
   printf '%s\n' "$session_id"
+}
+
+# True when live pid $2 is live pid $1 itself, or an ancestor of it reached
+# without ever leaving one contiguous Claude harness run: the same relation
+# fm_harness_ancestry_pids models for THIS process, evaluated for another.
+#
+# Every process on the walk must be a verified Claude harness process, so the
+# walk can never cross a gap into an unrelated harness further up the real
+# process tree, and no non-Claude harness is reachable through it at all.
+fm_harness_run_hosts_pid() {  # <inner-pid> <outer-pid>
+  local pid=$1 outer=$2 comm args
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$outer" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    fm_harness_process_matches "$comm" "$args" || return 1
+    [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || return 1
+    [ "$pid" = "$outer" ] && return 0
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || break
+  done
+  return 1
+}
+
+# Print the Claude session id that live pid $1 is running, or return 1.
+#
+# The registry keys its records on the SESSION pid, while the session lock
+# records the outermost pid of the contiguous harness run
+# (fm_harness_ancestry_pid). Those are the same pid for an ordinary session, and
+# different for one running in the background, whose run is headed by a
+# `claude bg-pty-host` process the registry never records - the shape this
+# fleet's own primary runs in. So the pid's own record answers when there is one,
+# and otherwise the one live record whose session pid that run hosts does.
+#
+# Nothing is weakened by the second step: the walk stays inside one contiguous
+# Claude run, so an unrelated live session is never reachable, and two session
+# records inside one run is ambiguity rather than an answer - refused like every
+# other unresolvable input here. A recorded owner the registry vouches for
+# nowhere in its run keeps the unchanged refusal.
+fm_claude_session_id_of_pid() {  # <pid>
+  local pid=$1 cfg record candidate session_id found=''
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fm_claude_session_record_id "$pid" && return 0
+  cfg=$(fm_claude_config_dir) || return 1
+  for record in "$cfg"/sessions/*.json; do
+    [ -f "$record" ] && [ ! -L "$record" ] || continue
+    candidate=${record##*/}
+    candidate=${candidate%.json}
+    case "$candidate" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$candidate" != "$pid" ] || continue
+    session_id=$(fm_claude_session_record_id "$candidate") || continue
+    fm_harness_run_hosts_pid "$candidate" "$pid" || continue
+    [ -z "$found" ] || return 1
+    found=$session_id
+  done
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
 }
 
 # Print the one transcript file recorded for Claude session id $1, or return 1.
@@ -331,28 +418,79 @@ fm_transcript_strictly_extends() {  # <ancestor-file> <descendant-file>
   ' "$1" "$2"
 }
 
+# --- published refusal evidence ----------------------------------------------
+#
+# The predicate below refuses for materially different reasons, and no command
+# available to an operator separates them from the outside: `bin/fm-lock.sh
+# status` prints the same live-pid line whether the recorded owner is a second
+# session genuinely in use or this session's own displaced predecessor. The
+# predicate is the only place that knows which sub-check refused, so it publishes
+# that, and callers report it instead of asking the operator to establish what
+# nothing they can run will tell them (2026-08-14 incident).
+#
+# FM_CLAUDE_FORK_EVIDENCE is one of:
+#   no-session-identity   this process carries no Claude session id at all, so
+#                         no continuity evidence can be produced.
+#   owner-unresolved      no live Claude session record vouches for the recorded
+#                         pid or for the harness run it heads.
+#   owner-is-this-session the recorded owner resolves to this session's own id.
+#   job-record-unproven   this claimant runs inside a background job whose record
+#                         does not show it continues the recorded owner.
+#   transcript-missing    a transcript needed for the comparison is unreadable.
+#   transcript-diverged   the owner's transcript is not a strict prefix of this
+#                         session's: it has taken turns of its own.
+#   fork-proven           no refusal; descent was proven.
+# FM_CLAUDE_FORK_OWNER_SESSION carries the owner's resolved session id, or is
+# empty when the owner was never resolved.
+FM_CLAUDE_FORK_EVIDENCE='no-session-identity'
+FM_CLAUDE_FORK_OWNER_SESSION=''
+
 # True when THIS process's Claude session provably descends, by fork, from the
 # session that live pid $1 is running, and that source session has produced
 # nothing since the fork.
 #
 # A session running inside a Claude Code background job may only claim when that
-# job's own record shows it continues another session, so a task-seeded worker is
-# refused before any transcript is read.
+# job's own record shows this claimant continues this recorded owner, so a
+# task-seeded worker, and a nested session reading an ancestor's inherited job
+# record, are both refused before any transcript is read.
 fm_claude_fork_descendant_of_pid() {  # <pid>
   local owner_pid=$1 own_session owner_session own_transcript owner_transcript
-  if [ -n "${CLAUDE_JOB_DIR:-}" ]; then
-    fm_claude_job_continues_another_session || return 1
-  fi
+  FM_CLAUDE_FORK_EVIDENCE='no-session-identity'
+  FM_CLAUDE_FORK_OWNER_SESSION=''
   own_session=${CLAUDE_CODE_SESSION_ID:-}
   case "$own_session" in
     ''|*[!0-9a-fA-F-]*) return 1 ;;
   esac
+  FM_CLAUDE_FORK_EVIDENCE='owner-unresolved'
   owner_session=$(fm_claude_session_id_of_pid "$owner_pid") || return 1
+  FM_CLAUDE_FORK_OWNER_SESSION=$owner_session
+  FM_CLAUDE_FORK_EVIDENCE='owner-is-this-session'
   [ "$owner_session" != "$own_session" ] || return 1
+  if [ -n "${CLAUDE_JOB_DIR:-}" ]; then
+    FM_CLAUDE_FORK_EVIDENCE='job-record-unproven'
+    fm_claude_job_continues_another_session "$own_session" "$owner_session" || return 1
+  fi
+  FM_CLAUDE_FORK_EVIDENCE='transcript-missing'
   own_transcript=$(fm_claude_transcript_of_session "$own_session") || return 1
   owner_transcript=$(fm_claude_transcript_of_session "$owner_session") || return 1
-  fm_transcript_strictly_extends "$owner_transcript" "$own_transcript"
+  FM_CLAUDE_FORK_EVIDENCE='transcript-diverged'
+  fm_transcript_strictly_extends "$owner_transcript" "$own_transcript" || return 1
+  FM_CLAUDE_FORK_EVIDENCE='fork-proven'
 }
+
+# What the single deciding read in fm_session_lock_foreign_owner_alive() below
+# saw, published so a caller's operator-facing message can never name a pid, a
+# session, or a reason that decision did not use. The lock is read exactly once
+# per call and every one of these comes from that read; a caller that re-read it
+# for its banner could name whatever a third writer put there in between.
+# FM_SESSION_LOCK_OWNER_PID is "unknown" for an absent or malformed lock, and
+# FM_SESSION_LOCK_OWNER_EVIDENCE carries the FM_CLAUDE_FORK_EVIDENCE token above.
+# shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
+FM_SESSION_LOCK_OWNER_PID=unknown
+# shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
+FM_SESSION_LOCK_OWNER_SESSION=''
+# shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
+FM_SESSION_LOCK_OWNER_EVIDENCE='owner-unresolved'
 
 # True when state dir $1's session lock is held by a LIVE harness process that
 # is not this process's own ancestry AND is not this session's proven fork
@@ -360,17 +498,26 @@ fm_claude_fork_descendant_of_pid() {  # <pid>
 # Stop-owned auto-arm (bin/fm-claude-stop-autoarm.sh) stays inert rather than
 # contesting the recorded owner. Callers must not report that owner as a proven
 # second session: an unproven fork source lands here too, and the 2026-08-14
-# incident was an evening of turn-end blocks asserting exactly that.
+# incident was an evening of turn-end blocks asserting exactly that - report the
+# published evidence above instead.
 # False for a missing/malformed lock and false for a dead recorded owner - both
 # remain this caller's own uncertainty or stale-owner cases to handle, not a
 # foreign live owner.
+# shellcheck disable=SC2034 # The FM_SESSION_LOCK_OWNER_* globals it publishes are read by bin/fm-turnend-guard.sh, not this lib.
 fm_session_lock_foreign_owner_alive() {
   local state=$1 lock_pid
+  FM_SESSION_LOCK_OWNER_PID='unknown'
+  FM_SESSION_LOCK_OWNER_SESSION=''
+  FM_SESSION_LOCK_OWNER_EVIDENCE='owner-unresolved'
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
   case "$lock_pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  fm_session_lock_owned_by_self "$state" && return 1
+  FM_SESSION_LOCK_OWNER_PID=$lock_pid
+  fm_harness_ancestry_contains_pid "$lock_pid" && return 1
   fm_harness_pid_alive "$lock_pid" || return 1
-  ! fm_claude_fork_descendant_of_pid "$lock_pid"
+  fm_claude_fork_descendant_of_pid "$lock_pid" && return 1
+  FM_SESSION_LOCK_OWNER_SESSION=$FM_CLAUDE_FORK_OWNER_SESSION
+  FM_SESSION_LOCK_OWNER_EVIDENCE=$FM_CLAUDE_FORK_EVIDENCE
+  return 0
 }

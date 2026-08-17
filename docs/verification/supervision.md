@@ -675,7 +675,11 @@ positional prefix match with each: 0
 
 A task-seeded job therefore fails the transcript proof on its own evidence, independently of the job-record test.
 
-One measured limitation remains.
+`CLAUDE_JOB_DIR` is exported to every descendant process, so a record read through it attributes nothing on its own.
+The claim therefore requires the record to name the claimant's own session id and to name the recorded lock owner's resolved session as the one it continues, which is what refuses a nested session reading an ancestor's record.
+
+### Resolving a lock that records a backgrounded run
+
 The live-session registry keys on the session process pid, never on the `claude bg-pty-host` process a backgrounded session runs under - and that host process is the outermost pid of the contiguous harness run, so it is what the lock records for such a session:
 
 ```text
@@ -686,8 +690,21 @@ ps -o pid=,ppid=  2529774        2529774 2529590  (the session process)
 ~/.claude/sessions/2529590.json  absent
 ```
 
-Ownership itself is unaffected, because `fm_session_lock_owned_by_self` tests membership of the whole contiguous run.
-Fork recovery is affected: a lock recorded this way cannot be resolved to a session id, so a later fork of a backgrounded session keeps the unchanged refusal.
+Ownership itself was never affected, because `fm_session_lock_owned_by_self` tests membership of the whole contiguous run.
+Fork recovery was: resolving the recorded owner only through its own registry record left a fork of a backgrounded source unable to reclaim its home, which is the same inert-auto-arm symptom one hop later, and this fleet's own primary runs in exactly that topology.
+
+`fm_claude_session_id_of_pid` therefore falls back to the one live record whose session pid the recorded pid's own contiguous Claude run hosts.
+Measured against that live table on 2026-08-17, from the repo checkout:
+
+```text
+direct record of host pid 2529590        UNRESOLVED
+widened resolve of host pid 2529590      0b5c32a9-054a-44ce-acc1-9ad39553f7d3
+run hosts (2529774 under 2529590)        yes
+run hosts (2529774 under 1315077)        no      (a different live bg-pty-host)
+widened resolve of unrelated pid 484999  UNRESOLVED
+```
+
+The boundary is unchanged in every other direction, because the walk never leaves one contiguous Claude run: a session in another run is not reachable at all, two session records inside one run are ambiguity rather than an answer, and a recorded owner the registry vouches for nowhere in its run keeps the unchanged refusal - as does every non-Claude primary, which the walk rejects at its first hop.
 
 Deterministic entry points:
 

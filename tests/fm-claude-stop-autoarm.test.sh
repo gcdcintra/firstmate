@@ -58,6 +58,39 @@ msg_uuid() {  # <n>
 
 FORK_SOURCE_SESSION=00000000-0000-4000-9000-000000000001
 FORK_CHILD_SESSION=00000000-0000-4000-9000-000000000002
+NESTED_SESSION=00000000-0000-4000-9000-000000000003
+
+# A backgrounded Claude session as the process table really shows it: a
+# harness-named host process with the session process as its own child. The lock
+# records the host, because that is the outermost pid of the contiguous run,
+# while the harness registry only ever keys a record on the session pid.
+BG_HOST_SCRIPT="$TMP_ROOT/bg-host.sh"
+cat > "$BG_HOST_SCRIPT" <<'SH'
+#!/usr/bin/env bash
+# $1 = directory to publish the session pid into, $2 = harness-named interpreter.
+"$2" -c 'printf "%s\n" "$$" > "$0/session-pid"; while :; do sleep 0.2; done' "$1" &
+wait
+SH
+
+BG_HOST_PID=
+BG_SESSION_PID=
+spawn_backgrounded_session_run() {  # <name>
+  local dir="$TMP_ROOT/bg-run-$1" i=0
+  mkdir -p "$dir"
+  "$FAKE_CLAUDE" "$BG_HOST_SCRIPT" "$dir" "$FAKE_CLAUDE" >/dev/null 2>&1 &
+  BG_HOST_PID=$!
+  while [ "$i" -lt 200 ] && [ ! -s "$dir/session-pid" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -s "$dir/session-pid" ] || fail "the backgrounded-run fixture never started its session process"
+  BG_SESSION_PID=$(tr -d '[:space:]' < "$dir/session-pid")
+}
+
+stop_backgrounded_session_run() {
+  kill "$BG_SESSION_PID" "$BG_HOST_PID" 2>/dev/null || true
+  wait "$BG_HOST_PID" 2>/dev/null || true
+}
 
 # A Claude Code background-job directory of the shape `claude --bg` writes, and
 # print it for CLAUDE_JOB_DIR. $1 names the job's own session and $2 the session
@@ -460,6 +493,78 @@ test_inert_for_a_task_seeded_background_job() {
   pass "auto-arm: a task-seeded background job never claims the home it did not continue"
 }
 
+# The residual half of the same defect, through the same hook: this fleet's own
+# primary is a fork of a source that was ITSELF backgrounded, so state/.lock
+# names that source's HOST process and the harness registry keys only its session
+# pid. Resolving the recorded owner through its own record alone left the fork
+# inert on every Stop for exactly the reported reason, one hop later.
+test_reclaims_lock_recorded_as_a_backgrounded_source_host() {
+  local dir job out status owner_after session_state
+  fork_evidence_available || { pass "auto-arm: backgrounded-source host case needs a process start time, refused everywhere else"; return; }
+  dir=$(make_primary_dir "$TMP_ROOT/fork-source-bg-host")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  spawn_backgrounded_session_run autoarm-source
+  printf '%s\n' "$BG_HOST_PID" > "$dir/state/.lock"
+  register_claude_session "$BG_SESSION_PID" "$FORK_SOURCE_SESSION"
+  write_claude_transcript "$FORK_SOURCE_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_claude_transcript "$FORK_CHILD_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  job=$(make_job_dir autoarm-fork-of-backgrounded "$FORK_CHILD_SESSION" "$FORK_SOURCE_SESSION")
+  out=$(printf '%s\n' '{"session_id":"bghost"}' \
+    | CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID="$FORK_CHILD_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+        printf "%s\n" "$$" > "$FM_HOME/state/expected-owner"
+        "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
+      ' 2>&1); status=$?
+  owner_after=$(cat "$dir/state/.lock")
+  session_state=$(ps -o state= -p "$BG_SESSION_PID" 2>/dev/null || true)
+  stop_backgrounded_session_run
+  expect_code 2 "$status" "a fork of a backgrounded source must reclaim the home whose lock records that source host"
+  case "$session_state" in
+    ''|*Z*) fail "the reclaim killed the backgrounded source: a live captain-visible window must never be killed" ;;
+  esac
+  [ "$owner_after" = "$(cat "$dir/state/expected-owner")" ] \
+    || fail "the fork did not take the home from its backgrounded source: lock names $owner_after"
+  [ -e "$dir/state/arm-ran" ] || fail "supervision never armed after the fork reclaimed the home"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "a reclaim from a backgrounded source must record outcome=rewake"
+  assert_not_contains "$out" "another live firstmate session" "the reclaim must not report a competing session"
+  pass "auto-arm: a fork of a backgrounded source reclaims the home whose lock records that source host pid"
+}
+
+test_inert_for_a_nested_session_reading_an_inherited_job_record() {
+  local dir source_pid job out status owner_after source_state
+  fork_evidence_available || { pass "auto-arm: inherited-job-record case needs a process start time, refused everywhere else"; return; }
+  dir=$(make_primary_dir "$TMP_ROOT/nested-inherited-job")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  "$FAKE_CLAUDE" -c 'sleep 60; :' &
+  source_pid=$!
+  printf '%s\n' "$source_pid" > "$dir/state/.lock"
+  register_claude_session "$source_pid" "$FORK_SOURCE_SESSION"
+  write_claude_transcript "$FORK_SOURCE_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_claude_transcript "$NESTED_SESSION" "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # CLAUDE_JOB_DIR is exported to every descendant, so a session started inside a
+  # backgrounded one reads its ANCESTOR's record: a genuine continuation record,
+  # about a different session than the one claiming here.
+  job=$(make_job_dir autoarm-nested "$FORK_CHILD_SESSION" "$FORK_SOURCE_SESSION")
+  out=$(printf '%s\n' '{"session_id":"nested"}' \
+    | CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID="$NESTED_SESSION" FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+        "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
+      ' 2>&1); status=$?
+  owner_after=$(cat "$dir/state/.lock")
+  source_state=$(ps -o state= -p "$source_pid" 2>/dev/null || true)
+  kill "$source_pid" 2>/dev/null || true
+  wait "$source_pid" 2>/dev/null || true
+  expect_code 0 "$status" "a nested session reading an inherited job record must stay inert"
+  [ "$owner_after" = "$source_pid" ] || fail "a nested session took the home on its ancestor's job record: lock names $owner_after"
+  case "$source_state" in
+    ''|*Z*) fail "the refusal killed the recorded owner: a live captain-visible window must never be killed" ;;
+  esac
+  [ ! -e "$dir/state/arm-ran" ] || fail "a nested session armed supervision on evidence about a different session"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "a nested session wrote an epoch"
+  assert_not_contains "$out" "lock acquired" "a nested session must never acquire the home lock"
+  pass "auto-arm: a nested session never claims on a job record inherited from its ancestor"
+}
+
 test_inert_when_afk() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/afk")
@@ -820,6 +925,8 @@ test_reclaims_lock_from_quiescent_fork_source
 test_inert_when_fork_source_resumed_work
 test_reclaims_lock_from_quiescent_fork_source_in_a_background_job
 test_inert_for_a_task_seeded_background_job
+test_reclaims_lock_recorded_as_a_backgrounded_source_host
+test_inert_for_a_nested_session_reading_an_inherited_job_record
 test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain

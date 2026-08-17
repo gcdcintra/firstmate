@@ -308,6 +308,37 @@ make_job_dir() {  # <name> <own-session-id> <resumed-session-id>
   printf '%s\n' "$dir"
 }
 
+# A backgrounded Claude session as the process table really shows it: a
+# harness-named host process with the session process as its own child, so the
+# outermost pid of the contiguous run - the pid the session lock records - is a
+# process the harness registry never keys a record on.
+BG_HOST_SCRIPT="$TMP_ROOT/bg-host.sh"
+cat > "$BG_HOST_SCRIPT" <<'SH'
+#!/usr/bin/env bash
+# $1 = directory to publish the session pid into, $2 = harness-named interpreter.
+"$2" -c 'printf "%s\n" "$$" > "$0/session-pid"; while :; do sleep 0.2; done' "$1" &
+wait
+SH
+
+# Publish one such run: BG_HOST_PID is what a lock would record for it, and
+# BG_SESSION_PID is the only pid in it the registry ever records.
+BG_HOST_PID=
+BG_SESSION_PID=
+spawn_backgrounded_session_run() {  # <name>
+  local dir="$TMP_ROOT/bg-run-$1" i=0
+  mkdir -p "$dir"
+  "$NAMED_CLAUDE" "$BG_HOST_SCRIPT" "$dir" "$NAMED_CLAUDE" >/dev/null 2>&1 &
+  BG_HOST_PID=$!
+  FORK_HELPER_PIDS+=("$BG_HOST_PID")
+  while [ "$i" -lt 200 ] && [ ! -s "$dir/session-pid" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -s "$dir/session-pid" ] || fail "the backgrounded-run fixture never started its session process"
+  BG_SESSION_PID=$(tr -d '[:space:]' < "$dir/session-pid")
+  FORK_HELPER_PIDS+=("$BG_SESSION_PID")
+}
+
 # Evaluate one library expression against the REAL process table.
 lib_run() {  # <expression>
   local expr=$1
@@ -451,6 +482,80 @@ test_backgrounded_session_whose_source_resumed_work_is_refused() {
     fail "a backgrounded session took the home from a source that had resumed work"
   fi
   pass "fork descent: a backgrounded session whose source resumed work is still refused"
+}
+
+# The residual half of the same defect: this fleet's own primary is a fork of a
+# source that was ITSELF backgrounded, so the lock records that source's host
+# process and the registry keys only its session pid. Resolving the recorded
+# owner only through its own record left that fork unable to reclaim its home -
+# the identical inert-auto-arm, blocked-every-turn symptom, one hop later.
+test_fork_of_a_backgrounded_source_resolves_the_run_the_lock_records() {
+  local job
+  proc_start_available || { pass "fork descent: backgrounded-source case needs /proc, refused everywhere else"; return; }
+  spawn_backgrounded_session_run source
+  register_session "$BG_SESSION_PID" 00000000-0000-4000-9000-000000000021
+  [ ! -e "$CLAUDE_CONFIG_DIR/sessions/$BG_HOST_PID.json" ] \
+    || fail "the fixture registered the host pid, which is exactly what the harness never does"
+  write_transcript 00000000-0000-4000-9000-000000000021 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000022 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  job=$(make_job_dir fork-of-backgrounded 00000000-0000-4000-9000-000000000022 00000000-0000-4000-9000-000000000021)
+  CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000022 \
+    lib_run "fm_claude_fork_descendant_of_pid $BG_HOST_PID" \
+    || fail "a fork of a backgrounded source could not resolve the run its lock records"
+  pass "fork descent: a lock naming the host of a backgrounded run resolves to the session that run hosts"
+}
+
+test_live_session_outside_the_recorded_run_is_never_borrowed() {
+  local owner
+  proc_start_available || { pass "fork descent: outside-the-run case needs /proc, refused everywhere else"; return; }
+  # A live, registered, harness-named session exists - just not inside the run
+  # the lock records. Borrowing it would hand an unrelated session's identity to
+  # the recorded owner, which is the whole boundary the run walk must keep.
+  spawn_backgrounded_session_run outsider
+  register_session "$BG_SESSION_PID" 00000000-0000-4000-9000-000000000023
+  write_transcript 00000000-0000-4000-9000-000000000023 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000024 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  spawn_owner_process; owner=$OWNER_PID
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000024 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "an unrelated live session record was borrowed to resolve a recorded owner"
+  fi
+  pass "fork descent: a live session outside the run the lock records is never borrowed to resolve it"
+}
+
+test_inherited_ancestor_job_record_never_claims() {
+  local owner job
+  proc_start_available || { pass "fork descent: inherited-job-record case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000025
+  write_transcript 00000000-0000-4000-9000-000000000025 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000026 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # CLAUDE_JOB_DIR is exported to every descendant process, so a nested session
+  # started inside a backgrounded one reads its ANCESTOR's record. That record
+  # proves a continuation, but of a different session than the one claiming.
+  job=$(make_job_dir inherited-ancestor 00000000-0000-4000-9000-000000000027 00000000-0000-4000-9000-000000000025)
+  if CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000026 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a nested session claimed the home on a job record belonging to its ancestor"
+  fi
+  pass "fork descent: a job record inherited from an ancestor never proves THIS claimant continued anyone"
+}
+
+test_job_record_continuing_a_different_session_is_refused() {
+  local owner job
+  proc_start_available || { pass "fork descent: other-source-job case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000028
+  write_transcript 00000000-0000-4000-9000-000000000028 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000029 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # This claimant's own job record, naming a third session as the one it
+  # continues: it vouches for nothing about the session the lock actually holds.
+  job=$(make_job_dir other-source 00000000-0000-4000-9000-000000000029 00000000-0000-4000-9000-000000000099)
+  if CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000029 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a job record continuing some other session claimed descent from the recorded owner"
+  fi
+  pass "fork descent: a job record that continues a session other than the recorded owner is refused"
 }
 
 test_recycled_pid_record_is_rejected() {
@@ -637,6 +742,10 @@ test_task_seeded_background_job_never_claims_by_fork_evidence
 test_backgrounded_session_claims_its_own_quiescent_source
 test_backgrounded_session_with_an_unreadable_job_record_is_refused
 test_backgrounded_session_whose_source_resumed_work_is_refused
+test_fork_of_a_backgrounded_source_resolves_the_run_the_lock_records
+test_live_session_outside_the_recorded_run_is_never_borrowed
+test_inherited_ancestor_job_record_never_claims
+test_job_record_continuing_a_different_session_is_refused
 test_recycled_pid_record_is_rejected
 test_live_owner_without_a_session_record_is_refused
 test_missing_own_session_identity_is_refused
