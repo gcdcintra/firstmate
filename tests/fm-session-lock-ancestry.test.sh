@@ -296,6 +296,18 @@ msg_uuid() {  # <n>
   printf '00000000-0000-4000-8000-%012d\n' "$1"
 }
 
+# A Claude Code background-job directory of the shape `claude --bg` writes, and
+# print it for CLAUDE_JOB_DIR. $1 names the job's own session and $2 the session
+# it was created to continue; passing the same value for both is the shape a job
+# seeded with its own task carries.
+make_job_dir() {  # <name> <own-session-id> <resumed-session-id>
+  local dir="$TMP_ROOT/jobs/$1"
+  mkdir -p "$dir"
+  printf '{\n  "sessionId": "%s",\n  "resumeSessionId": "%s",\n  "template": "bg",\n  "backend": "daemon"\n}\n' \
+    "$2" "$3" > "$dir/state.json"
+  printf '%s\n' "$dir"
+}
+
 # Evaluate one library expression against the REAL process table.
 lib_run() {  # <expression>
   local expr=$1
@@ -364,20 +376,81 @@ test_identical_transcript_is_not_an_ancestor() {
   pass "fork descent: matching the source's transcript is not extending it"
 }
 
-test_background_agent_never_claims_by_fork_evidence() {
-  local owner
-  proc_start_available || { pass "fork descent: background-agent case needs /proc, refused everywhere else"; return; }
+test_task_seeded_background_job_never_claims_by_fork_evidence() {
+  local owner job
+  proc_start_available || { pass "fork descent: task-seeded-job case needs /proc, refused everywhere else"; return; }
   spawn_owner_process; owner=$OWNER_PID
   register_session "$owner" 00000000-0000-4000-9000-000000000009
   write_transcript 00000000-0000-4000-9000-000000000009 "$(msg_uuid 1)" "$(msg_uuid 2)"
   write_transcript 00000000-0000-4000-9000-000000000010 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
-  # Claude Code seeds a background agent by forking the live session, so the
-  # transcript evidence alone would let a worker take its captain's home.
-  if CLAUDE_JOB_DIR=/tmp/job CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000010 \
+  # A worker `claude --bg` seeded with its own task records itself as the session
+  # it continues, so it must be refused even where the transcript proof is
+  # satisfied - which a real one never is, since it forks no one.
+  job=$(make_job_dir seeded 00000000-0000-4000-9000-000000000010 00000000-0000-4000-9000-000000000010)
+  if CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000010 \
     lib_run "fm_claude_fork_descendant_of_pid $owner"; then
-    fail "a background agent claimed the home on fork evidence"
+    fail "a task-seeded background job claimed the home on fork evidence"
   fi
-  pass "fork descent: a background agent is excluded even with a satisfied transcript proof"
+  pass "fork descent: a task-seeded background job is excluded even with a satisfied transcript proof"
+}
+
+# The 2026-08-14 defect: Claude Code gives a session the operator moved into the
+# background the same CLAUDE_JOB_DIR it gives a task-seeded worker, so treating
+# that variable as the worker test left a backgrounded primary permanently unable
+# to re-claim its own home - the guard then blocked every turn end reporting a
+# competing session, and supervision never re-armed.
+test_backgrounded_session_claims_its_own_quiescent_source() {
+  local owner job
+  proc_start_available || { pass "fork descent: backgrounded-session case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000015
+  write_transcript 00000000-0000-4000-9000-000000000015 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000016 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  job=$(make_job_dir backgrounded 00000000-0000-4000-9000-000000000016 00000000-0000-4000-9000-000000000015)
+  CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000016 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner" \
+    || fail "a backgrounded session could not prove descent from its own quiescent source"
+  pass "fork descent: a backgrounded session proves descent from its own quiescent source"
+}
+
+test_backgrounded_session_with_an_unreadable_job_record_is_refused() {
+  local owner job
+  proc_start_available || { pass "fork descent: unreadable-job-record case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000017
+  write_transcript 00000000-0000-4000-9000-000000000017 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000018 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # A job whose record cannot be read says nothing about what it continues, so
+  # the claim fails closed rather than assuming the permissive reading.
+  mkdir -p "$TMP_ROOT/jobs/recordless"
+  if CLAUDE_JOB_DIR="$TMP_ROOT/jobs/recordless" \
+    CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000018 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a job with no readable record claimed descent"
+  fi
+  job=$(make_job_dir malformed 00000000-0000-4000-9000-000000000018 'not a session id')
+  if CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000018 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a job record naming a malformed continued session claimed descent"
+  fi
+  pass "fork descent: a background job whose record does not prove a continued session is refused"
+}
+
+test_backgrounded_session_whose_source_resumed_work_is_refused() {
+  local owner job
+  proc_start_available || { pass "fork descent: backgrounded resumed-source case needs /proc, refused everywhere else"; return; }
+  spawn_owner_process; owner=$OWNER_PID
+  register_session "$owner" 00000000-0000-4000-9000-000000000019
+  # The continued session is genuinely this job's source, but it took its own
+  # turn after the fork: two live sessions in use, which must still be refused.
+  write_transcript 00000000-0000-4000-9000-000000000019 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 40)"
+  write_transcript 00000000-0000-4000-9000-000000000020 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  job=$(make_job_dir backgrounded-active 00000000-0000-4000-9000-000000000020 00000000-0000-4000-9000-000000000019)
+  if CLAUDE_JOB_DIR="$job" CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000020 \
+    lib_run "fm_claude_fork_descendant_of_pid $owner"; then
+    fail "a backgrounded session took the home from a source that had resumed work"
+  fi
+  pass "fork descent: a backgrounded session whose source resumed work is still refused"
 }
 
 test_recycled_pid_record_is_rejected() {
@@ -560,7 +633,10 @@ test_quiescent_fork_source_is_provable
 test_fork_source_that_resumed_work_is_refused
 test_sibling_fork_is_not_an_ancestor
 test_identical_transcript_is_not_an_ancestor
-test_background_agent_never_claims_by_fork_evidence
+test_task_seeded_background_job_never_claims_by_fork_evidence
+test_backgrounded_session_claims_its_own_quiescent_source
+test_backgrounded_session_with_an_unreadable_job_record_is_refused
+test_backgrounded_session_whose_source_resumed_work_is_refused
 test_recycled_pid_record_is_rejected
 test_live_owner_without_a_session_record_is_refused
 test_missing_own_session_identity_is_refused

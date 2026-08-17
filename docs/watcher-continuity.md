@@ -38,14 +38,16 @@ Everything else keeps the unchanged refusal, so the boundary the fleet depends o
 
 - A source that took any turn after the fork appends a uuid this session does not have, so it is a live session in use and keeps the home.
 - Sibling forks of one source extend each other in neither direction, and an identical transcript is not an extension.
-- A background agent never claims on this evidence, because Claude Code seeds one by forking the live session it must not displace.
+- A session inside a Claude Code background job claims only when the job's own record shows the job was created to continue another session, so a job seeded with its own task is refused before any transcript is read - and refused again by the transcript proof, because such a job starts a fresh session that shares no message uuid with anyone.
+  Claude Code has one background-session feature, `claude --bg`, whose help calls what it starts a background agent, and the same feature serves both a session the operator moved into the background and a worker seeded with a task; the job environment alone therefore cannot tell them apart, and treating its presence as the worker test left a backgrounded primary session permanently unable to re-claim its own home (2026-08-14 incident).
 - A live owner with no registry record, a record whose process start time no longer matches, or a claimant that cannot identify its own session all fail closed.
 - The process start time is read from `/proc`, so fork recovery is Linux-only and every other platform refuses.
 - Every primary harness other than Claude keeps today's behavior, having no such registry.
 
-Two limits are deliberate.
+Three limits are deliberate.
 A fork taken from a point earlier than the source's own tip leaves post-boundary uuids in the source, so it never auto-claims and the manual path remains.
 A source that has been idle since the fork loses the lock to its descendant and goes read-only if it is used again; the home still has exactly one owner at all times, and this is the only direction in which the change is more permissive - never the direction where two live sessions both act on one home.
+A source that was itself running as a background session recorded the pid of the host process it ran under rather than its own session pid, and the harness registry vouches only for session pids, so a fork of such a source cannot be resolved to a session and keeps the unchanged refusal; [`verification/supervision.md`](verification/supervision.md#background-job-sessions) records the measurement.
 
 ## Actionable wake ordering
 

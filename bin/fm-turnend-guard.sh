@@ -59,12 +59,19 @@
 #      hard 8-consecutive-block override - then allow one loud attended
 #      fail-open only for an already verified failure episode.
 #
-# Stood-down outcome (another live session owns the fleet lock): when
-# state/.lock is held by a live foreign harness session, the Stop-owned
-# auto-arm correctly stays INERT by design (bin/fm-claude-stop-autoarm.sh) and
-# never writes an epoch or an EXHAUSTED FAILURE notice for this home - so step 3
-# above can never become reachable while waiting on that failure. This guard
-# treats "stood down because another live session owns the fleet" as its own
+# Stood-down outcome (the fleet lock records a live owner this session cannot
+# match to its own): the Stop-owned auto-arm stays INERT
+# (bin/fm-claude-stop-autoarm.sh) and never writes an epoch or an EXHAUSTED
+# FAILURE notice for this home - so step 3 above can never become reachable while
+# waiting on that failure.
+# The recorded owner may be a second session that owns recovery, or this
+# session's own displaced predecessor whose continuity could not be proven, so
+# the banner and the alarm name the recorded pid and both readings instead of
+# asserting either, and neither tells the operator to skip inspecting this
+# session's hook registration - a misconfigured hook is silent in exactly the
+# same way, and the 2026-08-14 incident stayed hidden for an evening behind a
+# message that ruled that inspection out.
+# This guard treats the stood-down case as its own
 # first-class outcome: it accounts that case on the SAME bounded
 # state/.turnend-claude-blocks budget as step 3, incrementing once per turn
 # instead of deduping against an epoch that cannot advance, so the two reasons
@@ -159,7 +166,21 @@ OWNER_LOCK="$STATE/.claude-autoarm.lock"
 FAILURE_NOTICE="$STATE/.claude-autoarm-failure-notified"
 FAILURE_ALARM="$STATE/.claude-autoarm-failure-alarmed"
 FOREIGN_LOCK_OWNER_ALIVE=0
+# The pid the stood-down outcome actually read, captured once at the read that
+# decided it so the banner and the alarm can never name a pid the decision did
+# not use. Naming it is what makes the outcome checkable instead of an assertion
+# about who owns the home; an unreadable or malformed lock reports "unknown".
+FOREIGN_LOCK_OWNER_PID=unknown
 SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"' 2>/dev/null || printf 'unknown')
+
+recorded_lock_owner() {
+  local pid
+  pid=$(cat "$STATE/.lock" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) printf 'unknown' ;;
+    *) printf '%s' "$pid" ;;
+  esac
+}
 budget_reset() {
   [ "$CLAUDE_MODE" -eq 1 ] || return 0
   fm_lock_try_acquire "$BUDGET_LOCK" || return 0
@@ -185,7 +206,7 @@ block_stop() {
   x_mode=0
   [ -f "$CONFIG/x-mode.env" ] && x_mode=1
   if [ "$CLAUDE_MODE" -eq 1 ] && [ "$FOREIGN_LOCK_OWNER_ALIVE" -eq 1 ] && [ "$afk" -eq 0 ]; then
-    reason="another live session already owns this home's fleet lock, so the Stop-owned auto-arm here correctly stays inert by design and will never record a failure. Supervision recovery belongs to that other session; do not inspect this session's hook registration."
+    reason="this home's fleet lock records live process $FOREIGN_LOCK_OWNER_PID, which this session could not match to its own, so the Stop-owned auto-arm stayed inert and will never record a failure here. That process may be a second live session that owns recovery, or this session's own displaced predecessor whose continuity could not be proven - establish which before you rely on supervision running anywhere. Run bin/fm-lock.sh status to see what the recorded owner is, and inspect this session's own Stop hook registration too, because a broken hook is silent in exactly this way."
   else
     reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
       || printf '%s\n' 'tasks in flight, no live watcher - repair missing watcher supervision according to the session-start operating block before ending the turn')
@@ -382,7 +403,7 @@ failure_episode_verified() {
   esac
 }
 
-# --- stood-down accounting (another live session owns the fleet lock) --------
+# --- stood-down accounting (the lock records an unmatched live owner) --------
 # Shares the one BUDGET_FILE record, and its BUDGET_LOCK, with
 # budget_account_current_epoch() above: a single persisted counter is what keeps
 # the two reasons for re-blocking from independently reaching BLOCK_BUDGET and
@@ -458,21 +479,22 @@ if autoarm_owns_recovery; then
   exit 0
 fi
 
-# Another live session may already own this home's fleet lock, in which case
-# the auto-arm above correctly stayed inert and never wrote the epoch/failure
+# The lock may record a live owner this session cannot match to its own, in which
+# case the auto-arm above stayed inert and never wrote the epoch/failure
 # evidence the ordinary progression below waits for (see the header comment).
 # Handle that stood-down outcome on the shared block budget before assuming a
 # genuine auto-arm failure. Away mode owns supervision itself, so it blocks here
 # without spending any of that budget (see the header comment).
 if fm_session_lock_foreign_owner_alive "$STATE"; then
   FOREIGN_LOCK_OWNER_ALIVE=1
+  FOREIGN_LOCK_OWNER_PID=$(recorded_lock_owner)
   [ ! -e "$STATE/.afk" ] || block_stop
   standdown_account || block_stop
   standdown_terminal_fail_open
   standdown_status=$?
   if [ "$standdown_status" -eq 0 ]; then
     NEED_DESC=$(need_desc)
-    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, another live session already owns this home fleet lock so the Stop-owned auto-arm here correctly stays inert and will never record a failure, no watcher or automatic continuation exists here, and the block budget is exhausted. Keep this session attended: wait for that other session to restore supervision or take over the fleet lock, and diagnose why that session watcher stopped beating before relying on unattended supervision here."}\n' "$NEED_DESC"
+    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, this home fleet lock records live process %s which this session could not match to its own so the Stop-owned auto-arm stayed inert and will never record a failure here, no watcher or automatic continuation exists here, and the block budget is exhausted. Keep this session attended and establish what that recorded owner is - a second live session that owns recovery, or this session own displaced predecessor - with bin/fm-lock.sh status, and inspect this session own Stop hook registration too, because a broken hook is silent in exactly this way."}\n' "$NEED_DESC" "$FOREIGN_LOCK_OWNER_PID"
     exit 0
   fi
   [ "$standdown_status" -eq 2 ] && exit 0

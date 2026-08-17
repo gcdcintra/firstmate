@@ -633,6 +633,62 @@ acquire rc=1
 lock after refused acquire: 1409153
 ```
 
+### Background-job sessions
+
+Measured on 2026-08-17 with Claude Code 2.1.232 and 2.1.233 on Linux, against a live backgrounded primary firstmate session and one throwaway background job in a throwaway home.
+
+Claude Code has a single background-session feature, and its own help names what that feature starts:
+
+```text
+  --bg, --background                    Start the session as a background agent
+  agents [options]                      Manage background agents
+```
+
+A firstmate primary session moved into the background is one of those jobs.
+Reading the live session's own environment (`tr '\0' '\n' < /proc/2529774/environ`) printed:
+
+```text
+CLAUDE_CODE_SESSION_KIND=bg
+CLAUDE_BG_BACKEND=daemon
+CLAUDE_BG_SOURCE=slash
+CLAUDE_JOB_DIR=/home/gustavo-cintra/.claude/jobs/e07f3cf4
+```
+
+So `CLAUDE_JOB_DIR` marks a job, not specifically a worker, and one job-launch code path sets that identical shape for every job.
+
+The job's own record does separate the two shapes.
+A job created by backgrounding an existing session names the session it continues, while a job seeded with its own task names itself:
+
+```text
+jobs/e07f3cf4/state.json  sessionId=e07f3cf4-89d3-4051-b967-9d4ea8ffeda1  resumeSessionId=af6cf465-da1c-4e36-a493-793b8757bb45
+jobs/5aa61ddf/state.json  sessionId=5aa61ddf-e070-4197-a3cf-a1af772523c7  resumeSessionId=5aa61ddf-e070-4197-a3cf-a1af772523c7
+```
+
+The task-seeded job above was started with `claude --bg 'Reply with exactly: hello'`.
+Comparing its transcript against every other transcript in the same project directory:
+
+```text
+agent uuids: 13
+shared uuids with each of the 8 other sessions: 0
+positional prefix match with each: 0
+```
+
+A task-seeded job therefore fails the transcript proof on its own evidence, independently of the job-record test.
+
+One measured limitation remains.
+The live-session registry keys on the session process pid, never on the `claude bg-pty-host` process a backgrounded session runs under - and that host process is the outermost pid of the contiguous harness run, so it is what the lock records for such a session:
+
+```text
+state/.lock                      2529590
+ps -o pid=,ppid=  2529590        2529590 3177     (claude bg-pty-host)
+ps -o pid=,ppid=  2529774        2529774 2529590  (the session process)
+~/.claude/sessions/2529774.json  present
+~/.claude/sessions/2529590.json  absent
+```
+
+Ownership itself is unaffected, because `fm_session_lock_owned_by_self` tests membership of the whole contiguous run.
+Fork recovery is affected: a lock recorded this way cannot be resolved to a session id, so a later fork of a backgrounded session keeps the unchanged refusal.
+
 Deterministic entry points:
 
 ```sh

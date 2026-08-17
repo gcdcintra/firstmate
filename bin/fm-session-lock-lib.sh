@@ -234,6 +234,37 @@ fm_claude_record_field() {  # <file> <key>
   printf '%s\n' "$value"
 }
 
+# True when this process runs inside a Claude Code background job that the
+# harness created to CONTINUE another session - the only job shape a fork
+# continuation can have.
+#
+# Claude Code has exactly one background-session feature, `claude --bg`, and its
+# own help calls what that starts a background agent. The same feature serves
+# both a session the operator moved into the background and a worker seeded with
+# its own task, and one code path gives both of them CLAUDE_JOB_DIR. So that
+# variable identifies a job, never specifically a worker, and testing it alone
+# left a backgrounded primary session permanently unable to re-claim its own home
+# (2026-08-14 incident).
+#
+# The job's own record separates the two by construction: a job that resumed or
+# forked an existing session names that session in resumeSessionId, while a
+# task-seeded worker names its own id there and starts a transcript that shares
+# no message uuid with anyone. A worker is therefore refused here AND by the
+# transcript proof below. A record that is absent, unreadable, malformed, or
+# self-naming fails closed into today's refusal.
+fm_claude_job_continues_another_session() {
+  local dir=${CLAUDE_JOB_DIR:-} record own resumed
+  [ -n "$dir" ] || return 1
+  record="$dir/state.json"
+  [ -f "$record" ] && [ ! -L "$record" ] || return 1
+  own=$(fm_claude_record_field "$record" sessionId) || return 1
+  resumed=$(fm_claude_record_field "$record" resumeSessionId) || return 1
+  case "$own$resumed" in
+    *[!0-9a-fA-F-]*) return 1 ;;
+  esac
+  [ "$resumed" != "$own" ]
+}
+
 # Print the Claude session id that live pid $1 is running, proven by the
 # harness's own registry, or return 1. The record's own pid and process start
 # time must both match the live process, so a recycled pid can never inherit a
@@ -304,12 +335,14 @@ fm_transcript_strictly_extends() {  # <ancestor-file> <descendant-file>
 # session that live pid $1 is running, and that source session has produced
 # nothing since the fork.
 #
-# A background agent is excluded outright: Claude Code forks the captain's live
-# session to seed one, so it would otherwise satisfy the transcript proof while
-# being a genuinely separate worker that must never take the home.
+# A session running inside a Claude Code background job may only claim when that
+# job's own record shows it continues another session, so a task-seeded worker is
+# refused before any transcript is read.
 fm_claude_fork_descendant_of_pid() {  # <pid>
   local owner_pid=$1 own_session owner_session own_transcript owner_transcript
-  [ -z "${CLAUDE_JOB_DIR:-}" ] || return 1
+  if [ -n "${CLAUDE_JOB_DIR:-}" ]; then
+    fm_claude_job_continues_another_session || return 1
+  fi
   own_session=${CLAUDE_CODE_SESSION_ID:-}
   case "$own_session" in
     ''|*[!0-9a-fA-F-]*) return 1 ;;
@@ -323,11 +356,14 @@ fm_claude_fork_descendant_of_pid() {  # <pid>
 
 # True when state dir $1's session lock is held by a LIVE harness process that
 # is not this process's own ancestry AND is not this session's proven fork
-# source: the state in which recovery genuinely belongs to that other session,
-# so this session's own Stop-owned auto-arm (bin/fm-claude-stop-autoarm.sh)
-# correctly stays inert rather than contesting it. False for a missing/malformed
-# lock and false for a dead recorded owner - both remain this caller's own
-# uncertainty or stale-owner cases to handle, not a foreign live owner.
+# source: the state in which this session cannot show the home is its own, so its
+# Stop-owned auto-arm (bin/fm-claude-stop-autoarm.sh) stays inert rather than
+# contesting the recorded owner. Callers must not report that owner as a proven
+# second session: an unproven fork source lands here too, and the 2026-08-14
+# incident was an evening of turn-end blocks asserting exactly that.
+# False for a missing/malformed lock and false for a dead recorded owner - both
+# remain this caller's own uncertainty or stale-owner cases to handle, not a
+# foreign live owner.
 fm_session_lock_foreign_owner_alive() {
   local state=$1 lock_pid
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
