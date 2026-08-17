@@ -15,6 +15,11 @@
 #     main. Reachability alone false-refused this common GitHub flow; the check now
 #     recognizes a merged PR head containing the local work (or the content already
 #     in main) as landed.
+#   - stale-worktree-claim: a recorded worktree= is only a historical claim. Once
+#     the pool recycles a returned slot to another task, tearing down on that
+#     claim resets and kills the CURRENT occupant's live work. Teardown now
+#     refuses, before any inspection or cleanup, when a second live record in the
+#     same home claims that same path.
 #   - teardown-lock-race: a killed crew process can leave a transient worktree
 #     git index.lock that blocks teardown. The return path retries on the lock
 #     error signature (even if the lock self-clears mid-check), then only removes a
@@ -49,6 +54,18 @@
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#
+# Competing-claim matrix (bin/fm-teardown.sh's worktree_ownership_conflict_in_state).
+# This is the records-only refusal, independent of the per-worktree ownership
+# record require_worktree_ownership checks (tests/fm-worktree-owner.test.sh):
+#   (z)  another live task's meta claims the same worktree     -> REFUSE, nothing touched
+#   (z2) another live task claims the path as its home=        -> REFUSE (both keys scanned)
+#   (aa) same, with --force                                    -> REFUSE (another task's work)
+#   (bb) unlanded work, sole owner / reassigned slot           -> the two refusals stay distinct
+#   (cc) sole claimant                                         -> ALLOW (no false positive)
+#   (ee) forced child cleanup, child home a sibling claims     -> REFUSE, nothing touched
+#   (ii) prescribed recovery applied to every path line        -> ALLOW; worktree= alone still refuses
+#   (jj) recorded worktree path emptied instead                -> REFUSE (never a recovery)
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -72,7 +89,7 @@ make_case() {
   local name=$1 case_dir fakebin
   case_dir="$TMP_ROOT/$name"
   fakebin="$case_dir/fakebin"
-  mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
+  mkdir -p "$case_dir/state" "$case_dir/config" "$case_dir/data" "$case_dir/home" "$fakebin"
 
   # Mocks for the post-check teardown steps. Refuse logic exits before these
   # run; the ALLOW cases need them so the script can complete cleanly.
@@ -555,10 +572,20 @@ SH
 }
 
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
+# FM_HOME and FM_DATA_OVERRIDE are set alongside the others because teardown
+# derives more than state and config from the home: DATA, and with it the
+# secondmate registry it validates and rewrites, resolve from FM_HOME. Without
+# them a case that runs a secondmate teardown to completion reads and rewrites
+# the registry of whatever home the suite happens to run in. FM_HOME points at
+# its own empty directory rather than the case dir, because teardown refuses to
+# remove anything sitting inside the active home and the fixtures' secondmate
+# homes live under the case dir.
 run_teardown() {
   local case_dir=$1; shift
-  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_ROOT_OVERRIDE="${FM_TEST_FM_ROOT:-$ROOT}" \
+  FM_HOME="$case_dir/home" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
   FM_TEST_GH_LOG="$case_dir/gh.log" \
@@ -1358,6 +1385,434 @@ test_fractional_legacy_retry_wait_refuses_without_arithmetic_error() {
   pass "fractional legacy retry wait remains supported without arithmetic"
 }
 
+# --- competing-claim cross-check ---------------------------------------------
+
+# A treehouse mock that records every destructive `return`, so a test can prove
+# teardown never reached the contested path. `return --if-lease-holder` is
+# enforced the way the real tool enforces it (verified against treehouse
+# v2.1.1): a slot carrying no lease refuses with its own distinct signature and
+# is left alone, which is the path a non-leased fixture home takes.
+# Args: case_dir
+add_ownership_treehouse() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+want=; prev=
+for arg in "\$@"; do
+  [ "\$prev" != --if-lease-holder ] || want=\$arg
+  prev=\$arg
+done
+if [ -n "\$want" ]; then
+  echo "failed to return worktree: lease precondition failed: worktree \${!#} is not leased" >&2
+  exit 1
+fi
+printf '%s\n' "\$*" >> '$case_dir/treehouse.log'
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
+# Register a second live task in the same home that claims <path>. With key=home
+# the claim lands on that record's home= line while its worktree= names some
+# other path - the half-corrected record shape the cross-check's home arm exists
+# for. Args: case_dir id path [key]
+add_competing_task_meta() {
+  local case_dir=$1 id=$2 path=$3 key=${4:-worktree}
+  if [ "$key" = home ]; then
+    fm_write_meta "$case_dir/state/$id.meta" \
+      "window=firstmate:fm-$id" \
+      "endpoint_task_id=$id" \
+      "worktree=$case_dir/$id-elsewhere" \
+      "project=$case_dir/project" \
+      "kind=secondmate" \
+      "mode=local-only" \
+      "home=$path"
+    return 0
+  fi
+  fm_write_meta "$case_dir/state/$id.meta" \
+    "window=firstmate:fm-$id" \
+    "endpoint_task_id=$id" \
+    "worktree=$path" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes"
+}
+
+# The worktree is untouched when treehouse was never asked to return it and the
+# task branch is still checked out (teardown detaches HEAD before returning).
+assert_worktree_untouched() {
+  local case_dir=$1 label=$2 branch
+  [ ! -f "$case_dir/treehouse.log" ] \
+    || fail "$label: teardown returned the worktree: $(cat "$case_dir/treehouse.log")"
+  branch=$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD)
+  [ "$branch" = fm/task-x1 ] || fail "$label: teardown moved the worktree off its branch ($branch)"
+}
+
+test_reassigned_worktree_claim_refuses_before_any_cleanup() {
+  local case_dir rc err
+  case_dir=$(make_case ownership-conflict)
+  write_meta "$case_dir" no-mistakes ship
+  # Landed work: the unlanded-work check would allow this teardown, so only the
+  # ownership check can refuse it.
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_ownership_treehouse "$case_dir"
+  add_competing_task_meta "$case_dir" other-task "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-conflict: teardown should refuse a reassigned worktree"
+  assert_contains "$err" "ownership conflict" "ownership-conflict: no ownership refusal"
+  assert_contains "$err" "task-x1" "ownership-conflict: refusal did not name the torn-down task"
+  assert_contains "$err" "other-task" "ownership-conflict: refusal did not name the claiming task"
+  assert_contains "$err" "$case_dir/wt" "ownership-conflict: refusal did not name the contested path"
+  # The refusal is the operator's only recovery path, so it must name the exact
+  # records to edit and rule out deleting either of them.
+  assert_contains "$err" "$case_dir/state/task-x1.meta for task-x1" \
+    "ownership-conflict: recovery did not name this task's own record"
+  assert_contains "$err" "$case_dir/state/other-task.meta for other-task" \
+    "ownership-conflict: recovery did not name the competing record"
+  assert_contains "$err" "repoint EVERY worktree= and home= line" \
+    "ownership-conflict: recovery did not name the exact edit"
+  assert_contains "$err" "Do not empty worktree=" \
+    "ownership-conflict: recovery did not rule out the edit that bricks the record"
+  assert_contains "$err" "delete no meta file" \
+    "ownership-conflict: recovery did not rule out deleting a record"
+  # The competing record lives in this state dir, so the diagnostic must resolve
+  # there rather than in whatever home the operator happens to be standing in.
+  assert_contains "$err" "FM_STATE_OVERRIDE=$case_dir/state bin/fm-crew-state.sh other-task" \
+    "ownership-conflict: diagnostic command was not scoped to the record's own home"
+  assert_worktree_untouched "$case_dir" ownership-conflict
+  assert_present "$case_dir/state/task-x1.meta" "ownership-conflict: durable record removed despite refusal"
+  assert_present "$case_dir/state/other-task.meta" "ownership-conflict: claiming task's record removed"
+  pass "worktree claimed by another live task is refused before any cleanup"
+}
+
+test_competing_home_record_refuses() {
+  local case_dir rc err
+  case_dir=$(make_case ownership-conflict-home-key)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_ownership_treehouse "$case_dir"
+  # The live claimant records the contested path as its home, not its worktree -
+  # the shape a half-corrected record leaves behind.
+  add_competing_task_meta "$case_dir" other-home "$case_dir/wt" home
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-conflict-home-key: a claim recorded as home= must refuse too"
+  assert_contains "$err" "ownership conflict" "ownership-conflict-home-key: no ownership refusal"
+  assert_contains "$err" "home= in $case_dir/state/other-home.meta" \
+    "ownership-conflict-home-key: refusal did not name the home= line that claims the path"
+  assert_worktree_untouched "$case_dir" ownership-conflict-home-key
+  pass "a path another live task records as its home= is refused, not only worktree="
+}
+
+test_reassigned_worktree_claim_refuses_even_under_force() {
+  local case_dir rc err
+  case_dir=$(make_case ownership-conflict-force)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_ownership_treehouse "$case_dir"
+  add_competing_task_meta "$case_dir" other-task "$case_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-conflict-force: --force must not discard another task's work"
+  assert_contains "$err" "ownership conflict" "ownership-conflict-force: no ownership refusal"
+  assert_contains "$err" "--force does not bypass this" \
+    "ownership-conflict-force: refusal did not explain why --force is not the answer"
+  assert_worktree_untouched "$case_dir" ownership-conflict-force
+  pass "--force does not bypass the ownership refusal (it cannot discard another task's work)"
+}
+
+test_ownership_refusal_is_distinct_from_unlanded_refusal() {
+  local case_dir rc err
+  case_dir=$(make_case ownership-vs-unlanded)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "unpushed work"
+  add_ownership_treehouse "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-vs-unlanded: unlanded work must still refuse"
+  assert_contains "$err" "not on any remote and not landed" \
+    "ownership-vs-unlanded: the unlanded-work refusal was weakened"
+  assert_not_contains "$err" "ownership conflict" \
+    "ownership-vs-unlanded: unlanded work reported an ownership conflict"
+  assert_worktree_untouched "$case_dir" ownership-vs-unlanded
+
+  # And the reverse: a sole owner whose work is not landed reports only the
+  # unlanded refusal, while a reassigned slot reports only the ownership one.
+  add_competing_task_meta "$case_dir" other-task "$case_dir/wt"
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-vs-unlanded: reassigned worktree must refuse"
+  assert_contains "$err" "ownership conflict" "ownership-vs-unlanded: no ownership refusal"
+  assert_not_contains "$err" "not on any remote and not landed" \
+    "ownership-vs-unlanded: ownership conflict was reported as unlanded work"
+  pass "the ownership refusal and the unlanded-work refusal are independently distinguishable"
+}
+
+test_sole_owner_worktree_still_tears_down() {
+  local case_dir rc
+  case_dir=$(make_case ownership-sole-owner)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  # Another live task holds a different worktree: not a competing claim.
+  add_ownership_treehouse "$case_dir"
+  add_competing_task_meta "$case_dir" other-task "$case_dir/other-wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "ownership-sole-owner: teardown should succeed for the sole owner"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "ownership-sole-owner: teardown printed a REFUSED line"
+  assert_grep "return --force $case_dir/wt" "$case_dir/treehouse.log" \
+    "ownership-sole-owner: teardown did not return the worktree"
+  assert_absent "$case_dir/state/task-x1.meta" "ownership-sole-owner: task record survived teardown"
+  pass "a worktree with a single live claimant is torn down normally"
+}
+
+# A secondmate records the SAME path as both worktree= and home= (bin/fm-spawn.sh),
+# which is what makes the prescribed recovery a two-line edit. Args: case_dir home
+write_secondmate_meta_claiming_home() {
+  local case_dir=$1 home=$2
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$home" \
+    "project=$case_dir/project" \
+    "kind=secondmate" \
+    "mode=local-only" \
+    "home=$home"
+}
+
+# Rewrite one recorded path key in place, leaving every other line alone.
+# Args: meta key value
+set_meta_path_line() {
+  local meta=$1 key=$2 value=$3
+  sed -i.bak "s|^$key=.*|$key=$value|" "$meta"
+  rm -f "$meta.bak"
+}
+
+# Seed a directory as a firstmate home marked for <id>. Args: home id
+seed_firstmate_home() {
+  local home=$1 id=$2
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' "$id" > "$home/.fm-secondmate-home"
+}
+
+# A stand-in FM_ROOT whose linked worktrees are what a pooled firstmate home
+# actually is on disk, so teardown resolves such a home to a pool slot it
+# returns. Set FM_TEST_FM_ROOT to the echoed path before calling run_teardown.
+# Args: case_dir
+make_pool_root() {
+  local case_dir=$1 root="$1/fmroot"
+  mkdir -p "$root/bin"
+  cat > "$root/bin/fm-guard.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$root/bin/fm-guard.sh"
+  git init -q "$root"
+  git -C "$root" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "pool root"
+  printf '%s\n' "$root"
+}
+
+# Hand a slot out of that pool: a linked worktree of the pool repo, seeded as a
+# firstmate home marked for <id>. Args: pool_root path id
+add_pool_home() {
+  local root=$1 path=$2 id=$3
+  git -C "$root" worktree add -q --detach "$path" >/dev/null 2>&1
+  seed_firstmate_home "$path" "$id"
+}
+
+test_prescribed_recovery_clears_a_contested_secondmate_claim() {
+  local case_dir home owned rc err
+  local FM_TEST_FM_ROOT
+  case_dir=$(make_case ownership-recovery-secondmate)
+  FM_TEST_FM_ROOT=$(make_pool_root "$case_dir")
+  home="$case_dir/secondmate-home"; owned="$case_dir/owned-home"
+  add_pool_home "$FM_TEST_FM_ROOT" "$home" task-x1
+  add_pool_home "$FM_TEST_FM_ROOT" "$owned" task-x1
+  write_secondmate_meta_claiming_home "$case_dir" "$home"
+  add_ownership_treehouse "$case_dir"
+  add_competing_task_meta "$case_dir" sm-alpha "$home"
+  # A secondmate teardown that runs to completion validates and rewrites the
+  # secondmate registry. Binding task-x1 to the home it really holds lets the
+  # run reach that rewrite, and the entry's fate below is what proves the
+  # registry it resolved was this sandbox's rather than the ambient home's.
+  printf '%s\n' \
+    '# secondmates' \
+    "- task-x1 - fixture binding (home: $owned; scope: fixture; projects: none; added 2026-08-14)" \
+    > "$case_dir/data/secondmates.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+  expect_code 1 "$rc" "ownership-recovery-secondmate: a contested secondmate home must refuse"
+  assert_contains "$err" "live task sm-alpha also claims it" \
+    "ownership-recovery-secondmate: refusal did not name the competing task"
+
+  # Correcting one of the two lines is provably no recovery: the line that still
+  # records the contested path keeps driving the refusal.
+  set_meta_path_line "$case_dir/state/task-x1.meta" worktree "$owned"
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+  expect_code 1 "$rc" "ownership-recovery-secondmate: correcting one line should still refuse"
+  assert_contains "$err" "live task sm-alpha also claims it" \
+    "ownership-recovery-secondmate: the surviving home= line stopped being consulted"
+
+  # Both lines corrected to the home this task really holds: teardown proceeds,
+  # and the contested slot is never touched.
+  set_meta_path_line "$case_dir/state/task-x1.meta" home "$owned"
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+  expect_code 0 "$rc" "ownership-recovery-secondmate: the prescribed recovery did not let teardown proceed"
+  assert_not_contains "$err" "ownership conflict" \
+    "ownership-recovery-secondmate: teardown still refused after the prescribed recovery"
+  assert_present "$home/.fm-secondmate-home" \
+    "ownership-recovery-secondmate: teardown destroyed the contested home anyway"
+  # A pooled home is cleaned up by returning its slot, not by removing the tree.
+  assert_grep "return --force $owned" "$case_dir/treehouse.log" \
+    "ownership-recovery-secondmate: teardown did not return the home the record now names"
+  ! grep -q "return --force $home\$" "$case_dir/treehouse.log" \
+    || fail "ownership-recovery-secondmate: teardown returned the contested home"
+  assert_present "$case_dir/data/secondmates.md" \
+    "ownership-recovery-secondmate: the sandbox registry was not the one the run resolved"
+  ! grep -q '^- task-x1 ' "$case_dir/data/secondmates.md" \
+    || fail "ownership-recovery-secondmate: teardown retired its binding somewhere other than the sandbox registry"
+  assert_grep '# secondmates' "$case_dir/data/secondmates.md" \
+    "ownership-recovery-secondmate: teardown rewrote more of the sandbox registry than its own entry"
+  pass "correcting every recorded path line recovers a contested secondmate claim, and correcting worktree= alone does not"
+}
+
+test_blanking_a_recorded_worktree_is_not_a_recovery() {
+  local case_dir rc err
+  case_dir=$(make_case ownership-recovery-blanking)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_ownership_treehouse "$case_dir"
+  add_competing_task_meta "$case_dir" other-task "$case_dir/wt"
+
+  # Emptying the recorded path is the edit an operator might read a refusal as
+  # asking for; the endpoint validator refuses it outright, so the refusal must
+  # never prescribe it.
+  set_meta_path_line "$case_dir/state/task-x1.meta" worktree ""
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-recovery-blanking: an empty worktree= must not silently tear down"
+  assert_contains "$err" "worktree identity" \
+    "ownership-recovery-blanking: emptying the recorded path stopped being refused"
+  assert_worktree_untouched "$case_dir" ownership-recovery-blanking
+  pass "emptying a recorded worktree path is refused outright, so no refusal may prescribe it"
+}
+
+# A secondmate parent whose child is itself a secondmate home. A forced teardown
+# of the parent destroys that child home too, so the child's home path needs the
+# same cross-check the parent's does, against the child home's own state
+# directory rather than this one's. Args: case_dir pool_root
+configure_secondmate_with_secondmate_child() {
+  local case_dir=$1 pool_root=$2 home="$1/secondmate-home" child_home="$1/secondmate-home/child-home"
+  add_pool_home "$pool_root" "$home" task-x1
+  add_pool_home "$pool_root" "$child_home" child-sm
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  fm_write_meta "$home/state/child-sm.meta" \
+    "window=firstmate:fm-child-sm" \
+    "endpoint_task_id=child-sm" \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    "kind=secondmate" \
+    "mode=local-only" \
+    "home=$child_home"
+}
+
+test_forced_child_home_claimed_by_a_sibling_refuses() {
+  local case_dir home child_home rc err
+  local FM_TEST_FM_ROOT
+  case_dir=$(make_case ownership-child-conflict)
+  FM_TEST_FM_ROOT=$(make_pool_root "$case_dir")
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_secondmate_child "$case_dir" "$FM_TEST_FM_ROOT"
+  home="$case_dir/secondmate-home"; child_home="$home/child-home"
+  add_ownership_treehouse "$case_dir"
+  # The competing claim lives in the CHILD home's state directory, which is the
+  # only one that can speak for a child's path; nothing in the parent's state
+  # names it, so only the per-child cross-check can refuse this.
+  fm_write_meta "$home/state/sm-stranger.meta" \
+    "window=firstmate:fm-sm-stranger" \
+    "endpoint_task_id=sm-stranger" \
+    "worktree=$child_home" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  err=$(cat "$case_dir/stderr")
+
+  expect_code 1 "$rc" "ownership-child-conflict: forced teardown should refuse a reassigned child home"
+  assert_contains "$err" "ownership conflict on child firstmate home" \
+    "ownership-child-conflict: child preflight did not raise an ownership refusal"
+  assert_contains "$err" "live task sm-stranger also claims it" \
+    "ownership-child-conflict: child preflight ignored the competing child-home record"
+  assert_contains "$err" "$home/state/child-sm.meta for child-sm" \
+    "ownership-child-conflict: recovery did not name the child's own record"
+  [ ! -f "$case_dir/treehouse.log" ] \
+    || fail "ownership-child-conflict: teardown returned a pooled path: $(cat "$case_dir/treehouse.log")"
+  assert_present "$child_home/.fm-secondmate-home" \
+    "ownership-child-conflict: refusal removed the contested child home"
+  assert_present "$home/state/child-sm.meta" "ownership-child-conflict: refusal erased the child record"
+  assert_present "$case_dir/state/task-x1.meta" "ownership-child-conflict: refusal erased the parent record"
+  pass "forced child cleanup refuses a child home a sibling record claims, before destroying it"
+}
+
 test_local_only_force_overrides_unpushed() {
   local case_dir rc
   case_dir=$(make_case force-override)
@@ -1501,8 +1956,8 @@ test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes() {
   closed="$case_dir/closed"
   : > "$case_dir/state/task-x1.status"
   : > "$case_dir/state/task-x1.turn-ended"
-  # Record every treehouse invocation: the contended-lock refusal must fire
-  # BEFORE the isolated copy is returned, so phase 1 may not invoke it at all.
+  # Record every mutating treehouse invocation: the contended-lock refusal must
+  # fire BEFORE the isolated copy is returned, so phase 1 may not return at all.
   thlog="$case_dir/treehouse.log"; : > "$thlog"
   cat > "$case_dir/fakebin/treehouse" <<SH
 #!/usr/bin/env bash
@@ -1955,6 +2410,14 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed() {
   pass "herdr projection teardown retains every record when post-close presence is unknown"
 }
 
+test_reassigned_worktree_claim_refuses_before_any_cleanup
+test_competing_home_record_refuses
+test_reassigned_worktree_claim_refuses_even_under_force
+test_ownership_refusal_is_distinct_from_unlanded_refusal
+test_sole_owner_worktree_still_tears_down
+test_prescribed_recovery_clears_a_contested_secondmate_claim
+test_blanking_a_recorded_worktree_is_not_a_recovery
+test_forced_child_home_claimed_by_a_sibling_refuses
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
