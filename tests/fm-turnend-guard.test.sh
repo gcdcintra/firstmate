@@ -23,6 +23,9 @@ REQUIRED_REASON='watcher supervision needs Stop-owned automatic recovery; inspec
 # The one phrase that identifies the stood-down reason override, so the cases
 # that must NOT take it cannot go vacuous when that wording changes.
 STANDDOWN_MARKER='could not match to its own'
+# The phrase unique to the inconclusive reading, for the cases that must reach it
+# and the ones that must be reported as something more definite instead.
+UNRESOLVED_MARKER='no live session record vouches for'
 
 # --- PREDICATE: bin/fm-supervision-lib.sh -----------------------------------
 
@@ -1110,13 +1113,19 @@ STANDDOWN_FAKEBIN=$(fm_fakebin "$TMP_ROOT/standdown-fakebin")
 ln -s /bin/bash "$STANDDOWN_FAKEBIN/claude"
 FAKE_CLAUDE_STANDDOWN="$STANDDOWN_FAKEBIN/claude"
 
+# A verified harness that is NOT Claude Code, for the supported configuration in
+# which a pi/codex/opencode primary holds this home's lock.
+ln -s /bin/bash "$STANDDOWN_FAKEBIN/codex"
+FAKE_CODEX_STANDDOWN="$STANDDOWN_FAKEBIN/codex"
+
 # Simulate a live harness process this session cannot match to its own: start one
-# under a harness name and record it as the session lock owner.
+# under a harness name and record it as the session lock owner. $2 selects which
+# harness name it runs under, defaulting to Claude Code.
 record_foreign_lock_owner() {
-  local dir=$1
+  local dir=$1 harness=${2:-$FAKE_CLAUDE_STANDDOWN}
   # The trailing no-op keeps the fake harness process alive under its own name
   # instead of allowing bash to exec the final sleep into a non-harness process.
-  "$FAKE_CLAUDE_STANDDOWN" -c 'sleep 60; :' &
+  "$harness" -c 'sleep 60; :' &
   FOREIGN_LOCK_PID=$!
   printf '%s\n' "$FOREIGN_LOCK_PID" > "$dir/state/.lock"
 }
@@ -1659,13 +1668,39 @@ test_hook_claude_mode_standdown_reports_an_unresolvable_owner_as_such() {
   out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
   release_foreign_lock_owner
   expect_code 2 "$status" "an unresolvable recorded owner must still block within the budget"
-  assert_contains "$out" 'no live Claude session record vouches for that process' \
-    "the banner must state the sub-check that actually refused"
-  assert_contains "$out" 'displaced predecessor' "the banner must name the reading that evidence supports"
+  assert_contains "$out" "$UNRESOLVED_MARKER" "the banner must state the sub-check that actually refused"
+  assert_contains "$out" 'The evidence is inconclusive' \
+    "an owner no record vouches for must be reported as inconclusive, not as a picked reading"
+  assert_contains "$out" 'displaced predecessor' "the banner must name the readings the evidence is consistent with"
+  assert_not_contains "$out" 'The evidence supports' \
+    "the inconclusive case must not claim the evidence supports any single reading"
   assert_not_contains "$out" 'bin/fm-lock.sh status' \
     "the banner must not point at a command whose output is identical for both readings"
   assert_contains "$out" 'Stop hook registration' "the banner must keep the hook registration in scope"
-  pass "fm-turnend-guard --claude: an owner no session record vouches for is reported as the displaced-predecessor reading"
+  pass "fm-turnend-guard --claude: a live Claude owner no session record vouches for is reported as inconclusive"
+}
+
+# A live pi/codex/opencode/grok/kimi primary holding this home's lock is a
+# supported configuration, and it reaches the same stood-down path: the owner is
+# a verified live harness, so nothing about it resolves through the Claude
+# registry. Its evidence must not read as the displaced predecessor of a Claude
+# session, which no non-Claude process can be.
+test_hook_claude_mode_standdown_reports_a_non_claude_owner_as_another_primary() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-evidence-not-claude")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir" "$FAKE_CODEX_STANDDOWN"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true); status=$?
+  release_foreign_lock_owner
+  expect_code 2 "$status" "a live non-Claude lock owner must still block within the budget"
+  assert_contains "$out" "$FOREIGN_LOCK_PID" "the banner must name the recorded lock owner it read"
+  assert_contains "$out" 'not Claude Code' "the banner must report that the owner is a harness of another kind"
+  assert_not_contains "$out" 'displaced predecessor' \
+    "a live non-Claude owner must never be reported as the displaced predecessor of this Claude session"
+  assert_not_contains "$out" "$UNRESOLVED_MARKER" \
+    "a live non-Claude owner must not be collapsed into the unresolvable-Claude-owner reading"
+  assert_contains "$out" 'Stop hook registration' "the banner must keep the hook registration in scope"
+  pass "fm-turnend-guard --claude: a live non-Claude lock owner is reported as a primary of another kind"
 }
 
 test_hook_claude_mode_standdown_reports_a_diverged_owner_as_a_second_session() {
@@ -1711,7 +1746,7 @@ test_hook_claude_mode_standdown_reaches_fail_open() {
   assert_contains "$out" 'Keep this session attended' "stood-down fail-open alarm omitted the attended-session action"
   assert_not_contains "$out" 'correctly stays inert' "stood-down fail-open alarm must not assert the inertness is correct"
   assert_not_contains "$out" 'wait for that other session' "stood-down fail-open alarm must not direct the operator to wait on an unproven second session"
-  assert_contains "$out" 'no live Claude session record vouches for that process' \
+  assert_contains "$out" "$UNRESOLVED_MARKER" \
     "stood-down fail-open alarm must carry the same discriminating evidence as the banner"
   assert_not_contains "$out" 'bin/fm-lock.sh status' \
     "stood-down fail-open alarm must not point at a command whose output is identical for both readings"
@@ -1909,6 +1944,7 @@ test_hook_claude_mode_waits_for_late_claim
 test_hook_claude_mode_secondmate_reblocks_like_primary
 test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded
 test_hook_claude_mode_standdown_reports_an_unresolvable_owner_as_such
+test_hook_claude_mode_standdown_reports_a_non_claude_owner_as_another_primary
 test_hook_claude_mode_standdown_reports_a_diverged_owner_as_a_second_session
 test_hook_claude_mode_standdown_reaches_fail_open
 test_hook_claude_mode_standdown_recovery_clears_episode_state

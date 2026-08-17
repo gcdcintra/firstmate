@@ -705,6 +705,18 @@ widened resolve of unrelated pid 484999  UNRESOLVED
 ```
 
 The boundary is unchanged in every other direction, because the walk never leaves one contiguous Claude run: a session in another run is not reachable at all, two session records inside one run are ambiguity rather than an answer, and a recorded owner the registry vouches for nowhere in its run keeps the unchanged refusal - as does every non-Claude primary, which the walk rejects at its first hop.
+A non-Claude owner is published as its own `owner-not-claude` evidence rather than folded into the unresolved case, because a live harness of another kind is the one thing that cannot be the displaced predecessor of a Claude session, and the turn-end guard must not offer that reading for it.
+
+This fallback runs whenever the direct record misses, which is the normal shape for a backgrounded primary, and the turn-end guard reaches it twice per Stop.
+Candidates are therefore discarded cheapest-first, and the matcher the walk calls per hop was moved onto shell builtins.
+Counting `clone` with `strace -f -c` for one resolution of host pid 2529590 against the same 4 live registry records:
+
+```text
+before  163 clones
+after    68 clones
+```
+
+Both resolve host pid 2529590 to the same session and both leave the unrelated live Claude pid 484999 unresolved.
 
 Deterministic entry points:
 

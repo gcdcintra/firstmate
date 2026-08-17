@@ -19,8 +19,8 @@ FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$'
 # bin/fm-claude-stop-autoarm.sh.
 FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi)
 
-# Print the exact harness name carried by executable path $1 - its own basename
-# or any directory component - or return 1.
+# Set FM_HARNESS_PATH_NAME to the exact harness name carried by executable path
+# $1 - its own basename or any directory component - or return 1.
 #
 # This exists because Claude Code's native installer names the per-session
 # executable by its version (~/.local/share/claude/versions/2.1.220), so the
@@ -28,12 +28,18 @@ FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi)
 # whole path components only is what keeps that widening safe: an ordinary path
 # such as bin/fm-claude-stop-autoarm.sh or ~/.claude/hooks/notify.sh has no
 # "claude" component and is correctly not a harness process.
+#
+# It answers through a variable rather than stdout because its one caller runs
+# per ancestry hop on the Stop hot path, where a command substitution would cost
+# a subprocess for a search that is entirely shell pattern matching.
+FM_HARNESS_PATH_NAME=''
 fm_harness_path_name() {  # <path>
   local path=$1 name
+  FM_HARNESS_PATH_NAME=''
   [ -n "$path" ] || return 1
   for name in "${FM_HARNESS_NAMES[@]}"; do
     case "/$path/" in
-      */"$name"/*) printf '%s' "$name"; return 0 ;;
+      */"$name"/*) FM_HARNESS_PATH_NAME=$name; return 0 ;;
     esac
   done
   return 1
@@ -50,24 +56,30 @@ fm_harness_path_name() {  # <path>
 #      name and ignores argv[0] entirely, so a version-named Claude Code binary
 #      is identified by its install path on macOS and by argv[0] on Linux.
 #   3. a bare interpreter (node, python) running a harness script path.
+#
+# Every test here is a shell builtin. This runs once per ancestry hop, and the
+# fork-descent resolution below walks a run per candidate registry record on the
+# Stop hot path, so a subprocess per test would cost more than the ps calls that
+# feed it.
 FM_HARNESS_IS_CLAUDE=0
 fm_harness_process_matches() {  # <comm> <args>
   local comm=$1 args=$2 base argv0 name
   FM_HARNESS_IS_CLAUDE=0
-  base=$(basename -- "$comm")
-  if printf '%s' "$base" | grep -qE "$FM_HARNESS_RE"; then
+  base=${comm##*/}
+  if [[ $base =~ $FM_HARNESS_RE ]]; then
     case "$base" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
     return 0
   fi
   argv0=${args%% *}
-  if name=$(fm_harness_path_name "$comm") || name=$(fm_harness_path_name "$argv0"); then
+  if fm_harness_path_name "$comm" || fm_harness_path_name "$argv0"; then
+    name=$FM_HARNESS_PATH_NAME
     case "$name" in claude) FM_HARNESS_IS_CLAUDE=1 ;; esac
     return 0
   fi
   # Bare interpreter (e.g. node): match the harness name in its script path.
   case "$comm" in
     *node*|*python*)
-      if printf '%s' "$args" | grep -qE "$FM_HARNESS_RE"; then
+      if [[ $args =~ $FM_HARNESS_RE ]]; then
         case "$args" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
         return 0
       fi
@@ -221,6 +233,7 @@ fm_claude_config_dir() {
 # platform keeps the unchanged refusal.
 fm_claude_proc_start() {  # <pid>
   local pid=$1 line rest
+  local -a fields=()
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -230,15 +243,22 @@ fm_claude_proc_start() {  # <pid>
   # Nothing after it contains a parenthesis, so the last ") " is comm's close.
   rest=${line##*") "}
   [ "$rest" != "$line" ] || return 1
-  printf '%s\n' "$rest" | awk 'NF >= 20 { print $20 }'
+  read -ra fields <<< "$rest" || :
+  [ "${#fields[@]}" -ge 20 ] || return 1
+  printf '%s\n' "${fields[19]}"
 }
 
 # Print flat JSON string-or-number field $2 from single-object record file $1.
 # Deliberately narrow: it reads only the flat, machine-written session record,
 # and any value that is not a plain token fails closed to no output.
+#
+# One subprocess per field, deliberately: the callers below run this on the Stop
+# hot path, once per candidate registry record, so the first-match selection is
+# done with a parameter expansion rather than a second process.
 fm_claude_record_field() {  # <file> <key>
   local value
-  value=$(sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' "$1" 2>/dev/null | head -1)
+  value=$(sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' "$1" 2>/dev/null)
+  value=${value%%$'\n'*}
   [ -n "$value" ] || return 1
   printf '%s\n' "$value"
 }
@@ -352,6 +372,14 @@ fm_harness_run_hosts_pid() {  # <inner-pid> <outer-pid>
 # records inside one run is ambiguity rather than an answer - refused like every
 # other unresolvable input here. A recorded owner the registry vouches for
 # nowhere in its run keeps the unchanged refusal.
+#
+# The scan runs on the Stop hot path, exactly in the backgrounded-primary shape
+# this fleet normally runs in, so candidates are discarded cheapest-first: a pid
+# the registry left a record for but that no longer exists costs no subprocess at
+# all, and one that is live but outside the run is rejected by the walk before
+# its record is ever read. Only a candidate the run genuinely hosts pays for the
+# record proof. Ordering the two conditions this way cannot change the outcome,
+# because a candidate must satisfy both to be accepted.
 fm_claude_session_id_of_pid() {  # <pid>
   local pid=$1 cfg record candidate session_id found=''
   case "$pid" in
@@ -367,8 +395,9 @@ fm_claude_session_id_of_pid() {  # <pid>
       ''|*[!0-9]*) continue ;;
     esac
     [ "$candidate" != "$pid" ] || continue
-    session_id=$(fm_claude_session_record_id "$candidate") || continue
+    kill -0 "$candidate" 2>/dev/null || continue
     fm_harness_run_hosts_pid "$candidate" "$pid" || continue
+    session_id=$(fm_claude_session_record_id "$candidate") || continue
     [ -z "$found" ] || return 1
     found=$session_id
   done
@@ -432,7 +461,11 @@ fm_transcript_strictly_extends() {  # <ancestor-file> <descendant-file>
 #   no-session-identity   this process carries no Claude session id at all, so
 #                         no continuity evidence can be produced.
 #   owner-unresolved      no live Claude session record vouches for the recorded
-#                         pid or for the harness run it heads.
+#                         pid or for the harness run it heads. This says nothing
+#                         about WHICH unvouched-for case it is, so a caller must
+#                         report it as inconclusive; the one case it does rule
+#                         out, a live owner that is not Claude at all, is
+#                         published separately as owner-not-claude below.
 #   owner-is-this-session the recorded owner resolves to this session's own id.
 #   job-record-unproven   this claimant runs inside a background job whose record
 #                         does not show it continues the recorded owner.
@@ -484,7 +517,17 @@ fm_claude_fork_descendant_of_pid() {  # <pid>
 # per call and every one of these comes from that read; a caller that re-read it
 # for its banner could name whatever a third writer put there in between.
 # FM_SESSION_LOCK_OWNER_PID is "unknown" for an absent or malformed lock, and
-# FM_SESSION_LOCK_OWNER_EVIDENCE carries the FM_CLAUDE_FORK_EVIDENCE token above.
+# FM_SESSION_LOCK_OWNER_EVIDENCE carries the FM_CLAUDE_FORK_EVIDENCE token above,
+# with one token this predicate adds because only it holds the fact:
+#
+#   owner-not-claude      the recorded owner is a live VERIFIED harness process
+#                         that is not Claude Code. The liveness check below
+#                         already establishes this, and the fork walk cannot -
+#                         it sees only that nothing resolved. Publishing it apart
+#                         from owner-unresolved is what stops a caller telling a
+#                         Claude session that a codex, opencode, grok, kimi or pi
+#                         owner is probably its own displaced predecessor, which
+#                         no displaced predecessor of a Claude session can be.
 # shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
 FM_SESSION_LOCK_OWNER_PID=unknown
 # shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
@@ -505,7 +548,7 @@ FM_SESSION_LOCK_OWNER_EVIDENCE='owner-unresolved'
 # foreign live owner.
 # shellcheck disable=SC2034 # The FM_SESSION_LOCK_OWNER_* globals it publishes are read by bin/fm-turnend-guard.sh, not this lib.
 fm_session_lock_foreign_owner_alive() {
-  local state=$1 lock_pid
+  local state=$1 lock_pid owner_is_claude
   FM_SESSION_LOCK_OWNER_PID='unknown'
   FM_SESSION_LOCK_OWNER_SESSION=''
   FM_SESSION_LOCK_OWNER_EVIDENCE='owner-unresolved'
@@ -516,8 +559,12 @@ fm_session_lock_foreign_owner_alive() {
   FM_SESSION_LOCK_OWNER_PID=$lock_pid
   fm_harness_ancestry_contains_pid "$lock_pid" && return 1
   fm_harness_pid_alive "$lock_pid" || return 1
+  owner_is_claude=$FM_HARNESS_IS_CLAUDE
   fm_claude_fork_descendant_of_pid "$lock_pid" && return 1
   FM_SESSION_LOCK_OWNER_SESSION=$FM_CLAUDE_FORK_OWNER_SESSION
   FM_SESSION_LOCK_OWNER_EVIDENCE=$FM_CLAUDE_FORK_EVIDENCE
+  if [ "$owner_is_claude" -eq 0 ] && [ "$FM_SESSION_LOCK_OWNER_EVIDENCE" = 'owner-unresolved' ]; then
+    FM_SESSION_LOCK_OWNER_EVIDENCE='owner-not-claude'
+  fi
   return 0
 }

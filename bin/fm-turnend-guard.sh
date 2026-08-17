@@ -205,8 +205,10 @@ standdown_evidence() {
     transcript-missing)
       printf 'The evidence is inconclusive: that process runs Claude session %s, but a transcript needed to compare the two could not be read, so continuity was never tested.' \
         "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    owner-not-claude)
+      printf 'The evidence supports a primary of another kind: that process is a live verified harness that is not Claude Code, so no Claude fork continuity with it is possible at all, and recovering supervision for this home belongs to that primary.' ;;
     owner-unresolved)
-      printf 'The evidence supports the displaced predecessor of this session: no live Claude session record vouches for that process or for the harness run it heads, which is how a fork-displaced predecessor reads, and equally how a non-Claude primary or an already-exited session reads.' ;;
+      printf 'The evidence is inconclusive: that process is a live Claude harness that no live session record vouches for, neither its own nor one for the harness run it heads, which is equally how the displaced predecessor of this session reads after a fork and how a session the registry has already dropped reads.' ;;
     job-record-unproven)
       printf 'The evidence is inconclusive: this session runs inside a Claude Code background job whose own record does not name Claude session %s as the session it continues, so continuity was never tested.' \
         "$FOREIGN_LOCK_OWNER_SESSION" ;;

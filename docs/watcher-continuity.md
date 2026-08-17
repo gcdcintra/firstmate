@@ -46,9 +46,12 @@ Everything else keeps the unchanged refusal, so the boundary the fleet depends o
 - The process start time is read from `/proc`, so fork recovery is Linux-only and every other platform refuses.
 - Every primary harness other than Claude keeps today's behavior, having no such registry, and the run walk rejects a non-Claude process at its first hop.
 
-Two limits are deliberate.
+Three limits are deliberate.
 A fork taken from a point earlier than the source's own tip leaves post-boundary uuids in the source, so it never auto-claims and the manual path remains.
 A source that has been idle since the fork loses the lock to its descendant and goes read-only if it is used again; the home still has exactly one owner at all times, and this is the only direction in which the change is more permissive - never the direction where two live sessions both act on one home.
+A background-job claimant more than one fork removed from the recorded owner is refused, because its job record names the session it forked from rather than the one the lock holds: background A into B while the home is idle so nothing rewrites the lock, background B into C, and C names B while the lock still names A.
+The transcript proof alone would allow C, so this is the price of binding the record to the recorded owner rather than to any ancestor, which is what keeps an inherited record from vouching for a session that is not the owner; the manual `bin/fm-watch-arm.sh` path remains, and one `bin/fm-lock.sh` acquire from B before it is backgrounded again removes the gap entirely.
+
 [`verification/supervision.md`](verification/supervision.md#resolving-a-lock-that-records-a-backgrounded-run) records the measured evidence for the backgrounded-run resolution.
 
 ## Actionable wake ordering
