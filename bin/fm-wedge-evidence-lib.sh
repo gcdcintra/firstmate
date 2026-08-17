@@ -26,16 +26,20 @@
 #      rediscover it.
 #   2. a declared wait (paused:/captain-held:)   subject: the worker's CLAIM
 #      Moves the pane to the long recheck cadence instead of the wedge cadence.
-#      It is a claim, not a measurement, and on this path it is a claim the
-#      harness contradicts - the worker says it is waiting while holding a turn
-#      open past its bound - so it buys a longer cadence and never silence.
-#      The caller decides whether the declaration is ELIGIBLE at all
-#      (<declared-wait-eligible>), because the watcher's own pause_state_class
-#      may already have reconciled that same line away against authoritative
-#      crew state. Re-reading the raw status line here and reversing that
-#      decision would put a superseded declaration back in charge of the
-#      cadence, which is the run-step precedence rule in bin/fm-crew-state.sh
-#      turned inside out.
+#      It is a claim, not a measurement, and every path that reaches here has
+#      something that reads against it - a turn held open past its bound, or a
+#      current-state read that reports the crew working - so it buys a longer
+#      cadence and never silence.
+#      The caller declares whether a declaration can be current on the path it
+#      is calling from (<declared-wait-eligible>), so a site that cannot reach
+#      one pays nothing to ask. Whether it IS current is decided here, by
+#      re-reading the last status line on every call: the watcher's own
+#      pause_state_class may have reported the crew authoritatively working under
+#      that same line, and that decides which absorb class the pane gets, not
+#      whether its declaration still stands. A crew that has actually moved off
+#      the declaration earns nothing on the next poll, so run-step precedence in
+#      bin/fm-crew-state.sh is preserved without the same declaration answering
+#      differently on two paths.
 #   3. the attributed pipeline run's own clock   subject: the PIPELINE's agent
 #      Read through bin/fm-crew-state.sh's --pipeline-activity mode, which
 #      reuses that file's branch and code-identity attribution so a sibling
@@ -131,7 +135,7 @@
 # that covers a different subject than the alarm buys less time, and this is
 # the number that decides when the delegation shape reaches deep inspection.
 FM_WEDGE_PIPELINE_MAX_DEFER_SECS=${FM_WEDGE_PIPELINE_MAX_DEFER_SECS:-3600}
-# A declared wait is a claim the harness contradicts on this path, so it buys
+# A declared wait is a claim something on this path reads against, so it buys
 # the same hour and no more.
 FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS=${FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS:-3600}
 # The worker-CPU cap keeps its established name and value; bin/fm-watch.sh's
@@ -139,7 +143,7 @@ FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS=${FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS:-3
 FM_WEDGE_CPU_MAX_DEFER_SECS=${FM_CPU_PROGRESS_MAX_DEFER_SECS:-7200}
 # The cadence a declared wait moves the pane onto: the same long recheck window
 # an idle declared wait already uses, so a worker gets one answer to the same
-# declaration whether or not it happens to be holding a turn open.
+# declaration whichever wedge path its pane happens to take.
 FM_WEDGE_DECLARED_WAIT_CADENCE=${FM_PAUSE_RESURFACE_SECS:-${FM_PAUSE_RESURFACE_SECS_DEFAULT:-3600}}
 # How long one delegation-shaped tool call may stay open before the veto fires.
 #
@@ -273,9 +277,10 @@ fm_wedge_spent_note() {  # <cap> <deferred-for> <age> <budget-usable> <budget-no
 # <deferred-for> is 0 when no episode is open. <budget-usable> is 0 when the
 # episode record was unreadable or its clock impossible; a corrupt record must
 # never hand a pane a fresh window, so it denies every tier at once.
-# <declared-wait-eligible> is 1 only where the caller has NOT already reconciled
-# the pane's declared wait against authoritative crew state, and defaults to 0
-# for the same reason <busy-path> does: a call site that forgets it escalates.
+# <declared-wait-eligible> is 1 on every call site a pane can reach while its
+# status log still declares a wait; whether the declaration is current is decided
+# here, not there. It defaults to 0 for the same reason <busy-path> does: a call
+# site that forgets it escalates.
 fm_wedge_evidence() {  # <state-dir> <task> <busy-verdict> <busy-path> <cpu-class> <cpu-detail> <deferred-for> <budget-usable> <budget-note> <age> <pipeline-cache> <declared-wait-eligible>
   local state=$1 task=$2 busy_verdict=$3 busy_path=${4:-0} cpu_class=$5 cpu_detail=$6
   local deferred_for=$7 budget_usable=$8 budget_note=$9 age=${10} cache=${11}

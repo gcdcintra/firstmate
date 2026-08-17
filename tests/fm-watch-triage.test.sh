@@ -1130,6 +1130,10 @@ test_nonterminal_paused_rechecks_authoritative_state() {
   pass "a declared pause is periodically rechecked against authoritative active-run state"
 }
 
+# What that timer then DOES with a still-standing declaration is owned by
+# test_declared_wait_under_an_active_run_stays_on_the_long_cadence below; this
+# case owns only the handover, because the two markers are mutually exclusive and
+# a pane left on the pause marker would never be wedge-timed at all.
 test_paused_authoritative_working_preserves_wedge_timer() {
   local dir state fakebin out capture_file window key pane_hash sig pid since
   dir=$(make_case paused-working-preserves-wedge-timer); state="$dir/state"; fakebin="$dir/fakebin"
@@ -1155,19 +1159,125 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   sleep 2
   [ "$(cat "$state/.stale-since-$key" 2>/dev/null || true)" = "$since" ] \
     || { reap "$pid"; fail "repeat authoritative working recheck reset the wedge timer"; }
+  [ ! -e "$state/.paused-$key" ] \
+    || { reap "$pid"; fail "authoritative working left the pane on the pause cadence marker"; }
   reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a paused status overridden by authoritative working takes the wedge timer rather than the pause cadence marker"
+}
 
-  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+# Observed 2026-08-14 (fm-watch-declared-wait-still-escalates): a crewmate
+# backgrounded its blocking pipeline call and declared the wait once, exactly as
+# the briefs ask. Its pane then sat static while the run worked, so
+# pause_state_class reported the crew authoritatively working - which correctly
+# moves the pane off the pause cadence marker and onto the wedge timer (the case
+# above) - and the wedge timer was handed no declared-wait eligibility at all.
+# The pane therefore re-escalated as a possible wedge every
+# FM_STALE_ESCALATE_SECS (~250s in production, ladder climbing 1, 2, 1, 2) for
+# the whole round, and only re-appending the declaration quieted it, because that
+# changed the pane and reset the tracking. The same declaration on the busy-turn
+# path got the long recheck cadence, so one declaration was answered two
+# different ways depending on which path the pane took.
+#
+# Absorbing the FIRST sighting was never the missing half - the triage log
+# absorbed every 15s throughout - so this case is driven across several
+# escalation windows and across monitoring-cycle restarts, and demands ZERO
+# wakes. Its closing phases are the other direction: the declaration is a claim,
+# and a pane it can no longer speak for escalates exactly as before.
+test_declared_wait_under_an_active_run_stays_on_the_long_cadence() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid
+  local round status wakes
+  dir=$(make_case declared-wait-active-run); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/declared-run.status"
+  window="test:fm-declared-run"
+  printf 'static pane; the backgrounded validation round is doing the work\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\nbackend=tmux\n' "$window" > "$state/declared-run.meta"
+  printf 'working: implementing\npaused: fix round in flight on the validation run, roughly 30-60 min\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-declared-run_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "static pane; the backgrounded validation round is doing the work")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The authoritative reader reports the attributed run, never the pause line
+  # (run-step precedence), which is what routes this pane to the wedge timer. The
+  # pipeline tier is left at the fake's unmeasurable default so nothing but the
+  # declaration itself can hold this pane back, and the CPU tier never applies
+  # off the busy-turn path.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # Three monitoring cycles at a 2s wedge threshold: each round crosses several
+  # escalation windows, and the pause cadence stays far longer than the wedge one,
+  # which is the relation under test.
+  round=1
+  while [ "$round" -le 3 ]; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_STALE_ESCALATE_SECS=2 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    # Each cycle either absorbs until this stops it (124) or exits on a wake; the
+    # aggregate below is the assertion, so one escalation never masks the rest and
+    # the failure reports how many times the pane came back.
+    wait_for_exit "$pid" 70
+    status=$?
+    [ "$status" -eq 0 ] || [ "$status" -eq 124 ] \
+      || fail "cycle $round exited $status: $(cat "$out")"
+    round=$((round + 1))
+  done
+  [ ! -s "$out" ] || fail "a once-declared wait printed a wake reason: $(cat "$out")"
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null || echo 0)
+  [ "$wakes" -eq 0 ] || fail "a once-declared wait queued $wakes stale wakes across three monitoring cycles"
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 0 ] \
+    || fail "a once-declared wait climbed the escalation ladder while its wait still held"
+  grep -F 'declared wait on the long recheck cadence' "$state/.watch-triage.log" >/dev/null \
+    || fail "the absorb did not record the declared wait as what held the escalation back: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+  # The absorb accounting must say WHICH path absorbed the pane and that a
+  # declaration was in play. Both provably-working absorb sites logged one
+  # identical sentence, which is why the original report could not be attributed
+  # to a path from the triage log at all.
+  grep -F 'provably working, under a declared wait, repeat poll' "$state/.watch-triage.log" >/dev/null \
+    || fail "the per-poll absorb line did not distinguish a declared-wait absorption: $(cat "$state/.watch-triage.log" 2>/dev/null)"
+
+  # A claim, not a measurement (1): the crew moved off the declaration, so the
+  # same static pane escalates as a possible wedge on the ordinary cadence.
+  printf 'resolved: upstream landed, back on the fix round\n' >> "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-declared-run_status"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=2 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "authoritative working state did not wedge-escalate past the threshold"
-  grep -F "possible wedge" "$out" >/dev/null || fail "authoritative working wedge escalation omitted its reason"
-  [ ! -e "$state/.stale-since-$key" ] || fail "wedge timer remained after authoritative working escalation"
+  wait_for_exit "$pid" 70 \
+    || fail "a static pane with no declaration standing stopped escalating as a possible wedge: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "the withdrawn declaration's pane did not escalate as a possible wedge: $(cat "$out")"
+
+  # A claim, not a measurement (2): the declaration is restored, but the pane's
+  # one shared deferral episode is spent, so it returns to the wedge cadence and
+  # the reason says the allowance ran out rather than reading like a healthy wait.
+  printf 'paused: fix round in flight on the validation run, roughly 30-60 min\n' >> "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-declared-run_status"
+  echo $(( $(date +%s) - 4000 )) > "$state/.wedge-defer-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=claude \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_WEDGE_DECLARED_WAIT_MAX_DEFER_SECS=3600 \
+    FM_STALE_ESCALATE_SECS=2 FM_PAUSE_RESURFACE_SECS=3600 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 70 \
+    || fail "a declared wait past its spent deferral allowance kept absorbing: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "a spent allowance did not return the declared wait to the wedge cadence: $(cat "$out")"
+  grep -F "recheck allowance is spent" "$out" >/dev/null \
+    || fail "the escalation did not say the declaration's allowance was spent: $(cat "$out")"
   unset FM_FAKE_CREW_STATE
-  pass "a paused status overridden by authoritative working preserves its wedge timer and escalates"
+  pass "one declared wait keeps a provably-working pane on the long recheck cadence across escalation windows and cycle restarts, while a withdrawn declaration and a spent allowance both still escalate"
 }
 
 # --- consecutive wedge escalations on the same pane demand deep inspection ----
@@ -2883,6 +2993,7 @@ test_secondmate_unpause_clears_pause_tracking
 test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash
 test_nonterminal_paused_rechecks_authoritative_state
 test_paused_authoritative_working_preserves_wedge_timer
+test_declared_wait_under_an_active_run_stays_on_the_long_cadence
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively
