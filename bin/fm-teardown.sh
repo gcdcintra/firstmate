@@ -80,6 +80,19 @@
 # recorded) falls back to an unguarded return; any other guarded failure,
 # including an older treehouse that rejects the flag, aborts loudly rather than
 # degrading to a return with no holder precondition.
+# A SECOND, independent ownership refusal runs before all of the above, and
+# before anything inspects the recorded path: a cross-check that no OTHER live
+# state/<id>.meta in the same firstmate home records the same worktree= or
+# home=. Two live records naming one path mean the pool reassigned that slot,
+# and that is provable from firstmate's own records alone - so it also covers
+# the cases the marker cannot, a task predating ownership records among them.
+# It names both task ids and the contested path, is distinct from both the
+# unlanded-work refusal and the marker refusal above, and --force does not
+# bypass it either. Both sides of the comparison are resolved before they are
+# compared, so a symlinked or differently spelled claim on one directory still
+# refuses. The scan reads one state directory, which is the whole of what it
+# proves; the forced child-cleanup preflight runs the same cross-check against
+# each child home's own state directory.
 # Usage: fm-teardown.sh <task-id> [--force] [--disown-worktree]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
@@ -206,6 +219,8 @@ T_ORCA=
 [ "$BACKEND" != orca ] || T_ORCA=$T
 "$FM_ROOT/bin/fm-guard.sh" || true
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
+# Secondmate homes recorded before home= existed carry the path in worktree=.
+[ -n "$HOME_PATH" ] || HOME_PATH=$WT
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
 # (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
@@ -676,6 +691,122 @@ canonical_existing_dir() {
   [ -n "$target" ] || return 1
   [ -d "$target" ] || return 1
   ( cd "$target" && pwd -P )
+}
+
+# --- Competing-claim cross-check --------------------------------------------
+# A task's recorded worktree= is a HISTORICAL claim, not proof of present
+# ownership: once a worktree is returned, treehouse recycles that pool slot and
+# hands the same path to a different task. Tearing down on a stale claim resets
+# the slot and kills the processes inside it, so it destroys the CURRENT
+# occupant's live work.
+# This is the records-only half of the proof, and it is independent of the
+# per-worktree ownership record require_worktree_ownership checks below: two
+# live metas naming one path are themselves evidence the slot was reassigned,
+# which holds even for a task carrying no ownership record at all. --force does
+# not bypass it, because the work at risk belongs to the other task.
+ownership_normalize_path() {  # <path> -> path with trailing slashes trimmed
+  local path=$1
+  [ -n "$path" ] || return 1
+  while [ "$path" != / ] && [ "${path%/}" != "$path" ]; do
+    path=${path%/}
+  done
+  printf '%s\n' "$path"
+}
+
+# How two recorded spellings relate: 0 same directory, 1 provably different,
+# 2 undecidable. Two spellings are the same when they normalize to one string or
+# resolve to one existing directory, so a symlinked or differently spelled claim
+# on a path still matches. They are provably different when both resolve and the
+# resolved paths differ, or when one resolves to a directory and the other is not
+# a directory at all. Everything else - an empty path, a directory that cannot be
+# entered - stays undecided, so a caller about to destroy work can fail closed
+# instead of reading "could not compare" as "not mine".
+ownership_paths_relation() {  # <path-a> <path-b>
+  local a=$1 b=$2 na nb ra rb
+  na=$(ownership_normalize_path "$a") || return 2
+  nb=$(ownership_normalize_path "$b") || return 2
+  [ "$na" != "$nb" ] || return 0
+  ra=$(canonical_existing_dir "$na") || ra=
+  rb=$(canonical_existing_dir "$nb") || rb=
+  if [ -n "$ra" ] && [ -n "$rb" ]; then
+    [ "$ra" != "$rb" ] || return 0
+    return 1
+  fi
+  [ -z "$ra" ] || [ -d "$nb" ] || return 1
+  [ -z "$rb" ] || [ -d "$na" ] || return 1
+  return 2
+}
+
+ownership_paths_match() {  # <path-a> <path-b>
+  local rel=0
+  ownership_paths_relation "$1" "$2" || rel=$?
+  [ "$rel" -eq 0 ]
+}
+
+# The operator's whole recovery path for an ownership refusal, so it names the
+# exact records and the exact edit, and rules out the two edits that look right
+# and are not. Emptying worktree= does NOT disown a path: the endpoint validator
+# (fm_backend_validate_task_endpoint) requires exactly one non-empty worktree=,
+# so an emptied record refuses that task's teardown permanently. Deleting a meta
+# is no better: dropping the OTHER task's meta re-arms this destructive path
+# against the task that really holds the slot, and dropping this task's own meta
+# makes its teardown fail permanently and orphans its status, turn-ended,
+# busy-gen and pr-poll records, which only teardown removes. What works is
+# repointing the stale record at what that task actually holds - and on EVERY
+# path line, not one of them: a secondmate records the same path as both
+# worktree= and home= (bin/fm-spawn.sh), so a half-corrected record still names
+# the contested path, which either reproduces this refusal unchanged or, through
+# the cross-check, refuses the teardown of the task that really owns the path.
+ownership_recovery_instructions() {  # <state-dir> <self-id> <path> <confirm-cmd> [other-record]
+  local state_dir=$1 self_id=$2 path=$3 confirm=$4 other_record=${5:-} records
+  records="$state_dir/$self_id.meta for $self_id"
+  [ -z "$other_record" ] || records="$records, or $other_record"
+  echo "Recovery: confirm which task is really in $path ($confirm)." >&2
+  echo "Then, in the stale claimant's own record ($records), repoint EVERY worktree= and home= line that records $path to the path that task actually holds now - both lines when both name it, since a record that still names $path anywhere keeps refusing, here or on the teardown of the task that really owns it." >&2
+  echo "Do not empty worktree= (a record with no worktree identity refuses its own teardown for good) and delete no meta file. If the stale task holds nothing any more, it has no worktree to tear down: retire its state/<id>.* records together by hand rather than pointing this teardown at $path." >&2
+  echo "Then rerun teardown." >&2
+}
+
+# Does another live task in the SAME firstmate home claim <path>? Every live
+# task keeps its <id>.meta until its own teardown removes it, so a second
+# recorded claim on one path means the pool reassigned that slot.
+# This scan reads one state directory, and that is the whole of what it proves:
+# it catches a competing claim recorded in this home, and it does NOT see one
+# recorded in a sibling home. That gap is real rather than hypothetical for the
+# firstmate repo itself. Treehouse keys a pool by <toplevel basename>-<repo
+# hash>, and a firstmate home seeded into a pool slot is a worktree of the
+# firstmate repo whose toplevel basename is again `firstmate`, so every
+# firstmate home - primary and pooled alike - resolves to one shared pool. A
+# slot handed out there can be claimed in a state directory this scan never
+# reads. What closes that across homes is the per-worktree ownership record and
+# the durable lease, neither of which is scoped to a state directory: a leased
+# firstmate home is returned through `treehouse return --if-lease-holder`, and
+# an ordinary worktree carries the marker bin/fm-worktree-owner-lib.sh checks,
+# whoever recorded the competing claim. This scan is the backstop that also
+# holds where neither exists - a task predating ownership records among them.
+# Widening it past one state directory is deliberately not done here; it is
+# separate work.
+worktree_ownership_conflict_in_state() {  # <state-dir> <self-id> <path> <label>
+  local state_dir=$1 self_id=$2 path=$3 label=$4 other_meta other_id key other
+  [ -n "$path" ] || return 0
+  [ -d "$state_dir" ] || return 0
+  for other_meta in "$state_dir"/*.meta; do
+    [ -f "$other_meta" ] || continue
+    other_id=$(basename "$other_meta" .meta)
+    [ "$other_id" != "$self_id" ] || continue
+    for key in worktree home; do
+      other=$(fm_meta_get "$other_meta" "$key")
+      [ -n "$other" ] || continue
+      ownership_paths_match "$path" "$other" || continue
+      echo "REFUSED: ownership conflict on $label $path: task $self_id recorded it, but live task $other_id also claims it ($key= in $other_meta)." >&2
+      echo "That slot was reassigned, so cleaning it up would destroy task $other_id's work; this teardown's discard approval does not cover another task's work, so --force does not bypass this." >&2
+      ownership_recovery_instructions "$state_dir" "$self_id" "$path" \
+        "FM_STATE_OVERRIDE=$state_dir bin/fm-crew-state.sh $other_id" \
+        "$other_meta for $other_id"
+      return 1
+    done
+  done
+  return 0
 }
 
 retry_wait_secs_is_valid() {
@@ -1507,17 +1638,23 @@ validate_firstmate_home_children_removal() {
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
+      worktree_ownership_conflict_in_state "$sub_state" "$child_id" "$child_home" \
+        "child firstmate home" || return 1
       validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
     elif [ "$child_backend" = orca ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
         child_proj=$(meta_value "$child_meta" project)
+        worktree_ownership_conflict_in_state "$sub_state" "$child_id" "$child_wt" \
+          "child worktree" || return 1
         validate_child_worktree_for_removal "$child_wt" "$child_proj" "$child_meta" "$child_id" >/dev/null || return 1
         require_orca_worktree_path_match "$child_orca_worktree_id" "$child_wt" || return 1
       fi
     elif [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
       child_proj=$(meta_value "$child_meta" project)
+      worktree_ownership_conflict_in_state "$sub_state" "$child_id" "$child_wt" \
+        "child worktree" || return 1
       validate_child_worktree_for_removal "$child_wt" "$child_proj" "$child_meta" "$child_id" >/dev/null || return 1
     fi
   done
@@ -1772,10 +1909,22 @@ remove_secondmate_registry_entry() {
   mv "$tmp" "$SECONDMATE_REG"
 }
 
+# Competing claims first: every gate below either inspects or destroys the
+# recorded path, and both are wrong when another live task now records it. This
+# is the earliest point where the records needed to decide that are all read,
+# and it runs for --force too, because the work at risk is the other task's. It
+# does not replace require_worktree_ownership further down, which proves the
+# worktree carries THIS task's own ownership record; a stale claim can be the
+# only surviving evidence when no such record exists.
+if [ "$KIND" = secondmate ]; then
+  worktree_ownership_conflict_in_state "$STATE" "$ID" "$HOME_PATH" "secondmate home" || exit 1
+else
+  worktree_ownership_conflict_in_state "$STATE" "$ID" "$WT" "worktree" || exit 1
+fi
+
 validate_pr_poll_cleanup "$STATE" "$ID" || exit 1
 
 if [ "$KIND" = secondmate ]; then
-  [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
@@ -2043,7 +2192,6 @@ if [ "$BACKEND" = herdr ]; then
   fi
 fi
 if [ "$KIND" = secondmate ]; then
-  [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
   remove_secondmate_registry_entry "$ID"
 fi

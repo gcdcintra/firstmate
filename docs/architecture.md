@@ -255,7 +255,8 @@ Every GitHub pull-request and issue query names its repository, because the GitH
 PR-based task merges go through `bin/fm-pr-merge.sh`, which records `pr=` and any available `pr_head=` through `bin/fm-pr-check.sh` before calling `gh-axi pr merge`.
 The helper requires a full `https://github.com/<owner>/<repo>/pull/<n>` URL, invokes `gh-axi pr merge <n> --repo <owner>/<repo>`, defaults to `--squash`, preserves explicit merge-method flags, and rejects malformed URLs or repo override flags before recording merge state; a well-formed GitLab merge request URL (see [docs/gitlab-merge-watch.md](gitlab-merge-watch.md)) is refused too, explicitly, rather than sent to the wrong forge.
 Teardown is fail-closed for ship worktrees: dirty worktrees refuse, committed work must be landed before the worktree is returned, and the recorded worktree must still be provably that task's.
-[`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the landed-work proofs, PR-discovery fallback, and stale-lock recovery procedure.
+Ahead of that ownership record, and ahead of every inspection, teardown also refuses when another live `state/<id>.meta` in the same home records the same path, because two live claims on one path are by themselves evidence the pool reassigned that slot - which holds even for a task carrying no ownership record at all.
+[`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the ownership proofs, landed-work proofs, PR-discovery fallback, and stale-lock recovery procedure.
 
 ## Optional X mode
 
