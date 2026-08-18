@@ -453,6 +453,8 @@ test_watch_restart_attaches_to_healthy_peer() {
   out="$dir/restart.out"
   ready="$dir/peer-ready"
   mark_pr_check_migration_complete "$state"
+  command -v node >/dev/null 2>&1 \
+    || fail "no node on PATH to build the TERM-resistant peer this case needs"
   # The peer must already be TERM-resistant when the restart arm signals it: node
   # installs the SIGTERM handler only after its ~150ms bootstrap, and a TERM that
   # lands earlier kills the peer, turning this attach case into a fresh-start one.
@@ -462,6 +464,8 @@ test_watch_restart_attaches_to_healthy_peer() {
   peer=$!
   i=0
   while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do
+    is_live_non_zombie "$peer" \
+      || fail "the node peer died before it could register its SIGTERM handler"
     sleep 0.1
     i=$((i + 1))
   done
@@ -476,7 +480,7 @@ test_watch_restart_attaches_to_healthy_peer() {
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 200 ]; do
     grep -qF "watcher: attached pid=$peer" "$out" 2>/dev/null && break
     sleep 0.1
     i=$((i + 1))
