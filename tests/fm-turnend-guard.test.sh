@@ -1040,50 +1040,45 @@ EOF
 # A private Claude Code configuration root and a fixed claimant identity, so the
 # stood-down evidence these cases assert is decided by fixtures below rather than
 # by whichever sessions the machine running this suite happens to be hosting.
-GUARD_CLAUDE_CONFIG="$TMP_ROOT/claude-config"
-mkdir -p "$GUARD_CLAUDE_CONFIG/sessions" "$GUARD_CLAUDE_CONFIG/projects/probe"
+GUARD_CLAUDE_CONFIG=$(fm_test_claude_config "$TMP_ROOT/claude-config")
 GUARD_SESSION_ID=00000000-0000-4000-9000-00000000000a
 GUARD_OWNER_SESSION_ID=00000000-0000-4000-9000-00000000000b
 
+# $3 overrides the claimant's own Claude session id, so the cases that must be
+# reported on the OWNER's kind alone can run it with none at all - the shape a
+# hook that never received CLAUDE_CODE_SESSION_ID fires in. Defaulted with ${3-}
+# rather than ${3:-} so an explicit empty value is honored.
 run_hook_claude() {
-  local dir=$1 stop_active=$2 home
+  local dir=$1 stop_active=$2 own_session=${3-$GUARD_SESSION_ID} home
   home=$(cd "$dir" && pwd)
   printf '{"stop_hook_active":%s,"session_id":"sess-claude-mode"}' "$stop_active" \
     | CLAUDECODE=1 FM_HOME="$home" \
       CLAUDE_CONFIG_DIR="$GUARD_CLAUDE_CONFIG" \
-      CLAUDE_CODE_SESSION_ID="$GUARD_SESSION_ID" \
+      CLAUDE_CODE_SESSION_ID="$own_session" \
       CLAUDE_JOB_DIR='' \
       bash "$dir/bin/fm-turnend-guard.sh" --claude 2>&1
 }
 
 # Claude Code's own live-session record and transcript shapes, in that private
-# root, so a recorded lock owner can be made resolvable on purpose.
+# root, so a recorded lock owner can be made resolvable on purpose. The shapes
+# themselves live in tests/lib.sh, which owns the one encoding of that external
+# contract.
 register_guard_session() {  # <pid> <session-id>
-  local pid=$1 session_id=$2 start=''
-  [ ! -r "/proc/$pid/stat" ] || start=$(awk '{ print $22 }' "/proc/$pid/stat")
-  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
-    "$pid" "$session_id" "$start" > "$GUARD_CLAUDE_CONFIG/sessions/$pid.json"
+  fm_test_claude_register_session "$GUARD_CLAUDE_CONFIG" "$@"
 }
 
 write_guard_transcript() {  # <session-id> <uuid>...
-  local session_id=$1 uuid file
-  shift
-  file="$GUARD_CLAUDE_CONFIG/projects/probe/$session_id.jsonl"
-  : > "$file"
-  for uuid in "$@"; do
-    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
-      "$uuid" "$session_id" >> "$file"
-  done
+  fm_test_claude_write_transcript "$GUARD_CLAUDE_CONFIG" "$@"
 }
 
 guard_msg_uuid() {  # <n>
-  printf '00000000-0000-4000-8000-%012d\n' "$1"
+  fm_test_claude_msg_uuid "$1"
 }
 
 # The registry proof binds a record to a process start time read from /proc, so
 # a resolvable owner can only be staged where that evidence exists.
 guard_fork_evidence_available() {
-  [ -r "/proc/$$/stat" ]
+  fm_test_claude_fork_evidence_available
 }
 
 seed_claude_failure() {
@@ -1703,6 +1698,51 @@ test_hook_claude_mode_standdown_reports_a_non_claude_owner_as_another_primary() 
   pass "fm-turnend-guard --claude: a live non-Claude lock owner is reported as a primary of another kind"
 }
 
+# The owner's KIND is established by the liveness read, independently of whether
+# this claimant can identify its own session. A hook that fires with no
+# CLAUDE_CODE_SESSION_ID must therefore still be told a codex/opencode/grok/kimi/pi
+# owner is a primary of another kind, rather than be handed the missing-own-identity
+# reading, which describes only what this process failed to learn about itself and
+# leaves the operator to guess the owner is a Claude session of some sort.
+test_hook_claude_mode_standdown_reports_a_non_claude_owner_without_own_identity() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-not-claude-no-identity")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir" "$FAKE_CODEX_STANDDOWN"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true ''); status=$?
+  release_foreign_lock_owner
+  expect_code 2 "$status" "a live non-Claude lock owner must still block within the budget without an own session id"
+  assert_contains "$out" "$FOREIGN_LOCK_PID" "the banner must name the recorded lock owner it read"
+  assert_contains "$out" 'not Claude Code' \
+    "the owner kind is known from the liveness read, so it must be reported even with no own session id"
+  assert_not_contains "$out" 'carries no Claude session id' \
+    "a resolved non-Claude owner must not be reported as an unproducible-evidence case about this process"
+  assert_not_contains "$out" 'displaced predecessor' \
+    "a live non-Claude owner must never be reported as the displaced predecessor of this Claude session"
+  assert_contains "$out" 'Stop hook registration' "the banner must keep the hook registration in scope"
+  pass "fm-turnend-guard --claude: a non-Claude owner is reported by kind even when this session has no own id"
+}
+
+# The claimant-side counterpart, kept next to it so the case the fallback above
+# must NOT swallow stays covered: a live CLAUDE owner plus no own session id is
+# genuinely the missing-own-identity case, and must still read as that.
+test_hook_claude_mode_standdown_reports_a_missing_own_identity_as_such() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-standdown-no-identity")
+  : > "$dir/state/task1.meta"
+  record_foreign_lock_owner "$dir"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" true ''); status=$?
+  release_foreign_lock_owner
+  expect_code 2 "$status" "a claimant with no own session id must still block within the budget"
+  assert_contains "$out" 'carries no Claude session id' \
+    "a Claude owner plus no own session id must be reported as the missing-own-identity case"
+  assert_not_contains "$out" 'not Claude Code' \
+    "a live Claude owner must never be reported as a harness of another kind"
+  assert_not_contains "$out" 'The evidence supports' \
+    "an unproducible-evidence case must not claim the evidence supports any single reading"
+  pass "fm-turnend-guard --claude: a claimant with no own session id is reported as producing no evidence"
+}
+
 test_hook_claude_mode_standdown_reports_a_diverged_owner_as_a_second_session() {
   local dir out status
   guard_fork_evidence_available || { pass "fm-turnend-guard --claude: a resolvable owner needs a process start time, unavailable here"; return; }
@@ -1945,6 +1985,8 @@ test_hook_claude_mode_secondmate_reblocks_like_primary
 test_hook_claude_mode_standdown_names_real_reason_and_stays_bounded
 test_hook_claude_mode_standdown_reports_an_unresolvable_owner_as_such
 test_hook_claude_mode_standdown_reports_a_non_claude_owner_as_another_primary
+test_hook_claude_mode_standdown_reports_a_non_claude_owner_without_own_identity
+test_hook_claude_mode_standdown_reports_a_missing_own_identity_as_such
 test_hook_claude_mode_standdown_reports_a_diverged_owner_as_a_second_session
 test_hook_claude_mode_standdown_reaches_fail_open
 test_hook_claude_mode_standdown_recovery_clears_episode_state

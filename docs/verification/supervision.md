@@ -704,8 +704,9 @@ run hosts (2529774 under 1315077)        no      (a different live bg-pty-host)
 widened resolve of unrelated pid 484999  UNRESOLVED
 ```
 
-The boundary is unchanged in every other direction, because the walk never leaves one contiguous Claude run: a session in another run is not reachable at all, two session records inside one run are ambiguity rather than an answer, and a recorded owner the registry vouches for nowhere in its run keeps the unchanged refusal - as does every non-Claude primary, which the walk rejects at its first hop.
+The boundary is unchanged in every other direction, because the walk never leaves one contiguous Claude run: a session in another run is not reachable at all, two session records inside one run are ambiguity rather than an answer, and a recorded owner the registry vouches for nowhere in its run keeps the unchanged refusal - as does every non-Claude primary, whose own liveness read discards it before any candidate walk starts.
 A non-Claude owner is published as its own `owner-not-claude` evidence rather than folded into the unresolved case, because a live harness of another kind is the one thing that cannot be the displaced predecessor of a Claude session, and the turn-end guard must not offer that reading for it.
+It replaces every token the fork walk can reach without resolving the owner, `no-session-identity` as well as `owner-unresolved`: both describe only what the walk failed to learn, while the owner's kind is already established by the liveness read, so a claimant that carries no session id of its own is still told what the recorded owner is rather than only what it could not prove about itself.
 
 This fallback runs whenever the direct record misses, which is the normal shape for a backgrounded primary, and the turn-end guard reaches it twice per Stop.
 Candidates are therefore discarded cheapest-first, and the matcher the walk calls per hop was moved onto shell builtins.
@@ -717,6 +718,10 @@ after    68 clones
 ```
 
 Both resolve host pid 2529590 to the same session and both leave the unrelated live Claude pid 484999 unresolved.
+
+The counts above predate one further discard, which was not re-measured against a live table: the run walk also requires the RECORDED pid to be a live Claude harness process, which is one answer for every candidate, so it is now read once on the first live candidate instead of per candidate.
+A resolvable Claude owner pays one extra process-table read for it; a lock held by a live codex, opencode, grok, kimi or pi primary stops paying an ancestry walk per live registry record for a walk that could never have succeeded, on a path the turn-end guard and the auto-arm reach up to four times per Stop.
+The no-live-candidate case still costs no subprocess at all.
 
 Deterministic entry points:
 

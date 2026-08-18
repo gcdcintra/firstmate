@@ -292,6 +292,16 @@ fm_claude_record_field() {  # <file> <key>
 #
 # A record that is absent, unreadable, malformed, self-naming, or about anyone
 # other than this claimant and this lock owner fails closed into today's refusal.
+#
+# Binding the record to the recorded owner has one accepted consequence, and it is
+# the deliberate safe edge of this boundary rather than an oversight to widen into
+# chain-walking: a claimant more than ONE background fork removed from the
+# recorded owner is refused, because its job record names the session it forked
+# from rather than the one the lock holds - background A into B while the home is
+# idle, then B into C, and C names B while the lock still names A. That binding is
+# exactly what stops an inherited record vouching for a session that is not the
+# owner, so this walks no chain: one `bin/fm-lock.sh` acquire from B removes the
+# gap, and docs/watcher-continuity.md owns the operator-facing statement of it.
 fm_claude_job_continues_another_session() {  # <own-session-id> <owner-session-id>
   local own_session=$1 owner_session=$2 dir=${CLAUDE_JOB_DIR:-} record own resumed
   [ -n "$dir" ] || return 1
@@ -380,8 +390,17 @@ fm_harness_run_hosts_pid() {  # <inner-pid> <outer-pid>
 # its record is ever read. Only a candidate the run genuinely hosts pays for the
 # record proof. Ordering the two conditions this way cannot change the outcome,
 # because a candidate must satisfy both to be accepted.
+#
+# The run walk also requires the RECORDED pid itself to be a live Claude harness
+# process, which is a property of that pid alone and so the same answer for every
+# candidate. It is therefore tested once, on the first live candidate, rather
+# than re-derived per candidate at the top of each walk: a lock recorded by a
+# live codex, opencode, grok, kimi or pi primary - a supported configuration -
+# would otherwise pay a whole ancestry walk per live record for a walk that
+# cannot succeed, four times over on a single Stop. Testing it lazily keeps the
+# no-live-candidate case free of subprocesses entirely.
 fm_claude_session_id_of_pid() {  # <pid>
-  local pid=$1 cfg record candidate session_id found=''
+  local pid=$1 cfg record candidate session_id found='' owner_verified=0
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -396,6 +415,11 @@ fm_claude_session_id_of_pid() {  # <pid>
     esac
     [ "$candidate" != "$pid" ] || continue
     kill -0 "$candidate" 2>/dev/null || continue
+    if [ "$owner_verified" -eq 0 ]; then
+      fm_harness_pid_alive "$pid" || return 1
+      [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || return 1
+      owner_verified=1
+    fi
     fm_harness_run_hosts_pid "$candidate" "$pid" || continue
     session_id=$(fm_claude_session_record_id "$candidate") || continue
     [ -z "$found" ] || return 1
@@ -528,6 +552,13 @@ fm_claude_fork_descendant_of_pid() {  # <pid>
 #                         Claude session that a codex, opencode, grok, kimi or pi
 #                         owner is probably its own displaced predecessor, which
 #                         no displaced predecessor of a Claude session can be.
+#                         It replaces EVERY token the fork walk can reach without
+#                         resolving the owner - no-session-identity as well as
+#                         owner-unresolved - because both of those describe only
+#                         what the walk failed to learn, while the owner's kind is
+#                         a fact already in hand. A claimant that carries no
+#                         session id of its own still knows a non-Claude owner is
+#                         no fork source of any Claude session.
 # shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
 FM_SESSION_LOCK_OWNER_PID=unknown
 # shellcheck disable=SC2034 # Read by the stood-down messages in bin/fm-turnend-guard.sh, not this lib.
@@ -563,8 +594,10 @@ fm_session_lock_foreign_owner_alive() {
   fm_claude_fork_descendant_of_pid "$lock_pid" && return 1
   FM_SESSION_LOCK_OWNER_SESSION=$FM_CLAUDE_FORK_OWNER_SESSION
   FM_SESSION_LOCK_OWNER_EVIDENCE=$FM_CLAUDE_FORK_EVIDENCE
-  if [ "$owner_is_claude" -eq 0 ] && [ "$FM_SESSION_LOCK_OWNER_EVIDENCE" = 'owner-unresolved' ]; then
-    FM_SESSION_LOCK_OWNER_EVIDENCE='owner-not-claude'
+  if [ "$owner_is_claude" -eq 0 ]; then
+    case "$FM_SESSION_LOCK_OWNER_EVIDENCE" in
+      owner-unresolved|no-session-identity) FM_SESSION_LOCK_OWNER_EVIDENCE='owner-not-claude' ;;
+    esac
   fi
   return 0
 }

@@ -229,20 +229,12 @@ SH
 # cases read the same registry and transcript layout the harness writes without
 # depending on this machine's own sessions.
 
-CLAUDE_CONFIG_DIR="$TMP_ROOT/claude-config"
+CLAUDE_CONFIG_DIR=$(fm_test_claude_config "$TMP_ROOT/claude-config")
 export CLAUDE_CONFIG_DIR
-mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$CLAUDE_CONFIG_DIR/projects/probe"
 
-FORK_HELPER_PIDS=()
-stop_helper_processes() {
-  local pid
-  for pid in "${FORK_HELPER_PIDS[@]:-}"; do
-    [ -n "$pid" ] || continue
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-  done
-}
-trap 'stop_helper_processes; fm_test_cleanup' EXIT
+# The record shapes themselves live in tests/lib.sh, which owns the one encoding
+# of that external contract; the wrappers below only bind them to this suite's
+# private configuration root and temp tree.
 
 # Publish a live process in OWNER_PID to stand in for a session owner. The
 # descent evidence never consults the process table, so any real pid carries the
@@ -252,91 +244,40 @@ OWNER_PID=
 spawn_owner_process() {
   sleep 60 >/dev/null 2>&1 &
   OWNER_PID=$!
-  FORK_HELPER_PIDS+=("$OWNER_PID")
-}
-
-# Read the kernel start time of pid $1 straight from /proc, independently of the
-# library's own parsing. Empty on a platform without /proc.
-raw_proc_start() {  # <pid>
-  [ -r "/proc/$1/stat" ] || return 0
-  awk '{ print $22 }' "/proc/$1/stat" 2>/dev/null
+  fm_test_cleanup_register_pid "$OWNER_PID"
 }
 
 # True when this host can supply the process start time the registry check
 # requires. Everywhere else the evidence is unavailable by design and every
 # claim below must be refused instead.
 proc_start_available() {
-  [ -n "$(raw_proc_start $$)" ]
+  fm_test_claude_fork_evidence_available
 }
 
-# Claude Code's own live-session record for pid $1 running session $2, with an
-# optional start time that does NOT match the live process.
 register_session() {  # <pid> <session-id> [<proc-start>]
-  local pid=$1 session_id=$2 start=${3:-}
-  [ -n "$start" ] || start=$(raw_proc_start "$pid")
-  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
-    "$pid" "$session_id" "$start" > "$CLAUDE_CONFIG_DIR/sessions/$pid.json"
+  fm_test_claude_register_session "$CLAUDE_CONFIG_DIR" "$@"
 }
 
-# A transcript for session $1 carrying message uuids $2.., in the record shape a
-# fork copies verbatim.
 write_transcript() {  # <session-id> <uuid>...
-  local session_id=$1 uuid file
-  shift
-  file="$CLAUDE_CONFIG_DIR/projects/probe/$session_id.jsonl"
-  : > "$file"
-  for uuid in "$@"; do
-    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
-      "$uuid" "$session_id" >> "$file"
-  done
+  fm_test_claude_write_transcript "$CLAUDE_CONFIG_DIR" "$@"
 }
 
-# Distinct, well-formed v4-shaped message uuids.
 msg_uuid() {  # <n>
-  printf '00000000-0000-4000-8000-%012d\n' "$1"
+  fm_test_claude_msg_uuid "$1"
 }
 
-# A Claude Code background-job directory of the shape `claude --bg` writes, and
-# print it for CLAUDE_JOB_DIR. $1 names the job's own session and $2 the session
-# it was created to continue; passing the same value for both is the shape a job
-# seeded with its own task carries.
 make_job_dir() {  # <name> <own-session-id> <resumed-session-id>
-  local dir="$TMP_ROOT/jobs/$1"
-  mkdir -p "$dir"
-  printf '{\n  "sessionId": "%s",\n  "resumeSessionId": "%s",\n  "template": "bg",\n  "backend": "daemon"\n}\n' \
-    "$2" "$3" > "$dir/state.json"
-  printf '%s\n' "$dir"
+  fm_test_claude_job_dir "$TMP_ROOT/jobs/$1" "$2" "$3"
 }
 
-# A backgrounded Claude session as the process table really shows it: a
-# harness-named host process with the session process as its own child, so the
-# outermost pid of the contiguous run - the pid the session lock records - is a
-# process the harness registry never keys a record on.
-BG_HOST_SCRIPT="$TMP_ROOT/bg-host.sh"
-cat > "$BG_HOST_SCRIPT" <<'SH'
-#!/usr/bin/env bash
-# $1 = directory to publish the session pid into, $2 = harness-named interpreter.
-"$2" -c 'printf "%s\n" "$$" > "$0/session-pid"; while :; do sleep 0.2; done' "$1" &
-wait
-SH
-
-# Publish one such run: BG_HOST_PID is what a lock would record for it, and
-# BG_SESSION_PID is the only pid in it the registry ever records.
+# Publish one backgrounded run: BG_HOST_PID is what a lock would record for it,
+# and BG_SESSION_PID is the only pid in it the registry ever records.
 BG_HOST_PID=
 BG_SESSION_PID=
 spawn_backgrounded_session_run() {  # <name>
-  local dir="$TMP_ROOT/bg-run-$1" i=0
-  mkdir -p "$dir"
-  "$NAMED_CLAUDE" "$BG_HOST_SCRIPT" "$dir" "$NAMED_CLAUDE" >/dev/null 2>&1 &
-  BG_HOST_PID=$!
-  FORK_HELPER_PIDS+=("$BG_HOST_PID")
-  while [ "$i" -lt 200 ] && [ ! -s "$dir/session-pid" ]; do
-    sleep 0.05
-    i=$((i + 1))
-  done
-  [ -s "$dir/session-pid" ] || fail "the backgrounded-run fixture never started its session process"
-  BG_SESSION_PID=$(tr -d '[:space:]' < "$dir/session-pid")
-  FORK_HELPER_PIDS+=("$BG_SESSION_PID")
+  fm_test_spawn_bg_session_run "$NAMED_CLAUDE" "$TMP_ROOT/bg-run-$1"
+  BG_HOST_PID=$FM_TEST_BG_HOST_PID
+  BG_SESSION_PID=$FM_TEST_BG_SESSION_PID
 }
 
 # Evaluate one library expression against the REAL process table.
@@ -521,6 +462,35 @@ test_live_session_outside_the_recorded_run_is_never_borrowed() {
     fail "an unrelated live session record was borrowed to resolve a recorded owner"
   fi
   pass "fork descent: a live session outside the run the lock records is never borrowed to resolve it"
+}
+
+# The same boundary where the recorded owner IS a live verified Claude process, so
+# nothing about its kind can discard it early and the run walk itself is the only
+# thing standing between two independent live runs on one machine - the case that
+# actually decides whether a second session's identity can be handed to this
+# home's recorded owner.
+test_claude_owner_outside_the_registered_run_is_never_borrowed() {
+  local registered_session outsider_host
+  proc_start_available || { pass "fork descent: outside-the-run Claude-owner case needs /proc, refused everywhere else"; return; }
+  spawn_backgrounded_session_run borrow-source
+  registered_session=$BG_SESSION_PID
+  register_session "$registered_session" 00000000-0000-4000-9000-000000000031
+  write_transcript 00000000-0000-4000-9000-000000000031 "$(msg_uuid 1)" "$(msg_uuid 2)"
+  write_transcript 00000000-0000-4000-9000-000000000032 "$(msg_uuid 1)" "$(msg_uuid 2)" "$(msg_uuid 3)"
+  # A second, independent backgrounded run. Its host is a live Claude harness the
+  # registry vouches for nowhere, and the only live record on the machine belongs
+  # to the OTHER run, so resolving it can only happen by borrowing across runs.
+  spawn_backgrounded_session_run borrow-target
+  outsider_host=$BG_HOST_PID
+  [ "$outsider_host" != "$registered_session" ] \
+    || fail "the fixture reused one run for both sides, so nothing about the run walk is being tested"
+  [ ! -e "$CLAUDE_CONFIG_DIR/sessions/$outsider_host.json" ] \
+    || fail "the fixture registered the recorded owner, which is exactly what this case must not stage"
+  if CLAUDE_JOB_DIR='' CLAUDE_CODE_SESSION_ID=00000000-0000-4000-9000-000000000032 \
+    lib_run "fm_claude_fork_descendant_of_pid $outsider_host"; then
+    fail "a session record from another live Claude run was borrowed to resolve the recorded owner"
+  fi
+  pass "fork descent: a live Claude owner outside the registered run is never resolved by borrowing across runs"
 }
 
 test_inherited_ancestor_job_record_never_claims() {
@@ -744,6 +714,7 @@ test_backgrounded_session_with_an_unreadable_job_record_is_refused
 test_backgrounded_session_whose_source_resumed_work_is_refused
 test_fork_of_a_backgrounded_source_resolves_the_run_the_lock_records
 test_live_session_outside_the_recorded_run_is_never_borrowed
+test_claude_owner_outside_the_registered_run_is_never_borrowed
 test_inherited_ancestor_job_record_never_claims
 test_job_record_continuing_a_different_session_is_refused
 test_recycled_pid_record_is_rejected

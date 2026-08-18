@@ -25,90 +25,53 @@ export FAKE_CLAUDE
 # A private Claude Code configuration root. Empty by default so no live-owner
 # case can accidentally read this machine's real sessions; the fork cases below
 # populate it with the registry and transcripts the harness would have written.
-CLAUDE_CONFIG_DIR="$TMP_ROOT/claude-config"
+CLAUDE_CONFIG_DIR=$(fm_test_claude_config "$TMP_ROOT/claude-config")
 export CLAUDE_CONFIG_DIR
-mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$CLAUDE_CONFIG_DIR/projects/probe"
 
-# Record live pid $1 as running Claude session $2, exactly as Claude Code's own
-# live-session registry does, including the process start time that binds the
-# record to this incarnation of the pid.
+# The record shapes themselves live in tests/lib.sh, which owns the one encoding
+# of that external contract; the wrappers below only bind them to this suite's
+# private configuration root, temp tree, and fake harness.
+
 register_claude_session() {  # <pid> <session-id>
-  local pid=$1 session_id=$2 start=''
-  [ ! -r "/proc/$pid/stat" ] || start=$(awk '{ print $22 }' "/proc/$pid/stat")
-  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
-    "$pid" "$session_id" "$start" > "$CLAUDE_CONFIG_DIR/sessions/$pid.json"
+  fm_test_claude_register_session "$CLAUDE_CONFIG_DIR" "$@"
 }
 
-# A transcript for session $1 carrying message uuids $2.., in the record shape a
-# fork copies verbatim.
 write_claude_transcript() {  # <session-id> <uuid>...
-  local session_id=$1 uuid file
-  shift
-  file="$CLAUDE_CONFIG_DIR/projects/probe/$session_id.jsonl"
-  : > "$file"
-  for uuid in "$@"; do
-    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
-      "$uuid" "$session_id" >> "$file"
-  done
+  fm_test_claude_write_transcript "$CLAUDE_CONFIG_DIR" "$@"
 }
 
 msg_uuid() {  # <n>
-  printf '00000000-0000-4000-8000-%012d\n' "$1"
+  fm_test_claude_msg_uuid "$1"
 }
 
 FORK_SOURCE_SESSION=00000000-0000-4000-9000-000000000001
 FORK_CHILD_SESSION=00000000-0000-4000-9000-000000000002
 NESTED_SESSION=00000000-0000-4000-9000-000000000003
 
-# A backgrounded Claude session as the process table really shows it: a
-# harness-named host process with the session process as its own child. The lock
-# records the host, because that is the outermost pid of the contiguous run,
-# while the harness registry only ever keys a record on the session pid.
-BG_HOST_SCRIPT="$TMP_ROOT/bg-host.sh"
-cat > "$BG_HOST_SCRIPT" <<'SH'
-#!/usr/bin/env bash
-# $1 = directory to publish the session pid into, $2 = harness-named interpreter.
-"$2" -c 'printf "%s\n" "$$" > "$0/session-pid"; while :; do sleep 0.2; done' "$1" &
-wait
-SH
-
+# The lock records the host of a backgrounded run, because that is the outermost
+# pid of the contiguous run, while the harness registry only ever keys a record on
+# the session pid.
 BG_HOST_PID=
 BG_SESSION_PID=
 spawn_backgrounded_session_run() {  # <name>
-  local dir="$TMP_ROOT/bg-run-$1" i=0
-  mkdir -p "$dir"
-  "$FAKE_CLAUDE" "$BG_HOST_SCRIPT" "$dir" "$FAKE_CLAUDE" >/dev/null 2>&1 &
-  BG_HOST_PID=$!
-  while [ "$i" -lt 200 ] && [ ! -s "$dir/session-pid" ]; do
-    sleep 0.05
-    i=$((i + 1))
-  done
-  [ -s "$dir/session-pid" ] || fail "the backgrounded-run fixture never started its session process"
-  BG_SESSION_PID=$(tr -d '[:space:]' < "$dir/session-pid")
+  fm_test_spawn_bg_session_run "$FAKE_CLAUDE" "$TMP_ROOT/bg-run-$1"
+  BG_HOST_PID=$FM_TEST_BG_HOST_PID
+  BG_SESSION_PID=$FM_TEST_BG_SESSION_PID
 }
 
 stop_backgrounded_session_run() {
-  kill "$BG_SESSION_PID" "$BG_HOST_PID" 2>/dev/null || true
-  wait "$BG_HOST_PID" 2>/dev/null || true
+  fm_test_stop_bg_session_run
 }
 
-# A Claude Code background-job directory of the shape `claude --bg` writes, and
-# print it for CLAUDE_JOB_DIR. $1 names the job's own session and $2 the session
-# it was created to continue; the same value for both is what a job seeded with
-# its own task records.
 make_job_dir() {  # <name> <own-session-id> <resumed-session-id>
-  local dir="$TMP_ROOT/jobs/$1"
-  mkdir -p "$dir"
-  printf '{\n  "sessionId": "%s",\n  "resumeSessionId": "%s",\n  "template": "bg",\n  "backend": "daemon"\n}\n' \
-    "$2" "$3" > "$dir/state.json"
-  printf '%s\n' "$dir"
+  fm_test_claude_job_dir "$TMP_ROOT/jobs/$1" "$2" "$3"
 }
 
 # True when this host can supply the process start time the registry check
 # requires. Fork recovery is deliberately Linux-only; everywhere else the
 # evidence is unavailable and the unchanged live-owner refusal stands.
 fork_evidence_available() {
-  [ -r "/proc/$$/stat" ]
+  fm_test_claude_fork_evidence_available
 }
 
 # Copy the hook and its sourced dependencies into a fixture checkout.

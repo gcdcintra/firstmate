@@ -214,8 +214,16 @@ standdown_evidence() {
         "$FOREIGN_LOCK_OWNER_SESSION" ;;
     owner-is-this-session)
       printf 'The evidence is contradictory: that process resolves to the session id of this very session while sitting outside the harness ancestry of this process.' ;;
-    *)
+    no-session-identity)
       printf 'The evidence is inconclusive: this process carries no Claude session id, so no continuity evidence could be produced at all, which is itself worth diagnosing.' ;;
+    # Every token the shared predicate publishes has a case above. The fallback
+    # therefore states only what it actually knows - which sub-check refused -
+    # rather than any one reading, so a token added there and not mirrored here
+    # cannot turn into a confident claim about this home in the very message this
+    # guard exists to keep honest.
+    *)
+      printf 'The evidence is inconclusive: the refusing sub-check was %s, which this guard has no specific reading for, so treat the owner as undetermined.' \
+        "$FOREIGN_LOCK_OWNER_EVIDENCE" ;;
   esac
 }
 budget_reset() {
