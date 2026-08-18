@@ -452,8 +452,17 @@ test_watch_restart_attaches_to_healthy_peer() {
   fakebin="$dir/fakebin"
   out="$dir/restart.out"
   mark_pr_check_migration_complete "$state"
-  node -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
+  # The peer must already be TERM-resistant when the restart arm signals it: a
+  # peer that registers its own handler during startup loses that race, and the
+  # arm's contractually correct TERM then kills it, turning this attach case into
+  # a fresh-start one. Forking while THIS shell ignores TERM makes the child
+  # TERM-proof from its first instruction instead, because SIG_IGN is inherited
+  # across fork and exec. Restore the disposition immediately: everything spawned
+  # below, the arm above all, must remain killable.
+  trap '' TERM
+  sleep 300 &
   peer=$!
+  trap - TERM
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$peer" > "$state/.watch.lock/pid"
@@ -464,7 +473,7 @@ test_watch_restart_attaches_to_healthy_peer() {
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 200 ]; do
     grep -qF "watcher: attached pid=$peer" "$out" 2>/dev/null && break
     sleep 0.1
     i=$((i + 1))
