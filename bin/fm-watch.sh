@@ -25,8 +25,16 @@
 #                          not confirmed dead, and that first sighting is
 #                          bounded by the cadence marker rather than by the pane hash
 #                          (an idle harness animates its footer, so the hash alone
-#                          would re-arm a first sighting every cycle). Only when neither
-#                          absorb class applies does the log's last line decide:
+#                          would re-arm a first sighting every cycle). A crew that
+#                          declared a wait AND is authoritatively working takes the
+#                          wedge timer rather than that cadence marker, because the
+#                          run-step precedence rule in bin/fm-crew-state.sh outranks
+#                          the log; the declaration still lengthens its cadence
+#                          there, through the evidence hierarchy's own
+#                          declared-wait tier, so one declaration is answered the
+#                          same way whichever path its pane takes. Only when
+#                          neither absorb class applies does the log's last line
+#                          decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
@@ -617,15 +625,27 @@ endpoint_absence_check() {  # <window>
 # <busy-verdict> is the pane's full semantic verdict, carried into every
 # escalation so an alarm that overrode an authoritative busy signal names it.
 #
-# <declared-wait-eligible> is 1 only on the busy-turn call sites. The three
-# non-busy sites are reached ONLY after pause_state_class has already reconciled
-# this pane's declared wait against authoritative crew state - a crew that
-# appended `paused:` and then started a run reports working, and that decision
-# resumes wedge tracking on purpose - so letting the evidence hierarchy re-read
-# the same raw status line there would hand a superseded declaration the cadence
-# back. The busy-turn sites perform no such reconciliation, which is exactly the
-# gap that escalated a well-formed declared wait as a possible wedge. It
-# defaults to 0 for the same reason <cpu-deferral-allowed> does.
+# <declared-wait-eligible> is 1 on every call site a pane can reach while its
+# status log STILL declares a wait: the two busy-turn sites, and the one
+# non-busy site that is entered precisely because the declaration is current
+# (pause_state_class reported the crew authoritatively working under it). It is 0
+# on the other two non-busy sites, which are unreachable with a current
+# declaration - one requires a captain-relevant last line, which the paused and
+# captain-held verbs never are, and the other is guarded on the declaration being
+# absent - so there it is moot, and leaving it 0 keeps the
+# a-site-that-forgets-it-escalates default meaningful. It defaults to 0 for the
+# same reason <cpu-deferral-allowed> does.
+#
+# Passing 0 wherever pause_state_class had returned `working` is what escalated
+# an accurate, once-appended declared wait as a possible wedge every
+# STALE_ESCALATE_SECS for a whole validation round (observed 2026-08-14). That
+# reconciliation chooses which ABSORB CLASS the pane gets - the pause cadence
+# marker in handle_paused_stale, or this wedge timer - and run-step precedence is
+# why an active run wins it; it does not void the declaration, and it is not a
+# reason to withhold the cadence the same declaration buys one path over. Nothing
+# is trusted blindly either way: bin/fm-wedge-evidence-lib.sh's tier 2 re-reads
+# the CURRENT last status line, so a declaration the crew has moved off earns
+# nothing on the very next poll.
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <cpu-deferral-allowed> <busy-verdict> <declared-wait-eligible>
   local win=$1 since_file=$2 label=$3 escalation_file=$4 cpu_deferral=${5:-0} busy_verdict=${6:-}
   local declared_eligible=${7:-0}
@@ -793,6 +813,20 @@ handle_paused_stale() {  # <window> <task> <hash>
     wake "$reason"
   fi
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
+}
+
+# The one absorb line every provably-working stale writes, naming the path that
+# absorbed it and whether the pane's own declared wait was part of the decision.
+# Both such sites - the first sighting of a stale pane state, and every repeat
+# poll of an already-classified one - used to log the SAME sentence, and the
+# triage log is the only place an absorb is ever visible. A reported declared-wait
+# escalation could therefore not be attributed to a path from the log at all,
+# which cost the investigation of that report its cheapest evidence.
+log_provably_working_absorb() {  # <window> <task> <sighting>
+  local win=$1 task=$2 sighting=$3 note=
+  status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" &&
+    note=', under a declared wait'
+  triage_log "absorbed non-terminal stale (provably working$note, $sighting): $win"
 }
 
 clear_pause_state() {  # <window>
@@ -1545,7 +1579,11 @@ EOF
           # on first sight, never every poll) via pause_state_class, which returns:
           #   - working: an actively-running pipeline legitimately sits on a static
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
-          #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
+          #     genuinely frozen run still escalates past STALE_ESCALATE_SECS. A
+          #     crew that declared a wait can reach this too, and does not lose the
+          #     declaration's long cadence for it: the timer's own evidence
+          #     hierarchy reads that declaration (see wedge_timer_check's
+          #     <declared-wait-eligible>);
           #   - paused: the crew declared an external wait, or a declared pause or
           #     captain hold is paired with a confidently dead agent, so absorb on
           #     the long PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;
@@ -1561,7 +1599,7 @@ EOF
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
-                triage_log "absorbed non-terminal stale (provably working): $w"
+                log_provably_working_absorb "$w" "$task" "first sighting"
                 ;;
               paused)
                 handle_paused_stale "$w" "$task" "$h"
@@ -1577,8 +1615,8 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
-                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" 0 "$busy_verdict"
-                         triage_log "absorbed non-terminal stale (provably working): $w" ;;
+                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" 0 "$busy_verdict" 1
+                         log_provably_working_absorb "$w" "$task" "repeat poll" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;
               esac
             else
