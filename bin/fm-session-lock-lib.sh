@@ -399,12 +399,22 @@ fm_harness_run_hosts_pid() {  # <inner-pid> <outer-pid>
 # would otherwise pay a whole ancestry walk per live record for a walk that
 # cannot succeed, four times over on a single Stop. Testing it lazily keeps the
 # no-live-candidate case free of subprocesses entirely.
+#
+# The scan is skipped outright where no record can be proven. Every candidate ends
+# at fm_claude_session_record_id, which binds a record to one incarnation of a pid
+# through fm_claude_proc_start and so refuses wherever /proc is absent - the same
+# Linux-only limit fork recovery has by design. A host without it would otherwise
+# walk the whole registry, and pay an ancestry walk per live candidate, to reach a
+# refusal a single builtin read establishes up front. Testing the RECORDED pid's
+# own entry is what makes that one read enough: the scan cannot succeed unless
+# that pid is a live Claude process, which no unreadable /proc entry allows.
 fm_claude_session_id_of_pid() {  # <pid>
   local pid=$1 cfg record candidate session_id found='' owner_verified=0
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   fm_claude_session_record_id "$pid" && return 0
+  [ -r "/proc/$pid/stat" ] || return 1
   cfg=$(fm_claude_config_dir) || return 1
   for record in "$cfg"/sessions/*.json; do
     [ -f "$record" ] && [ ! -L "$record" ] || continue

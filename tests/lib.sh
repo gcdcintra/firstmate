@@ -86,6 +86,16 @@ pass() {
 # moment it is known, so a `fail` anywhere after the spawn still retires it -
 # relying on a per-suite stop helper reached only on the happy path is what
 # leaked one past every suite exit.
+#
+# A registered pid is nonetheless weaker evidence than a job pid, and the
+# difference decides whether the reap is safe. An unwaited job is held in the
+# table by its own zombie, so its pid cannot be reused while this shell can still
+# name it; a registered grandchild is nobody's job here, so the moment it dies it
+# is reaped by init and its pid is free for the next process on the machine. A
+# suite that retires such a run mid-run and keeps going therefore leaves a long
+# window in which a bare recorded pid names something unrelated. Registration
+# binds the pid to its incarnation for exactly that reason, and cleanup signals it
+# only while that binding still holds.
 
 # Deliberately NOT exported. A subshell inherits it, which is the whole point,
 # while a separate test process that sources this library gets its own registry
@@ -100,38 +110,61 @@ fm_test_cleanup_register() {
   printf '%s\n' "$1" >> "$FM_TEST_CLEANUP_REGISTRY"
 }
 
-# fm_test_cleanup_register_pid <pid>: register a process this suite spawned that
-# `jobs -p` cannot see - typically a grandchild published by a fixture host - so
-# EXIT reaps it by exact pid. Safe to call from a command-substitution subshell.
-# A non-numeric argument is ignored rather than signalled: cleanup must never
-# widen a kill to anything the caller did not name.
+# fm_test_cleanup_register_pid <pid> [<proc-start>]: register a process this suite
+# spawned that `jobs -p` cannot see - typically a grandchild published by a
+# fixture host - so EXIT reaps it by exact pid. Safe to call from a
+# command-substitution subshell. A non-numeric argument is ignored rather than
+# signalled: cleanup must never widen a kill to anything the caller did not name.
+#
+# The pid is recorded together with the kernel start time naming THIS incarnation
+# of it, so the reap can never reach a later, unrelated holder of a recycled pid.
+# <proc-start> overrides the live reading, for a test staging a pid whose
+# incarnation has already changed. Where the host cannot supply a start time at
+# all the pid stands for itself, exactly as before.
 fm_test_cleanup_register_pid() {
-  case "${1:-}" in
+  local pid=${1:-} start=${2:-}
+  case "$pid" in
     ''|*[!0-9]*) return 0 ;;
   esac
-  printf '%s\n' "$1" >> "$FM_TEST_CLEANUP_PID_REGISTRY"
+  [ -n "$start" ] || start=$(fm_test_proc_start "$pid")
+  printf '%s %s\n' "$pid" "$start" >> "$FM_TEST_CLEANUP_PID_REGISTRY"
+}
+
+# True while pid $1 is still the incarnation that was registered with start time
+# $2. An empty $2 is the no-evidence case - a job pid, which needs none, or a host
+# with no /proc - and keeps the unconditional reap.
+fm_test_pid_is_registered_incarnation() {
+  [ -n "${2:-}" ] || return 0
+  [ "$2" = "$(fm_test_proc_start "$1")" ]
 }
 
 fm_test_cleanup() {
-  local d p pids extra=''
+  local d p start records signalled=''
   # Exact-pid reap of this shell's own background jobs and of every explicitly
   # registered descendant, so nothing this suite spawned outlives it holding the
-  # runner's stdout pipe open.
-  pids=$(jobs -p 2>/dev/null || true)
+  # runner's stdout pipe open. Each escalation re-checks the binding, because a
+  # registered pid that the first signal retired is free for reuse before the
+  # second one is sent.
+  records=$(jobs -p 2>/dev/null || true)
   if [ -f "$FM_TEST_CLEANUP_PID_REGISTRY" ]; then
-    extra=$(cat "$FM_TEST_CLEANUP_PID_REGISTRY" 2>/dev/null || true)
+    records=$(printf '%s\n%s\n' "$records" "$(cat "$FM_TEST_CLEANUP_PID_REGISTRY" 2>/dev/null || true)")
     rm -f "$FM_TEST_CLEANUP_PID_REGISTRY"
   fi
-  pids=$(printf '%s\n%s\n' "$pids" "$extra" | awk 'NF')
-  for p in $pids; do
+  records=$(printf '%s\n' "$records" | awk 'NF')
+  while IFS=' ' read -r p start; do
+    [ -n "$p" ] || continue
+    fm_test_pid_is_registered_incarnation "$p" "$start" || continue
     kill "$p" 2>/dev/null || true
-  done
-  if [ -n "$pids" ]; then
+    signalled="$signalled$p $start"$'\n'
+  done <<< "$records"
+  if [ -n "$signalled" ]; then
     sleep 0.2
-    for p in $pids; do
+    while IFS=' ' read -r p start; do
+      [ -n "$p" ] || continue
+      fm_test_pid_is_registered_incarnation "$p" "$start" || continue
       kill -9 "$p" 2>/dev/null || true
       wait "$p" 2>/dev/null || true
-    done
+    done <<< "$signalled"
   fi
   if [ -f "$FM_TEST_CLEANUP_REGISTRY" ]; then
     while IFS= read -r d; do
