@@ -446,30 +446,23 @@ test_watch_restart_rejects_reused_pid() {
 }
 
 test_watch_restart_attaches_to_healthy_peer() {
-  local dir state fakebin out peer ready identity armpid status i
+  local dir state fakebin out peer identity armpid status i
   dir=$(make_case restart-healthy-peer)
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/restart.out"
-  ready="$dir/peer-ready"
   mark_pr_check_migration_complete "$state"
-  command -v node >/dev/null 2>&1 \
-    || fail "no node on PATH to build the TERM-resistant peer this case needs"
-  # The peer must already be TERM-resistant when the restart arm signals it: node
-  # installs the SIGTERM handler only after its ~150ms bootstrap, and a TERM that
-  # lands earlier kills the peer, turning this attach case into a fresh-start one.
-  # The marker is written after the handler registers, so waiting on it removes
-  # the race without weakening what the case asserts.
-  node -e 'process.on("SIGTERM", () => {}); require("fs").writeFileSync(process.argv[1], ""); setTimeout(() => {}, 300000)' "$ready" &
+  # The peer must already be TERM-resistant when the restart arm signals it: a
+  # peer that registers its own handler during startup loses that race, and the
+  # arm's contractually correct TERM then kills it, turning this attach case into
+  # a fresh-start one. Forking while THIS shell ignores TERM makes the child
+  # TERM-proof from its first instruction instead, because SIG_IGN is inherited
+  # across fork and exec. Restore the disposition immediately: everything spawned
+  # below, the arm above all, must remain killable.
+  trap '' TERM
+  sleep 300 &
   peer=$!
-  i=0
-  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do
-    is_live_non_zombie "$peer" \
-      || fail "the node peer died before it could register its SIGTERM handler"
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ -e "$ready" ] || fail "peer never installed its SIGTERM handler"
+  trap - TERM
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$peer" > "$state/.watch.lock/pid"
