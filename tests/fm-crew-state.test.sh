@@ -361,10 +361,10 @@ EOF
 # `submitted_head` is the head the pipeline records itself as validating - the
 # rebase step replays the crew's commits onto a newer base and rewrites it - and
 # `current_head` is where the run sits now, which for an in-flight run is a
-# commit that exists only inside the local gate repo. `next_action.code` is
-# `continue_active_run` while a run is live and `recover_custody` once a terminal
-# run is only holding custody.
-branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state> [next-action-code] [owning-run-id]
+# commit that exists only inside the local gate repo. The trailing fields are
+# reproduced as the CLI emits them, but the reader binds on the pipeline heads
+# alone, so no test varies them.
+branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state> [owning-run-id]
   cat <<EOF
 branch_sync:
   state: $5
@@ -374,7 +374,7 @@ branch_sync:
     head: $2
     clean: true
   pipeline:
-    run: "${7:-01RUN}"
+    run: "${6:-01RUN}"
     status: running
     phase: pre_push
     submitted_head: $3
@@ -386,7 +386,7 @@ branch_sync:
   safety: blocked_pipeline_owned
   pr_state: none
   next_action:
-    code: ${6:-continue_active_run}
+    code: continue_active_run
     command: no-mistakes axi status
 EOF
 }
@@ -405,17 +405,24 @@ work_commit() {  # <worktree> <name>
 # cannot bind it - while carrying the identical patches, which is what the code
 # guard has to see through.
 rebased_sibling_head() {  # <worktree> -> echoes the rebased sha
-  local wt=$1 branch root newbase sha
+  local wt=$1 branch root newbase before sha
   branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD)
+  before=$(git -C "$wt" rev-parse HEAD)
   root=$(git -C "$wt" rev-list --max-parents=0 HEAD | tail -1)
   git -C "$wt" checkout -q --detach "$root"
   git -C "$wt" commit -q --allow-empty -m 'newer base the default branch advanced to'
   newbase=$(git -C "$wt" rev-parse HEAD)
   git -C "$wt" checkout -q -B fm-test-rebase "$branch"
-  git -C "$wt" rebase -q --onto "$newbase" "$root" >/dev/null 2>&1
+  git -C "$wt" rebase -q --onto "$newbase" "$root" >/dev/null 2>&1 \
+    || fail "rebased_sibling_head: the replay onto the newer base did not run"
   sha=$(git -C "$wt" rev-parse HEAD)
   git -C "$wt" checkout -q "$branch"
   git -C "$wt" branch -q -D fm-test-rebase
+  # Without these, a replay that silently did nothing would hand every call site
+  # the worktree HEAD itself and degrade the case to the trivial equal-head one.
+  [ "$sha" != "$before" ] || fail "rebased_sibling_head: returned the un-rebased head"
+  git -C "$wt" merge-base --is-ancestor "$before" "$sha" \
+    && fail "rebased_sibling_head: returned a descendant rather than a sibling"
   printf '%s' "$sha"
 }
 
@@ -1858,12 +1865,9 @@ test_stale_terminal_run_after_local_fix_commit_not_attributed() {
   fm_write_meta "$d/state/movedon.meta" "window=fm:fm-movedon" "worktree=$d/wt" "kind=ship" "harness=claude"
   printf 'working: fixing what the failed run reported\n' > "$d/state/movedon.status"
   FM_FAKE_RUN_HEAD="$gate_head"
-  # `continue_active_run`, the STRONGEST ownership claim the CLI can make, so the
-  # refusal is decided by the submitted head not carrying the fix commit and by
-  # nothing else.
   FM_FAKE_AXI_STATUS="$(run_failed fm/feat-movedon
     branch_sync_block fm/feat-movedon "$(git -C "$d/wt" rev-parse HEAD)" "$run_head" "$gate_head" \
-      pipeline_owned continue_active_run)"
+      pipeline_owned)"
   FM_FAKE_RUNS_LIST="  failed       fm/feat-movedon      ${run_head:0:8}  2026-08-19 00:22"
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" movedon
@@ -1875,12 +1879,12 @@ test_stale_terminal_run_after_local_fix_commit_not_attributed() {
   pass "stale terminal run whose worker moved on is not attributed"
 }
 
-# The ordinary shape of an in-flight run, end to end: the rebase step moved the
-# pipeline head and no fix round has pushed, so BOTH pipeline heads live only
-# inside the local gate and no local test can decide code identity either way.
-# The pipeline's own live-ownership instruction is then the evidence, and the
-# live step it names is what the crew is doing.
-test_in_flight_run_with_no_visible_pipeline_head_binds() {
+# No code evidence means no attribution, whatever the run's state. Both pipeline
+# heads live only inside the local gate - the shape of an in-flight run that has
+# rebased and not yet pushed - so nothing here can tell a run validating this
+# crew's code from one whose worker has moved on, and the reader says so by
+# letting the crew's own report stand.
+test_active_run_with_no_visible_pipeline_head_binds_nothing() {
   reset_fakes
   local d wt_head submitted current out
   d=$(new_case in-flight-gate-only)
@@ -1892,23 +1896,55 @@ test_in_flight_run_with_no_visible_pipeline_head_binds() {
   [ "$submitted" != "$current" ] || fail "fixture needs two distinct gate-only heads"
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/inflight.meta" "window=fm:fm-inflight" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'paused: waiting on the pipeline\n' > "$d/state/inflight.status"
+  printf 'paused: waiting on the captain to answer\n' > "$d/state/inflight.status"
   FM_FAKE_RUN_HEAD="$current"
   FM_FAKE_AXI_STATUS="$(run_fixing fm/feat-inflight
     branch_sync_block fm/feat-inflight "$wt_head" "$submitted" "$current" pipeline_owned)"
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" inflight
   out=$(run_crew_state "$d" inflight)
-  assert_contains "$out" "source: run-step" "a live run owning this checkout is attributed"
-  assert_contains "$out" "state: working" "an in-flight fix round reads as working"
-  assert_contains "$out" "validating (fixing)" "the detail names the live fix round"
-  pass "in-flight run with neither pipeline head visible binds on live ownership"
+  assert_not_contains "$out" "source: run-step" "a run with no visible pipeline head binds nothing"
+  assert_contains "$out" "source: status-log" "the crew's own report answers instead"
+  assert_contains "$out" "state: paused" "the crew's own paused report stays current"
+  pass "active run with neither pipeline head visible binds nothing"
 }
 
-# The invariant that keeps that path from ever becoming a false `failed`: with no
-# code evidence available, a run that has already ENDED binds nothing, even when
-# the same answer still claims live ownership of the branch. The reader enforces
-# this itself rather than trusting the CLI's two statements to agree.
+# The intent's preserved guarantee, in the shape that actually reaches the last
+# gate: a crew that rewrote its branch out from under an ABANDONED but still
+# ACTIVE run, whose pipeline heads are both gate-only. Branch ownership survives
+# the rewrite and the CLI keeps naming that run, so ownership alone would report
+# it as a healthy pipeline and mark the crew's own blocked line superseded.
+test_abandoned_active_run_with_gate_only_heads_not_attributed() {
+  reset_fakes
+  local d old_head new_head submitted current out
+  d=$(new_case abandoned-gate-only)
+  make_repo_on_branch "$d/wt" fm/feat-abandonedgo
+  old_head=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" checkout -q --orphan tmp-rewrite
+  work_commit "$d/wt" rewritten-tip
+  git -C "$d/wt" branch -q -M fm/feat-abandonedgo
+  new_head=$(git -C "$d/wt" rev-parse HEAD)
+  [ "$old_head" != "$new_head" ] || fail "rewrite did not produce a new head"
+  submitted=$(gate_only_head "$d" submitted)
+  current=$(gate_only_head "$d" current)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/abandonedgo.meta" "window=fm:fm-abandonedgo" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: cannot reach the package registry\n' > "$d/state/abandonedgo.status"
+  FM_FAKE_RUN_HEAD="$current"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-abandonedgo
+    branch_sync_block fm/feat-abandonedgo "$new_head" "$submitted" "$current" pipeline_owned)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" abandonedgo
+  out=$(run_crew_state "$d" abandonedgo)
+  assert_not_contains "$out" "source: run-step" "an abandoned run under a rewritten branch binds nothing"
+  assert_not_contains "$out" "state: working" "an abandoned run must not read as a healthy pipeline"
+  assert_not_contains "$out" "superseded" "the crew's own report must not be marked superseded"
+  assert_contains "$out" "state: blocked" "the crew's own blocked report stays current"
+  pass "abandoned active run with gate-only heads is not attributed"
+}
+
+# The same refusal for a run that has already ended, so no read with zero code
+# evidence can ever assert a terminal verdict.
 test_terminal_run_with_no_visible_pipeline_head_binds_nothing() {
   reset_fakes
   local d wt_head submitted current out
@@ -1953,7 +1989,7 @@ test_branch_sync_refusal_is_not_rescued_by_the_sha_binding() {
   FM_FAKE_RUN_HEAD="$wt_head"
   FM_FAKE_AXI_STATUS="$(run_failed fm/feat-notrescued
     branch_sync_block fm/feat-notrescued "$wt_head" "$wt_head" "$wt_head" pipeline_owned \
-      continue_active_run 01NEWERRUN)"
+      01NEWERRUN)"
   FM_FAKE_RUNS_LIST=""
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" notrescued
@@ -1964,9 +2000,39 @@ test_branch_sync_refusal_is_not_rescued_by_the_sha_binding() {
   pass "a branch_sync refusal is not rescued by the sha binding"
 }
 
-# The run-id binding stays exact: a `branch_sync` block that names another
-# branch, or whose view of this checkout's HEAD disagrees with what is really
-# there, is not this crew's run and binds nothing on its own.
+# The freshness half of the binding, which nothing else in the suite reaches: the
+# CLI's `local` view is a live read of this checkout, so if it disagrees with the
+# HEAD actually there, the whole answer describes a checkout that has since moved
+# and none of it may be trusted. Everything else here would bind - the run id
+# matches, the branch matches, and the submitted head IS the worktree HEAD and so
+# carries all of its work - which is what makes this the deciding guard.
+test_run_id_binding_rejects_a_stale_view_of_this_checkout() {
+  reset_fakes
+  local d wt_head stale_head out
+  d=$(new_case runid-stale-view)
+  make_repo_on_branch "$d/wt" fm/feat-staleview
+  stale_head=$(git -C "$d/wt" rev-parse HEAD)
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  [ "$stale_head" != "$wt_head" ] || fail "fixture needs a head the CLI read before the commit"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/staleview.meta" "window=fm:fm-staleview" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: cannot reach the package registry\n' > "$d/state/staleview.status"
+  FM_FAKE_RUN_HEAD="$wt_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-staleview
+    branch_sync_block fm/feat-staleview "$stale_head" "$wt_head" "$wt_head" pipeline_owned)"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" staleview
+  out=$(run_crew_state "$d" staleview)
+  assert_not_contains "$out" "state: failed" "an answer describing a moved checkout must not report failed"
+  assert_not_contains "$out" "source: run-step" "a stale view of this checkout binds nothing"
+  assert_contains "$out" "state: blocked" "the crew's own blocked report stays current"
+  pass "run-id binding rejects a stale view of this checkout"
+}
+
+# The other half: a `branch_sync` block that names another branch is not this
+# crew's run and binds nothing on its own.
 test_run_id_binding_rejects_foreign_branch_sync() {
   reset_fakes
   local d wt_head gate_head rebased out
@@ -2056,9 +2122,11 @@ test_coarse_unbindable_newest_row_still_reads_the_pane
 test_coarse_newest_row_failed_and_bound_still_reports_failed
 test_run_id_bound_failed_run_still_reports_failed
 test_stale_terminal_run_after_local_fix_commit_not_attributed
-test_in_flight_run_with_no_visible_pipeline_head_binds
+test_active_run_with_no_visible_pipeline_head_binds_nothing
+test_abandoned_active_run_with_gate_only_heads_not_attributed
 test_terminal_run_with_no_visible_pipeline_head_binds_nothing
 test_branch_sync_refusal_is_not_rescued_by_the_sha_binding
+test_run_id_binding_rejects_a_stale_view_of_this_checkout
 test_run_id_binding_rejects_foreign_branch_sync
 
 # --- (m) --pipeline-activity: the PIPELINE's own clock ----------------------

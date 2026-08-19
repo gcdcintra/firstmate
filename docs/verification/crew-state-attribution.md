@@ -73,19 +73,22 @@ A worker that added a commit the pipeline never received gets a `+` line instead
 
 ## When no pipeline head is visible at all
 
-An in-flight run's own commits live only inside the local gate, so `current_head` - and, after a rebase, `submitted_head` too - can be unresolvable in the worktree, leaving no local evidence in either direction.
-Only there does the reader fall back to the pipeline's own live-ownership instruction, `next_action.code: continue_active_run`, which is addressed to this checkout ("do not make local follow-up commits").
+An in-flight run's own commits live only inside the local gate, so `current_head` - and, after a rebase, `submitted_head` too - can be unresolvable in the worktree.
+There is then no local evidence in either direction, and the reader binds NOTHING: the run is unattributed and the pane busy signature and status log answer instead.
 
-That instruction buys a LIVE step and nothing else, because the reader refuses this path outright for a run whose own status is already terminal.
-That refusal is enforced in `fm-crew-state.sh` rather than inferred from the CLI, and deliberately so: the two halves of the pairing below come from DIFFERENT commands, so treating them as a guarantee would make a false `failed` depend on an unchecked cross-command assumption.
+That is a deliberate refusal rather than a gap.
+The remaining fields in the block are all statements about who owns the branch NAME - `state: pipeline_owned`, `safety: blocked_pipeline_owned`, `next_action.code: continue_active_run` - and branch ownership survives both a worker rewriting the branch under a run it abandoned and a run going terminal ([`nm-custody-deadlock.md`](nm-custody-deadlock.md)).
+Binding on any of them would report an abandoned run's step as the crew's state and mark the crew's own `blocked:`/`paused:` line superseded, which is the self-report the pane and log fallback exists to surface.
 
-| | live run owning the branch | terminal run holding only custody |
-| --- | --- | --- |
-| observed via | `no-mistakes axi status`, the four runs above | `no-mistakes axi sync --check`, the reproduction in [`nm-custody-deadlock.md`](nm-custody-deadlock.md) |
-| `safety` | `blocked_pipeline_owned` | `blocked_pipeline_owned_recoverable` |
-| `next_action.code` | `continue_active_run` | `recover_custody` |
+Sourcing matters here and is worth stating plainly: the live values above were read with `no-mistakes axi status`, while the terminal-custody pairing (`safety: blocked_pipeline_owned_recoverable`, `next_action.code: recover_custody`) is only recorded from `no-mistakes axi sync --check`, a different command.
+No `axi status` read of a terminal run holding custody was ever captured - so a reader that leaned on those fields would be resting a false `failed` on an unchecked cross-command assumption.
+It does not lean on them at all.
 
-No `axi status` read of a terminal run holding custody was captured, which is exactly why the reader does not depend on one.
+## Bounding the patch-identity walk
+
+`git cherry` computes a patch-id - a full diff - for every commit on both sides of the merge base, and after a rebase the candidate's side includes however far the default branch had advanced.
+This reader runs per-crew on the watcher's single-threaded poll, so the walk is fenced twice: an ancestor test answers without diffing at all when the pipeline has not rebased, and otherwise the divergence is counted first with a plain graph walk and the diff is skipped entirely past `FM_CREW_STATE_PATCH_SCAN` commits (default 200).
+Exceeding the ceiling is treated as no evidence, which costs a fall-through to the pane and log sources rather than an unbounded diff on the fleet's supervision poll.
 
 ## Why the commit-sha binding cannot carry attribution alone
 
@@ -170,7 +173,8 @@ $ no-mistakes axi status --run 01M0C0NMH09NBK495KFFC9TAF8
 - `test_live_parked_run_pipeline_activity_is_parked` pins the same binding for the pipeline-clock mode.
 - `test_coarse_unbindable_newest_row_never_falls_back_to_older_row` and `test_coarse_unbindable_newest_row_still_reads_the_pane` pin that no older row answers for an unbindable newest one, and that refusing it still leaves the status log and the pane busy signature to answer.
 - `test_stale_terminal_run_after_local_fix_commit_not_attributed` pins the other false-`failed` shape: a terminal run still named in `pipeline.run` after its worker committed a local fix binds nothing, because the pipeline's submitted head does not carry that commit. It supplies `continue_active_run`, the strongest ownership claim the CLI can make, so only the code evidence can be deciding it.
-- `test_in_flight_run_with_no_visible_pipeline_head_binds` and `test_terminal_run_with_no_visible_pipeline_head_binds_nothing` pin the no-code-evidence path in both directions, with BOTH pipeline heads gate-only: a live run binds and reads its live step, and a terminal run binds nothing even while the same answer claims live ownership.
+- `test_active_run_with_no_visible_pipeline_head_binds_nothing`, `test_abandoned_active_run_with_gate_only_heads_not_attributed` and `test_terminal_run_with_no_visible_pipeline_head_binds_nothing` pin the no-code-evidence refusal with BOTH pipeline heads gate-only, for a live run, for a run a worker abandoned after rewriting the branch under it, and for a terminal run.
 - `test_branch_sync_refusal_is_not_rescued_by_the_sha_binding` pins that the older sha binding is reached only for an answer carrying no `branch_sync` block.
+- `test_run_id_binding_rejects_a_stale_view_of_this_checkout` pins the freshness half: an answer whose `local.head` disagrees with the HEAD really there describes a checkout that has moved, and binds nothing even though every other check would pass.
 - `test_coarse_newest_row_failed_and_bound_still_reports_failed` and `test_run_id_bound_failed_run_still_reports_failed` pin that genuinely failed runs are still reported failed, through both attribution paths.
 - `test_run_id_binding_rejects_foreign_branch_sync` pins that a `branch_sync` block describing another checkout binds nothing.

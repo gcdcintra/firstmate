@@ -27,31 +27,34 @@
 #      Attribution takes two answers, and needs BOTH. WHICH RUN comes from the
 #      run id wherever the CLI supplies one: `axi status` emits its `branch_sync:`
 #      block only for the run that owns the current checkout's branch, and
-#      `branch_sync.pipeline.run` names that run's id. WHOSE CODE is a separate
-#      question the run id cannot answer, because a run keeps owning a branch
-#      name after its worker has moved on - so the binding also demands that a
-#      pipeline head from the same block already CARRIES every commit unique to
-#      this worktree's HEAD (nm_commit_carries_worktree_work, patch identity, so
-#      the pipeline's own rebase of this crew's work still counts). Local work
-#      the pipeline never received leaves a commit uncarried and binds nothing.
-#      When no pipeline head is visible in this worktree at all there is no local
-#      evidence either way, and only then does the pipeline's own live-ownership
-#      instruction - `branch_sync.next_action.code: continue_active_run` - stand
-#      in for it; it is issued to THIS checkout, and it buys a LIVE step only.
-#      A run that has already ended is refused on that path outright, so no-code-
-#      evidence can never assert a terminal verdict - enforced here rather than
-#      assumed of the CLI (nm_run_id_binds_worktree, nm_run_is_terminal).
-#      Which half applies is decided by the block's presence, not by the run-id
-#      binding's result: an answer CARRYING a `branch_sync` block is answered
-#      entirely by that binding, so a refusal it reached on the pipeline's own
-#      heads is never rescued by a looser match; an answer carrying no such block
-#      (an older CLI) falls back to the sha binding, where a run matches when its
-#      head equals the worktree HEAD, or the worktree HEAD is an ancestor of the
-#      run head (pipeline fix commits advanced the run on the same line of
-#      history). Local work that advanced past the run head, or diverged from it,
-#      invalidates that fallback, as does a pipeline that rebased its own head
-#      off this worktree's line of history - which is why the run id has to lead
-#      (see nm_run_head_matches_worktree, and the incident it records).
+#      `branch_sync.pipeline.run` names that run's id. WHOSE CODE the run id
+#      cannot answer, because a run keeps owning its branch NAME after its worker
+#      has moved on - so the binding also demands that a pipeline head from the
+#      same block already CARRIES every commit unique to this worktree's HEAD
+#      (nm_commit_carries_worktree_work, patch identity, so the pipeline's own
+#      rebase of this crew's work still counts).
+#      That code evidence is the ONLY thing that binds. Ownership on its own -
+#      however the CLI phrases it - is never enough, and neither is
+#      `branch_sync.local.head`, which is the CLI's live read of this same
+#      checkout and agrees by construction. Local work the pipeline never
+#      received leaves a commit uncarried, and a pipeline head this worktree
+#      cannot see leaves no evidence either way; both are UNATTRIBUTED, and
+#      rule 4's pane and log sources answer instead. That is what keeps a crew's
+#      own blocked/paused report from being masked by a run it abandoned, and it
+#      is why no verdict of any kind - terminal or otherwise - can rest on
+#      ownership alone.
+#      Which binding applies is decided by the block's presence, not by the
+#      run-id binding's result: an answer CARRYING a `branch_sync` block is
+#      answered entirely by that binding, so a refusal it reached on the
+#      pipeline's own heads is never rescued by a looser match; an answer
+#      carrying no such block (an older CLI) falls back to the sha binding, where
+#      a run matches when its head equals the worktree HEAD, or the worktree HEAD
+#      is an ancestor of the run head (pipeline fix commits advanced the run on
+#      the same line of history). Local work that advanced past the run head, or
+#      diverged from it, invalidates that fallback, as does a pipeline that
+#      rebased its own head off this worktree's line of history - which is why
+#      the run id has to lead (see nm_run_head_matches_worktree, and the incident
+#      it records).
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. A failed run
@@ -126,6 +129,9 @@ case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
 # history every call.
 FM_CREW_STATE_RUNS_LIMIT=${FM_CREW_STATE_RUNS_LIMIT:-200}
 case "$FM_CREW_STATE_RUNS_LIMIT" in ''|*[!0-9]*) FM_CREW_STATE_RUNS_LIMIT=200 ;; esac
+# Ceiling on how far the code-identity guard will diff (nm_commit_carries_worktree_work).
+FM_CREW_STATE_PATCH_SCAN=${FM_CREW_STATE_PATCH_SCAN:-200}
+case "$FM_CREW_STATE_PATCH_SCAN" in ''|*[!0-9]*) FM_CREW_STATE_PATCH_SCAN=200 ;; esac
 SEP=' · '
 
 # Emit the one canonical line and exit 0. Detail is optional.
@@ -537,19 +543,31 @@ nm_commit_visible_here() {  # <commit-ish>
 # rewrote its branch out from under an abandoned run, leaves at least one commit
 # the pipeline never received, `git cherry` prefixes it `+`, and nothing binds.
 #
-# The ancestor pre-check is not a second rule, only the cheap half of the same
-# one: if the worktree HEAD is reachable from the candidate then every commit of
-# HEAD is literally in it, carried without any diffing. That is the shape of
-# every run that has NOT rebased, which is the common case, and it matters
-# because this reader runs per-crew on the watcher's single-threaded poll while
-# `git cherry` patch-ids every commit on the candidate's side of the merge base -
-# for a rebased head, however far the default branch had advanced. The patch-id
-# walk is therefore paid only for the rebase shape it was added for.
+# Cost discipline, because this reader runs per-crew on the watcher's
+# single-threaded poll and is called up to twice per read. Two cheap graph walks
+# stand in front of the one expensive step:
+#   - if the worktree HEAD is reachable from the candidate, every commit of HEAD
+#     is literally in it and nothing needs diffing at all. That covers a run that
+#     has not rebased yet and a crew already synchronized to the pipeline's head.
+#   - otherwise the divergence is measured first. `git cherry` computes a patch-id
+#     - a full diff - for every commit on BOTH sides of the merge base, and after
+#     a rebase the candidate's side includes however far the default branch had
+#     advanced, so that span is what has to stay bounded. Past
+#     FM_CREW_STATE_PATCH_SCAN commits the walk is not run at all and the answer
+#     is "no evidence", which costs a fall-through to the pane and log sources
+#     rather than an unbounded diff on the fleet's supervision poll.
+# Post-rebase runs are the shape that reaches the patch-id walk, and by design it
+# is the bounded shape rather than the rare one.
 nm_commit_carries_worktree_work() {  # <commit-ish>
-  local cand=${1:-} cand_full unmatched
+  local cand=${1:-} cand_full base span unmatched
   nm_commit_visible_here "$cand" || return 1
   cand_full=$(git -C "$WT" rev-parse --verify "${cand}^{commit}" 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor HEAD "$cand_full" 2>/dev/null && return 0
+  base=$(git -C "$WT" merge-base HEAD "$cand_full" 2>/dev/null) || return 1
+  [ -n "$base" ] || return 1
+  span=$(git -C "$WT" rev-list --count "$base..HEAD" "$base..$cand_full" 2>/dev/null) || return 1
+  case "$span" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$span" -le "$FM_CREW_STATE_PATCH_SCAN" ] || return 1
   unmatched=$(git -C "$WT" cherry "$cand_full" HEAD 2>/dev/null) || return 1
   printf '%s\n' "$unmatched" | grep -q '^+' && return 1
   return 0
@@ -561,17 +579,6 @@ nm_commit_carries_worktree_work() {  # <commit-ish>
 # below is.
 nm_has_branch_sync() {
   printf '%s\n' "$RUN_OUT" | grep -qE '^branch_sync:[[:space:]]*$'
-}
-
-# 0 when the reported run has already reached an end state, by either of the two
-# ways `axi status` says so: an `outcome:` line at all, or a terminal `status:`.
-# Every one of those maps to a terminal crew verdict (done or failed) below.
-nm_run_is_terminal() {
-  [ -n "$(strip_quotes "$(nm_field outcome)")" ] && return 0
-  case "$(strip_quotes "$(nm_field status)")" in
-    completed|failed|cancelled) return 0 ;;
-  esac
-  return 1
 }
 
 # Scalar value of a key nested one level under the `branch_sync:` block, e.g.
@@ -630,24 +637,19 @@ nm_branch_sync_field() {  # <sub-block> <key>
 # this worktree's HEAD, by patch identity so the pipeline's own rebase of this
 # crew's work still counts (nm_commit_carries_worktree_work).
 #
-# When NEITHER pipeline head is visible in this worktree, no local test can
-# decide - which is the ordinary shape of an in-flight run, whose commits live
-# only inside the local gate. Only there does the pipeline's own live-ownership
-# instruction stand in: `next_action.code: continue_active_run` means "the
-# pipeline still owns the branch, keep driving the active run, do not make local
-# follow-up commits", and it is addressed to THIS checkout.
-#
-# That instruction buys a LIVE step and nothing else. The reader refuses this
-# path outright for a run that has already ended, so "no code evidence" can never
-# produce a terminal verdict - the failure mode this whole reader exists to
-# prevent. That is enforced here rather than inferred from the CLI: the observed
-# pairing (live runs say `continue_active_run`, a terminal run holding custody
-# says `recover_custody`) comes from two different commands, so treating it as a
-# guarantee would make a false `failed` depend on an unchecked cross-command
-# assumption. A terminal run whose heads this checkout cannot see is simply
-# unattributed, and falls through to the pane and log sources.
+# Code evidence is the only thing that binds, and there is no ownership-only
+# escape hatch. When NEITHER pipeline head is visible in this worktree - the
+# ordinary shape of an in-flight run, whose commits live only inside the local
+# gate - nothing here can tell a run that is validating this crew's code from one
+# whose worker has since rewritten the branch out from under it, so the answer is
+# UNATTRIBUTED and the pane and log sources answer instead. That is what keeps an
+# abandoned run from masking the crew's own blocked/paused report, and it is why
+# no verdict of any kind can rest on the CLI merely naming this branch's owner.
+# `local.head` is checked too, but only as a freshness check on the answer: it is
+# the CLI's live read of this same checkout, so it can catch a read that raced a
+# local commit and can never be the code evidence itself.
 nm_run_id_binds_worktree() {
-  local run_id bs_run bs_branch submitted current
+  local run_id bs_run bs_branch
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || return 1
   bs_run=$(strip_quotes "$(nm_branch_sync_field pipeline run)")
@@ -655,51 +657,24 @@ nm_run_id_binds_worktree() {
   bs_branch=$(strip_quotes "$(nm_branch_sync_field local branch)")
   [ -n "$bs_branch" ] && [ "$bs_branch" = "$CREW_BRANCH" ] || return 1
   same_commit_as_worktree_head "$(strip_quotes "$(nm_branch_sync_field local head)")" || return 1
-  submitted=$(strip_quotes "$(nm_branch_sync_field pipeline submitted_head)")
-  current=$(strip_quotes "$(nm_branch_sync_field pipeline current_head)")
-  nm_commit_carries_worktree_work "$submitted" && return 0
-  nm_commit_carries_worktree_work "$current" && return 0
-  # A visible pipeline head that failed the test above is evidence AGAINST the
-  # binding, not an absence of evidence, so the live-ownership instruction never
-  # gets to overrule it.
-  nm_commit_visible_here "$submitted" && return 1
-  nm_commit_visible_here "$current" && return 1
-  nm_run_is_terminal && return 1
-  [ "$(strip_quotes "$(nm_branch_sync_field next_action code)")" = continue_active_run ]
+  nm_commit_carries_worktree_work "$(strip_quotes "$(nm_branch_sync_field pipeline submitted_head)")" && return 0
+  nm_commit_carries_worktree_work "$(strip_quotes "$(nm_branch_sync_field pipeline current_head)")"
 }
 
 # The FALLBACK attribution, reached ONLY for an answer that carries no
 # `branch_sync` block at all - nm_run_id_binds_worktree above is the whole rule
 # for any answer that carries one, and needs no commit guessing.
-# Branch match is a precondition (caller). Two heads can bind it, and
-# either one is sufficient:
-#   - `head`, where the run sits NOW. It binds a run whose commits this worktree
-#     can still see: no pipeline commit yet, or the crew already synchronized to
-#     the pipeline-pushed head.
-#   - `branch_sync.pipeline.submitted_head`, the head the pipeline records itself
-#     as validating. A run in flight rewrites its own head inside the local gate
-#     repo - the rebase step alone does it, before any fix round - and those
-#     commits are not in the crew worktree until the pipeline pushes, so `head`
-#     resolves to nothing here and, on its own, disowns the very run that is
-#     validating this crew right now (verified 2026-08-11 against a real live
-#     run: worktree c27c5d94, run head e62fa96c present only in the gate repo,
-#     submitted_head c27c5d94). Attribution then fell through to the coarse runs
-#     list, which matched an OLDER superseded run still sitting on the worktree
-#     sha and reported a healthy crew as failed.
-# Read the submitted head as the pipeline's record and NOT as "the commit this
-# worktree handed it": the rebase step replays that commit onto a newer base, so
-# once a run has rebased, the submitted head is a rewrite of the worktree's HEAD
-# rather than that HEAD or a descendant of it, and neither test here can bind it
-# (verified 2026-08-19 against a real live run: worktree 985dd8af, run head
-# c3c0cfa7 gate-only, submitted_head 0df68e38 a rebase of 985dd8af onto a newer
-# main). That is the whole reason the run-id binding has to lead rather than
-# being a refinement of this one.
-# Both tests stay exact rather than optimistic, so a crew that rewrote its branch
-# under an abandoned still-active run matches neither head and correctly falls
+# Branch match is a precondition (caller). One head is all such an answer has:
+# `head`, where the run sits NOW. It binds a run whose commits this worktree can
+# still see - no pipeline commit yet, or the crew already synchronized to the
+# pipeline-pushed head - and nothing else. A submitted head is not tried here
+# because there is none to try: the CLI publishes `submitted_head` only inside
+# `branch_sync.pipeline`, so any answer that has one is answered above.
+# The test stays exact rather than optimistic, so a crew that rewrote its branch
+# under an abandoned still-active run matches no head and correctly falls
 # through to the pane/log sources below.
 nm_run_head_matches_worktree() {
-  nm_commit_binds_worktree "$(strip_quotes "$(nm_field head)")" && return 0
-  nm_commit_binds_worktree "$(strip_quotes "$(nm_field submitted_head)")"
+  nm_commit_binds_worktree "$(strip_quotes "$(nm_field head)")"
 }
 
 # The one attribution test the reader uses, and the block's presence picks which
@@ -707,9 +682,8 @@ nm_run_head_matches_worktree() {
 # the run-id binding: that block is the CLI's own attribution, so once it has
 # refused - including when it refused on a visible pipeline head that does not
 # carry this worktree's work - a looser ancestry match on the top-level `head:`
-# and `submitted_head:` fields must not rescue it. An answer carrying no block
-# (an older CLI) has no such attribution to consult, and falls back to the sha
-# binding above.
+# field must not rescue it. An answer carrying no block (an older CLI) has no
+# such attribution to consult, and falls back to the sha binding above.
 nm_run_binds_worktree() {
   if nm_has_branch_sync; then
     nm_run_id_binds_worktree
