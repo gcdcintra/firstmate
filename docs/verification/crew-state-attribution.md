@@ -4,7 +4,7 @@ Audience: maintainer-verification.
 Owner of the contract itself: the header of [`bin/fm-crew-state.sh`](../../bin/fm-crew-state.sh).
 This record holds the empirical facts that contract rests on, so they can be re-checked against a newer CLI.
 
-Verified 2026-08-19 against the installed `no-mistakes` v1.48.0, from two live worktrees of the same repository, one of which owned an active run parked at its review gate.
+Verified 2026-08-19 against the installed `no-mistakes` v1.48.0, from five live worktrees of the same repository - four owning a run of their own, one owning none, and two of the four parked at a review gate.
 
 ## The guarantee
 
@@ -36,7 +36,53 @@ $ no-mistakes axi status | grep -E '^  id:|^    run:|^    branch:|^    head:'
     run: "01M0C0NMH09NBK495KFFC9TAF8"
 ```
 
-So `run.id` equal to `branch_sync.pipeline.run`, with `branch_sync.local` agreeing on the task's branch and HEAD, is the pipeline's own attribution.
+So `run.id` equal to `branch_sync.pipeline.run`, with `branch_sync.local.branch` agreeing on the task's branch, is the pipeline's own statement of WHICH run owns this branch.
+
+## The run id answers which run, never whose code
+
+The run id cannot carry attribution on its own, and neither can `branch_sync.local`.
+
+`local` is the CLI's LIVE read of the checkout it was invoked in - `fm-crew-state.sh` invokes it with `cd "$WT"` - so `local.head` equals that worktree's HEAD by construction and agrees with any run.
+A run also keeps its custody claim on the branch NAME after going terminal ([`nm-custody-deadlock.md`](nm-custody-deadlock.md)), so the CLI keeps naming a dead run in `pipeline.run` long after its worker committed a local fix and went back to work.
+Run id plus branch name plus `local.head` is therefore exactly the "some run owns this branch" rule the reader's header calls insufficient, and binding on it reintroduces the false `failed`.
+
+The three neighboring fields do not close that gap either, checked against the four live runs above, two of which had a pipeline head that had already moved:
+
+| field | run A | run B | run C | run D |
+| --- | --- | --- | --- | --- |
+| `local.head` vs `pipeline.current_head` | same | same | differs | differs |
+| `changed` | `false` | `false` | `false` | `false` |
+| `state` | `pipeline_owned` | `pipeline_owned` | `pipeline_owned` | `pipeline_owned` |
+| `relation` | `equal` | `equal` | `unknown` | `unknown` |
+
+`changed` is `false` on every one of them, including the two whose heads disagree, so it is not a local-versus-pipeline comparison at all.
+`state` is `pipeline_owned` on all four, which is ownership rather than code identity.
+`relation` is `equal` only while the pipeline head still equals the local head and degrades to `unknown` - not to a divergence verdict - the moment the pipeline moves its head without pushing it, which is the ordinary shape of a live run.
+
+What the reader can compute locally is PATCH identity: does a pipeline head already carry every commit unique to this worktree's HEAD?
+On the incident's own commits it sees straight through the rebase that defeated ancestry:
+
+```
+$ git cherry 0df68e38d59e983b27060130fd49efb068eab352 985dd8af934a077dad2656e85d2cf849bd8c8ddd
+- 2b3e7014c46bed557bfeb51e15250e45ac7cad10
+- 985dd8af934a077dad2656e85d2cf849bd8c8ddd
+```
+
+Every worktree commit is `-`, already present upstream, so the pipeline holds all of this task's work.
+A worker that added a commit the pipeline never received gets a `+` line instead, and nothing binds.
+
+## When no pipeline head is visible at all
+
+An in-flight run's own commits live only inside the local gate, so `current_head` - and, after a rebase, `submitted_head` too - can be unresolvable in the worktree, leaving no local evidence in either direction.
+Only there does the reader fall back to the pipeline's own live-ownership instruction, which distinguishes a live run from a dead one holding custody:
+
+| | live run owning the branch | terminal run holding only custody |
+| --- | --- | --- |
+| `safety` | `blocked_pipeline_owned` | `blocked_pipeline_owned_recoverable` |
+| `next_action.code` | `continue_active_run` | `recover_custody` |
+
+The live row is from the four runs above; the terminal row is the reproduction in [`nm-custody-deadlock.md`](nm-custody-deadlock.md).
+`continue_active_run` is addressed to this checkout ("do not make local follow-up commits") and is issued only while the run is live, so that path can report a live run's step and can never assert a terminal verdict.
 
 ## Why the commit-sha binding cannot carry attribution alone
 
@@ -88,7 +134,8 @@ Newest-first plain text, `<status> <branch> <short-sha> <date> [<pr-url>]`, with
 
 The branch's live run is the second row and its sha is gate-only.
 A walk that skips an unbindable row reaches the fourth row, whose sha is exactly the worktree HEAD, and reports a terminal `failed` for a run that is still parked and answerable.
-This is why the walk answers only for the newest row of the branch and reports an unbindable one as unread.
+This is why the walk answers only for the newest row of the branch.
+An unbindable newest row attributes no run at all, which is the ordinary no-run case: the reader falls through to the pane busy signature and then the status log, so refusing the older row costs it no other evidence.
 
 ## End-to-end, on the live parked run
 
@@ -118,6 +165,7 @@ $ no-mistakes axi status --run 01M0C0NMH09NBK495KFFC9TAF8
 
 - `test_live_parked_run_never_reported_failed` reproduces this exact condition - gate-only run head, rebased submitted head, and the branch's own older failed rows below its live row - and fails with `state: failed · source: run-step · run failed` without the fix.
 - `test_live_parked_run_pipeline_activity_is_parked` pins the same binding for the pipeline-clock mode.
-- `test_coarse_unbindable_newest_row_never_falls_back_to_older_row` pins that no older row answers for an unbindable newest one.
+- `test_coarse_unbindable_newest_row_never_falls_back_to_older_row` and `test_coarse_unbindable_newest_row_still_reads_the_pane` pin that no older row answers for an unbindable newest one, and that refusing it still leaves the status log and the pane busy signature to answer.
+- `test_stale_terminal_run_after_local_fix_commit_not_attributed` pins the other false-`failed` shape: a terminal run still named in `pipeline.run` after its worker committed a local fix binds nothing, because the pipeline's submitted head does not carry that commit.
 - `test_coarse_newest_row_failed_and_bound_still_reports_failed` and `test_run_id_bound_failed_run_still_reports_failed` pin that genuinely failed runs are still reported failed, through both attribution paths.
 - `test_run_id_binding_rejects_foreign_branch_sync` pins that a `branch_sync` block describing another checkout binds nothing.
