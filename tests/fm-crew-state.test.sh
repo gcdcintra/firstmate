@@ -364,7 +364,7 @@ EOF
 # commit that exists only inside the local gate repo. The trailing fields are
 # reproduced as the CLI emits them, but the reader binds on the pipeline heads
 # alone, so no test varies them.
-branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state> [owning-run-id]
+branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state> [owning-run-id] [pipeline-status]
   cat <<EOF
 branch_sync:
   state: $5
@@ -375,7 +375,7 @@ branch_sync:
     clean: true
   pipeline:
     run: "${6:-01RUN}"
-    status: running
+    status: ${7:-running}
     phase: pre_push
     submitted_head: $3
     current_head: $4
@@ -404,8 +404,14 @@ work_commit() {  # <worktree> <name>
 # worktree HEAD - neither equal to it nor a descendant of it, so the sha binding
 # cannot bind it - while carrying the identical patches, which is what the code
 # guard has to see through.
-rebased_sibling_head() {  # <worktree> -> echoes the rebased sha
-  local wt=$1 branch root newbase before sha
+# Deliberately SETS a variable instead of echoing one. `fail` exits the shell it
+# runs in, so a helper called as `$(...)` can only ever kill its own subshell -
+# the suite would sail past a broken fixture with an empty value and assert
+# nothing. Called plainly, its checks abort the run like any other assertion.
+# The branch is restored before any of them, so a failure never leaves the case
+# on the throwaway rebase branch.
+rebased_sibling_head() {  # <worktree> -> sets REBASED_HEAD to the replayed sha
+  local wt=$1 branch root newbase before sha rc
   branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD)
   before=$(git -C "$wt" rev-parse HEAD)
   root=$(git -C "$wt" rev-list --max-parents=0 HEAD | tail -1)
@@ -413,17 +419,17 @@ rebased_sibling_head() {  # <worktree> -> echoes the rebased sha
   git -C "$wt" commit -q --allow-empty -m 'newer base the default branch advanced to'
   newbase=$(git -C "$wt" rev-parse HEAD)
   git -C "$wt" checkout -q -B fm-test-rebase "$branch"
-  git -C "$wt" rebase -q --onto "$newbase" "$root" >/dev/null 2>&1 \
-    || fail "rebased_sibling_head: the replay onto the newer base did not run"
+  git -C "$wt" rebase -q --onto "$newbase" "$root" >/dev/null 2>&1
+  rc=$?
   sha=$(git -C "$wt" rev-parse HEAD)
+  git -C "$wt" rebase --abort >/dev/null 2>&1 || true
   git -C "$wt" checkout -q "$branch"
-  git -C "$wt" branch -q -D fm-test-rebase
-  # Without these, a replay that silently did nothing would hand every call site
-  # the worktree HEAD itself and degrade the case to the trivial equal-head one.
-  [ "$sha" != "$before" ] || fail "rebased_sibling_head: returned the un-rebased head"
-  git -C "$wt" merge-base --is-ancestor "$before" "$sha" \
-    && fail "rebased_sibling_head: returned a descendant rather than a sibling"
-  printf '%s' "$sha"
+  git -C "$wt" branch -q -D fm-test-rebase >/dev/null 2>&1 || true
+  [ "$rc" -eq 0 ] || fail "rebased_sibling_head: the replay onto the newer base exited $rc"
+  [ "$sha" != "$before" ] || fail "rebased_sibling_head: the replay returned the un-rebased head"
+  ! git -C "$wt" merge-base --is-ancestor "$before" "$sha" \
+    || fail "rebased_sibling_head: the replay returned a descendant rather than a sibling"
+  REBASED_HEAD=$sha
 }
 
 # A commit id that is valid and real but lives in another repository, exactly
@@ -1688,7 +1694,7 @@ test_live_parked_run_never_reported_failed() {
   make_repo_on_branch "$d/wt" fm/feat-parked
   work_commit "$d/wt" implementation
   wt_head=$(git -C "$d/wt" rev-parse HEAD)
-  rebased=$(rebased_sibling_head "$d/wt")
+  rebased_sibling_head "$d/wt"; rebased=$REBASED_HEAD
   gate_head=$(gate_only_head "$d")
   [ "$(git -C "$d/wt" rev-parse HEAD)" = "$wt_head" ] || fail "fixture moved the worktree HEAD"
   git -C "$d/wt" merge-base --is-ancestor "$wt_head" "$rebased" 2>/dev/null \
@@ -1722,7 +1728,7 @@ test_live_parked_run_pipeline_activity_is_parked() {
   make_repo_on_branch "$d/wt" fm/feat-parkedpa
   work_commit "$d/wt" implementation
   wt_head=$(git -C "$d/wt" rev-parse HEAD)
-  rebased=$(rebased_sibling_head "$d/wt")
+  rebased_sibling_head "$d/wt"; rebased=$REBASED_HEAD
   gate_head=$(gate_only_head "$d")
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/parkedpa.meta" "window=fm:fm-parkedpa" "worktree=$d/wt" "kind=ship" "harness=claude"
@@ -1829,7 +1835,7 @@ test_run_id_bound_failed_run_still_reports_failed() {
   make_repo_on_branch "$d/wt" fm/feat-runidfail
   work_commit "$d/wt" implementation
   wt_head=$(git -C "$d/wt" rev-parse HEAD)
-  rebased=$(rebased_sibling_head "$d/wt")
+  rebased_sibling_head "$d/wt"; rebased=$REBASED_HEAD
   gate_head=$(gate_only_head "$d")
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/runidfail.meta" "window=fm:fm-runidfail" "worktree=$d/wt" "kind=ship" "harness=claude"
@@ -1943,6 +1949,90 @@ test_abandoned_active_run_with_gate_only_heads_not_attributed() {
   pass "abandoned active run with gate-only heads is not attributed"
 }
 
+# Refusing to attribute must not become a terminal verdict by the back door. The
+# reader cannot tie this live run to this code, and does not pretend to - but the
+# `failed:` line in the status log is necessarily an EARLIER run's outcome, and
+# relaying it abandons a gate that is still answerable. This is the incident's
+# own forbidden word arriving through the fallback instead of the run step.
+test_live_unattributable_run_never_relays_a_stale_failed() {
+  reset_fakes
+  local d wt_head submitted current out
+  d=$(new_case live-stale-failed)
+  make_repo_on_branch "$d/wt" fm/feat-stalefail
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  submitted=$(gate_only_head "$d" submitted)
+  current=$(gate_only_head "$d" current)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/stalefail.meta" "window=fm:fm-stalefail" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'failed: the previous run failed at review\n' > "$d/state/stalefail.status"
+  FM_FAKE_RUN_HEAD="$current"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-stalefail
+    branch_sync_block fm/feat-stalefail "$wt_head" "$submitted" "$current" pipeline_owned)"
+  FM_FAKE_RUNS_LIST="  running      fm/feat-stalefail      ${current:0:8}  2026-08-19 00:22"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" stalefail
+  out=$(run_crew_state "$d" stalefail)
+  assert_not_contains "$out" "state: failed" "a live run's branch must never relay an earlier run's failure"
+  assert_not_contains "$out" "source: run-step" "the reader still declines to attribute the run"
+  assert_contains "$out" "state: unknown" "an honest unknown is what is left"
+  assert_contains "$out" "could not be tied to this code" "the detail says why the log line was refused"
+  pass "a live unattributable run never relays a stale failed line"
+}
+
+# `done:` by the same route invites tearing live work down while the pipeline is
+# still validating it, so it is refused on the same terms.
+test_live_unattributable_run_never_relays_a_stale_done() {
+  reset_fakes
+  local d wt_head submitted current out
+  d=$(new_case live-stale-done)
+  make_repo_on_branch "$d/wt" fm/feat-staledone
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  submitted=$(gate_only_head "$d" submitted)
+  current=$(gate_only_head "$d" current)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/staledone.meta" "window=fm:fm-staledone" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'done: the previous run merged\n' > "$d/state/staledone.status"
+  FM_FAKE_RUN_HEAD="$current"
+  FM_FAKE_AXI_STATUS="$(run_fixing fm/feat-staledone
+    branch_sync_block fm/feat-staledone "$wt_head" "$submitted" "$current" pipeline_owned)"
+  FM_FAKE_RUNS_LIST="  running      fm/feat-staledone      ${current:0:8}  2026-08-19 00:22"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" staledone
+  out=$(run_crew_state "$d" staledone)
+  assert_not_contains "$out" "state: done" "a live run's branch must never relay an earlier run's completion"
+  assert_contains "$out" "state: unknown" "an honest unknown is what is left"
+  pass "a live unattributable run never relays a stale done line"
+}
+
+# The other direction, so refusing does not become blindness: once the CLI itself
+# reports the branch's run as terminal, there is no live run to protect and the
+# crew's own `failed:` line is its current state again.
+test_terminal_owner_still_lets_the_status_log_report_failed() {
+  reset_fakes
+  local d wt_head submitted current out
+  d=$(new_case terminal-owner-log)
+  make_repo_on_branch "$d/wt" fm/feat-termowner
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  submitted=$(gate_only_head "$d" submitted)
+  current=$(gate_only_head "$d" current)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/termowner.meta" "window=fm:fm-termowner" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'failed: the run failed at review\n' > "$d/state/termowner.status"
+  FM_FAKE_RUN_HEAD="$current"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-termowner
+    branch_sync_block fm/feat-termowner "$wt_head" "$submitted" "$current" user_owned 01RUN failed)"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" termowner
+  out=$(run_crew_state "$d" termowner)
+  assert_contains "$out" "state: failed" "a genuinely failed run's own report still stands"
+  assert_contains "$out" "source: status-log" "and it comes from the crew's own log"
+  pass "a terminal owning run still lets the status log report failed"
+}
+
 # The same refusal for a run that has already ended, so no read with zero code
 # evidence can ever assert a terminal verdict.
 test_terminal_run_with_no_visible_pipeline_head_binds_nothing() {
@@ -2040,7 +2130,7 @@ test_run_id_binding_rejects_foreign_branch_sync() {
   make_repo_on_branch "$d/wt" fm/feat-runidforeign
   work_commit "$d/wt" implementation
   wt_head=$(git -C "$d/wt" rev-parse HEAD)
-  rebased=$(rebased_sibling_head "$d/wt")
+  rebased_sibling_head "$d/wt"; rebased=$REBASED_HEAD
   gate_head=$(gate_only_head "$d")
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/runidforeign.meta" "window=fm:fm-runidforeign" "worktree=$d/wt" "kind=ship" "harness=claude"
@@ -2124,6 +2214,9 @@ test_run_id_bound_failed_run_still_reports_failed
 test_stale_terminal_run_after_local_fix_commit_not_attributed
 test_active_run_with_no_visible_pipeline_head_binds_nothing
 test_abandoned_active_run_with_gate_only_heads_not_attributed
+test_live_unattributable_run_never_relays_a_stale_failed
+test_live_unattributable_run_never_relays_a_stale_done
+test_terminal_owner_still_lets_the_status_log_report_failed
 test_terminal_run_with_no_visible_pipeline_head_binds_nothing
 test_branch_sync_refusal_is_not_rescued_by_the_sha_binding
 test_run_id_binding_rejects_a_stale_view_of_this_checkout
@@ -2281,6 +2374,23 @@ test_pipeline_activity_names_which_attribution_missed() {
   assert_contains "$out" "unknown " "a run whose head binds nothing measures nothing here"
   assert_contains "$out" "superseded or rewritten head" "an unbindable same-branch run is named as one"
   assert_not_contains "$out" "active " "a run validating other code is never credited to this task"
+
+  reset_fakes
+  pipeline_case pa-unseen pa-unseen fm/pa-unseen; d=$PA_DIR
+  # The ordinary in-flight shape: both pipeline heads live only in the gate, so
+  # the reader had no evidence in either direction. Saying the run is validating
+  # SOMEONE ELSE'S code there would be a confident wrong cause, spliced straight
+  # into a wedge escalation about a crew that is most likely healthy.
+  local unseen_sub unseen_cur
+  unseen_sub=$(gate_only_head "$d" submitted)
+  unseen_cur=$(gate_only_head "$d" current)
+  FM_FAKE_RUN_HEAD="$unseen_cur"
+  FM_FAKE_AXI_STATUS="$(run_active_steps fm/pa-unseen review 3s
+    branch_sync_block fm/pa-unseen "$(git -C "$d/wt" rev-parse HEAD)" "$unseen_sub" "$unseen_cur" pipeline_owned)"
+  out=$(run_pipeline_activity "$d" pa-unseen)
+  assert_contains "$out" "unknown " "a run with no visible head measures nothing here"
+  assert_contains "$out" "cannot see" "the reason given is the one actually observed"
+  assert_not_contains "$out" "superseded or rewritten head" "no evidence must not be reported as evidence of other code"
   pass "each way attribution can miss is reported as the distinct fact it is"
 }
 

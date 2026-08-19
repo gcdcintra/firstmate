@@ -72,7 +72,14 @@
 #   4. No run for this crew (pre-validation, or kind=scout): fall back to the
 #      recorded backend's pane busy state, then the status log's last line only
 #      when its verb maps to a recognized run-state. Decision-only events such as
-#      `resolved` never become current state or detail.
+#      `resolved` never become current state or detail. One line the log may NOT
+#      supply: a TERMINAL verdict while the CLI still reports a live run owning
+#      this branch (nm_branch_sync_run_is_live). Rule 2 refused to attribute that
+#      run, and it keeps refusing - but a `failed:`/`done:` line is then provably
+#      an EARLIER run's outcome, and relaying it abandons a gate that is still
+#      answerable or invites tearing live work down. That reads unknown, with the
+#      reason attribution missed (nm_bind_miss_note). Liveness is the only thing
+#      the block is trusted for here; it never becomes attribution.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log. The coarse fallback answers only for this
@@ -132,6 +139,9 @@ case "$FM_CREW_STATE_RUNS_LIMIT" in ''|*[!0-9]*) FM_CREW_STATE_RUNS_LIMIT=200 ;;
 # Ceiling on how far the code-identity guard will diff (nm_commit_carries_worktree_work).
 FM_CREW_STATE_PATCH_SCAN=${FM_CREW_STATE_PATCH_SCAN:-200}
 case "$FM_CREW_STATE_PATCH_SCAN" in ''|*[!0-9]*) FM_CREW_STATE_PATCH_SCAN=200 ;; esac
+# Why the attribution below last refused, owned by nm_run_id_binds_worktree and
+# rendered by nm_bind_miss_note. Empty means it bound, or was never attempted.
+NM_BIND_MISS=''
 SEP=' · '
 
 # Emit the one canonical line and exit 0. Detail is optional.
@@ -561,13 +571,14 @@ nm_commit_visible_here() {  # <commit-ish>
 nm_commit_carries_worktree_work() {  # <commit-ish>
   local cand=${1:-} cand_full base span unmatched
   nm_commit_visible_here "$cand" || return 1
+  NM_BIND_MISS=head-disagrees
   cand_full=$(git -C "$WT" rev-parse --verify "${cand}^{commit}" 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor HEAD "$cand_full" 2>/dev/null && return 0
   base=$(git -C "$WT" merge-base HEAD "$cand_full" 2>/dev/null) || return 1
   [ -n "$base" ] || return 1
   span=$(git -C "$WT" rev-list --count "$base..HEAD" "$base..$cand_full" 2>/dev/null) || return 1
   case "$span" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$span" -le "$FM_CREW_STATE_PATCH_SCAN" ] || return 1
+  [ "$span" -le "$FM_CREW_STATE_PATCH_SCAN" ] || { NM_BIND_MISS=scan-ceiling; return 1; }
   unmatched=$(git -C "$WT" cherry "$cand_full" HEAD 2>/dev/null) || return 1
   printf '%s\n' "$unmatched" | grep -q '^+' && return 1
   return 0
@@ -650,15 +661,21 @@ nm_branch_sync_field() {  # <sub-block> <key>
 # local commit and can never be the code evidence itself.
 nm_run_id_binds_worktree() {
   local run_id bs_run bs_branch
+  NM_BIND_MISS=foreign-run
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || return 1
   bs_run=$(strip_quotes "$(nm_branch_sync_field pipeline run)")
   [ -n "$bs_run" ] && [ "$bs_run" = "$run_id" ] || return 1
   bs_branch=$(strip_quotes "$(nm_branch_sync_field local branch)")
   [ -n "$bs_branch" ] && [ "$bs_branch" = "$CREW_BRANCH" ] || return 1
+  NM_BIND_MISS=stale-view
   same_commit_as_worktree_head "$(strip_quotes "$(nm_branch_sync_field local head)")" || return 1
-  nm_commit_carries_worktree_work "$(strip_quotes "$(nm_branch_sync_field pipeline submitted_head)")" && return 0
-  nm_commit_carries_worktree_work "$(strip_quotes "$(nm_branch_sync_field pipeline current_head)")"
+  NM_BIND_MISS=no-visible-head
+  nm_commit_carries_worktree_work "$(strip_quotes "$(nm_branch_sync_field pipeline submitted_head)")" \
+    && { NM_BIND_MISS=''; return 0; }
+  nm_commit_carries_worktree_work "$(strip_quotes "$(nm_branch_sync_field pipeline current_head)")" \
+    && { NM_BIND_MISS=''; return 0; }
+  return 1
 }
 
 # The FALLBACK attribution, reached ONLY for an answer that carries no
@@ -675,6 +692,40 @@ nm_run_id_binds_worktree() {
 # through to the pane/log sources below.
 nm_run_head_matches_worktree() {
   nm_commit_binds_worktree "$(strip_quotes "$(nm_field head)")"
+}
+
+# 0 when the CLI's own `branch_sync` block says a run is LIVE on this crew's
+# branch. This is evidence that a run EXISTS, never attribution of it to this
+# code: the block is emitted for whoever owns the branch NAME, which is exactly
+# the claim the binding above refuses to act on. The one thing it is trusted for
+# is the fallback's terminal verdicts - while a run is live on this branch, a
+# `failed:`/`done:` line left in the status log by an earlier run is provably not
+# this crew's current state, and reporting it would be the false terminal verdict
+# this whole reader exists to prevent. An unrecognized status counts as live,
+# which errs toward saying less rather than toward asserting an ending.
+nm_branch_sync_run_is_live() {
+  local bs_branch bs_status
+  nm_has_branch_sync || return 1
+  bs_branch=$(strip_quotes "$(nm_branch_sync_field local branch)")
+  [ -n "$bs_branch" ] && [ "$bs_branch" = "$CREW_BRANCH" ] || return 1
+  bs_status=$(strip_quotes "$(nm_branch_sync_field pipeline status)")
+  [ -n "$bs_status" ] || return 1
+  case "$bs_status" in completed|failed|cancelled) return 1 ;; esac
+  return 0
+}
+
+# What the attribution actually observed when it refused, for the details this
+# reader prints when it declines to attribute. Empty when nothing was attempted
+# or nothing is worth saying. Each miss is a different fact about a crew and is
+# read inside a wedge escalation, so a confident wrong cause here is the same
+# defect class as a confident wrong state.
+nm_bind_miss_note() {
+  case "${NM_BIND_MISS:-}" in
+    no-visible-head) printf '%s' "the pipeline holds a head this checkout cannot see, so code identity could not be established either way" ;;
+    scan-ceiling)    printf '%s' "this branch and the pipeline's head have diverged by more than FM_CREW_STATE_PATCH_SCAN ($FM_CREW_STATE_PATCH_SCAN) commits, so code identity was not checked" ;;
+    stale-view)      printf '%s' "the pipeline CLI's own view of this checkout is already out of date" ;;
+    head-disagrees)  printf '%s' "the pipeline's head does not carry this checkout's work" ;;
+  esac
 }
 
 # The one attribution test the reader uses, and the block's presence picks which
@@ -701,6 +752,10 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
 }
 
 HAVE_RUN=0
+# Set when the CLI reports a LIVE run owning this branch that the binding above
+# could not tie to this code. It buys no attribution - only the right to refuse a
+# stale terminal line from the status log below.
+UNATTRIBUTED_LIVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
 # a bare status word came back from the runs-list fallback above, so the
@@ -742,9 +797,15 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
         elif [ "$run_branch" != "$CREW_BRANCH" ]; then
           emit_pipeline unknown "the only run the pipeline CLI reports is for another branch ($run_branch), so no run of this work's own could be measured"
         else
-          emit_pipeline unknown "the run the pipeline CLI reports for this branch is validating other code - a superseded or rewritten head - so its clock is not this work's"
+          case "$NM_BIND_MISS" in
+            no-visible-head) emit_pipeline unknown "the run the pipeline CLI reports for this branch holds a head this checkout cannot see, so nothing here ties its clock to this work either way" ;;
+            scan-ceiling)    emit_pipeline unknown "this branch and the head of the run the pipeline CLI reports for it have diverged too far to check, so whose code that run is validating was never established" ;;
+            stale-view)      emit_pipeline unknown "the pipeline CLI's own view of this checkout is already out of date, so the run it reports describes a checkout that has since moved" ;;
+            *)               emit_pipeline unknown "the run the pipeline CLI reports for this branch is validating other code - a superseded or rewritten head - so its clock is not this work's" ;;
+          esac
         fi
       fi
+      nm_branch_sync_run_is_live && UNATTRIBUTED_LIVE_RUN=1
       COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
@@ -1027,8 +1088,24 @@ fi
 if [ -n "$LOG_VERB" ]; then
   LOG_STATE=$(map_log_state "$LOG_LINE")
   if [ "$LOG_STATE" != unknown ]; then
+    # A TERMINAL verdict is the one thing this log line may not assert while the
+    # CLI says a run is still live on this branch. The reader could not tie that
+    # run to this code and does not pretend otherwise - but `failed:`/`done:`
+    # here is necessarily an EARLIER run's outcome, and relaying it abandons a
+    # gate that is still answerable or invites tearing live work down. Saying
+    # `unknown` costs a supervisor one look; the terminal word costs the work.
+    case "$LOG_STATE" in
+      failed|done)
+        if [ "$UNATTRIBUTED_LIVE_RUN" = 1 ]; then
+          MISS_NOTE=$(nm_bind_miss_note)
+          emit unknown none "a live pipeline run owns this branch but could not be tied to this code${MISS_NOTE:+ ($MISS_NOTE)}, so this crew's earlier \`$LOG_VERB:\` line is not its current state"
+        fi
+        ;;
+    esac
     emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
   fi
 fi
 
+MISS_NOTE=$(nm_bind_miss_note)
+[ -z "$MISS_NOTE" ] || emit unknown none "no current-state source available: $MISS_NOTE"
 emit unknown none "no current-state source available"

@@ -84,6 +84,13 @@ Sourcing matters here and is worth stating plainly: the live values above were r
 No `axi status` read of a terminal run holding custody was ever captured - so a reader that leaned on those fields would be resting a false `failed` on an unchecked cross-command assumption.
 It does not lean on them at all.
 
+### What the refusal is allowed to cost
+
+Refusing to attribute is correct; letting that refusal harden into a terminal verdict is not.
+While the block reports a live run for this branch - `branch_sync.pipeline.status`, `running` on all four live reads above - the reader also refuses to let the status log's last line assert `failed` or `done`, because such a line is necessarily an EARLIER run's outcome and relaying it abandons a gate that is still answerable or invites tearing live work down.
+That is the ONLY thing the block is trusted for once attribution has refused: liveness, never attribution.
+Once the same field reports the branch's run as terminal, there is no live run to protect and the crew's own `failed:` line is its current state again.
+
 ## Bounding the patch-identity walk
 
 `git cherry` computes a patch-id - a full diff - for every commit on both sides of the merge base, and after a rebase the candidate's side includes however far the default branch had advanced.
@@ -174,6 +181,7 @@ $ no-mistakes axi status --run 01M0C0NMH09NBK495KFFC9TAF8
 - `test_coarse_unbindable_newest_row_never_falls_back_to_older_row` and `test_coarse_unbindable_newest_row_still_reads_the_pane` pin that no older row answers for an unbindable newest one, and that refusing it still leaves the status log and the pane busy signature to answer.
 - `test_stale_terminal_run_after_local_fix_commit_not_attributed` pins the other false-`failed` shape: a terminal run still named in `pipeline.run` after its worker committed a local fix binds nothing, because the pipeline's submitted head does not carry that commit. It supplies `continue_active_run`, the strongest ownership claim the CLI can make, so only the code evidence can be deciding it.
 - `test_active_run_with_no_visible_pipeline_head_binds_nothing`, `test_abandoned_active_run_with_gate_only_heads_not_attributed` and `test_terminal_run_with_no_visible_pipeline_head_binds_nothing` pin the no-code-evidence refusal with BOTH pipeline heads gate-only, for a live run, for a run a worker abandoned after rewriting the branch under it, and for a terminal run.
+- `test_live_unattributable_run_never_relays_a_stale_failed` and `test_live_unattributable_run_never_relays_a_stale_done` pin that an unattributable LIVE run also blocks the status log from relaying an earlier run's terminal line, and `test_terminal_owner_still_lets_the_status_log_report_failed` pins that a terminal owner does not.
 - `test_branch_sync_refusal_is_not_rescued_by_the_sha_binding` pins that the older sha binding is reached only for an answer carrying no `branch_sync` block.
 - `test_run_id_binding_rejects_a_stale_view_of_this_checkout` pins the freshness half: an answer whose `local.head` disagrees with the HEAD really there describes a checkout that has moved, and binds nothing even though every other check would pass.
 - `test_coarse_newest_row_failed_and_bound_still_reports_failed` and `test_run_id_bound_failed_run_still_reports_failed` pin that genuinely failed runs are still reported failed, through both attribution paths.
