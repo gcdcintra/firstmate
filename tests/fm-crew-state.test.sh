@@ -377,6 +377,20 @@ branch_sync:
 EOF
 }
 
+# A commit that IS present in the crew worktree but is not on its HEAD's line of
+# history - exactly the shape of a pipeline submitted head after the rebase step
+# replayed the crew's commit onto a newer base. Neither equal to the worktree
+# HEAD nor a descendant of it, so the sha binding cannot bind it.
+rebased_sibling_head() {  # <worktree> -> echoes the rebased sha
+  local wt=$1 branch sha
+  branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD)
+  git -C "$wt" checkout -q --detach "$(git -C "$wt" rev-list --max-parents=0 HEAD | tail -1)"
+  git -C "$wt" commit -q --allow-empty -m 'pipeline rebase replayed this onto a newer base'
+  sha=$(git -C "$wt" rev-parse HEAD)
+  git -C "$wt" checkout -q "$branch"
+  printf '%s' "$sha"
+}
+
 # A commit id that is valid and real but lives in another repository, exactly
 # like a pipeline commit the local gate holds and the crew worktree cannot see.
 gate_only_head() {  # <case-dir> -> echoes a sha absent from the crew worktree
@@ -1606,6 +1620,180 @@ test_single_live_run_with_gate_only_head_binds() {
   pass "single live run with a gate-only head binds by submitted head"
 }
 
+# --- false-`failed` on a live parked run ------------------------------------
+# Direct regression for the 2026-08-19 incident, which reported a false failure
+# to the captain twice for the same task. The live run was parked at its review
+# gate with all six findings intact and answerable, and the reader said
+# `failed · run failed`.
+#
+# The condition, reproduced exactly: the run's own head lives only in the local
+# gate, AND its submitted head has been rebased onto a newer base, so it is
+# present in the worktree but not on the worktree HEAD's line of history. Both
+# sha tests therefore miss, and the coarse runs list holds the branch's live row
+# at the gate-only sha followed by two older FAILED rows of the same branch - one
+# at the rebased head, one still sitting on the worktree sha. The old walk
+# skipped past the live row and reported the oldest row's outcome as current.
+#
+# The CLI named the owning run id in `branch_sync.pipeline.run` the whole time,
+# so attribution now binds by run id and the gate reads as parked.
+test_live_parked_run_never_reported_failed() {
+  reset_fakes
+  local d wt_head gate_head rebased out
+  d=$(new_case parked-not-failed)
+  make_repo_on_branch "$d/wt" fm/feat-parked
+  git -C "$d/wt" commit -q --allow-empty -m 'implementation commit'
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  rebased=$(rebased_sibling_head "$d/wt")
+  gate_head=$(gate_only_head "$d")
+  [ "$(git -C "$d/wt" rev-parse HEAD)" = "$wt_head" ] || fail "fixture moved the worktree HEAD"
+  git -C "$d/wt" merge-base --is-ancestor "$wt_head" "$rebased" 2>/dev/null \
+    && fail "fixture rebased head must not be a descendant of the worktree HEAD"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/parked.meta" "window=fm:fm-parked" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'paused: idle awaiting the captain decisions; the review gate is still answerable\n' \
+    > "$d/state/parked.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-parked
+    branch_sync_block fm/feat-parked "$wt_head" "$rebased" "$gate_head" pipeline_owned)"
+  FM_FAKE_RUNS_LIST="  running      fm/feat-parked      ${gate_head:0:8}  2026-08-19 00:22
+  failed       fm/feat-parked      ${rebased:0:8}  2026-08-18 16:53
+  failed       fm/feat-parked      ${wt_head:0:8}  2026-08-18 09:36"
+  out=$(run_crew_state "$d" parked)
+  assert_not_contains "$out" "state: failed" "a live run parked at a gate is never failed"
+  assert_contains "$out" "state: parked" "the live gate reads as parked"
+  assert_contains "$out" "source: run-step" "the parked verdict comes from the live run's own step"
+  assert_contains "$out" "parked at review" "the detail names the gate that is still answerable"
+  assert_contains "$out" "2 finding(s)" "the gate's findings are still reported"
+  pass "a live parked run whose heads both moved is never reported failed"
+}
+
+# The same run, read for the pipeline's own clock: a parked gate is the worker's
+# fault to answer, so this must not degrade to the unattributed `unknown` it
+# printed while the sha binding was the only attribution available.
+test_live_parked_run_pipeline_activity_is_parked() {
+  reset_fakes
+  local d wt_head gate_head rebased out
+  d=$(new_case parked-not-failed-pa)
+  make_repo_on_branch "$d/wt" fm/feat-parkedpa
+  git -C "$d/wt" commit -q --allow-empty -m 'implementation commit'
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  rebased=$(rebased_sibling_head "$d/wt")
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/parkedpa.meta" "window=fm:fm-parkedpa" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-parkedpa
+    branch_sync_block fm/feat-parkedpa "$wt_head" "$rebased" "$gate_head" pipeline_owned)"
+  out=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" parkedpa --pipeline-activity)
+  assert_contains "$out" "parked" "the pipeline clock reports the gate as parked on this worker"
+  assert_not_contains "$out" "unknown" "an attributable parked run is not unmeasurable"
+  pass "pipeline activity binds the same parked run by run id"
+}
+
+# The coarse walk in isolation, on a CLI answer that carries no branch_sync block
+# at all (another branch's run, so the run-id binding has nothing to read): the
+# branch's newest row is unbindable, and no older row of the same branch may
+# answer for it. Refusing to attribute is the honest result; the older row's
+# `failed` is the bug.
+test_coarse_unbindable_newest_row_never_falls_back_to_older_row() {
+  reset_fakes
+  local d wt_head gate_head out
+  d=$(new_case coarse-unbindable)
+  make_repo_on_branch "$d/wt" fm/feat-coarseunb
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/coarseunb.meta" "window=fm:fm-coarseunb" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validating\n' > "$d/state/coarseunb.status"
+  FM_FAKE_RUN_HEAD=aaaaaaa
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="  running      fm/other-crew      aaaaaaa  2026-08-19 00:24
+  running      fm/feat-coarseunb      ${gate_head:0:8}  2026-08-19 00:22
+  failed       fm/feat-coarseunb      ${wt_head:0:8}  2026-08-18 09:36"
+  out=$(run_crew_state "$d" coarseunb)
+  assert_not_contains "$out" "state: failed" "an older row of the same branch must not answer for the newest one"
+  assert_contains "$out" "state: unknown" "an unbindable newest row reports unknown"
+  assert_contains "$out" "could not be tied to this code" "the detail says why nothing was attributed"
+  pass "coarse walk refuses to attribute an older row when the newest is unbindable"
+}
+
+# The other direction, so honesty does not become blindness: when the branch's
+# newest coarse row is the one that failed AND it binds, the failure still lands.
+test_coarse_newest_row_failed_and_bound_still_reports_failed() {
+  reset_fakes
+  local d short out
+  d=$(new_case coarse-newest-failed)
+  make_repo_on_branch "$d/wt" fm/feat-coarsefail
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/coarsefail.meta" "window=fm:fm-coarsefail" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validating\n' > "$d/state/coarsefail.status"
+  FM_FAKE_RUN_HEAD=aaaaaaa
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="  running    fm/other-crew aaaaaaa  2026-08-19 00:24
+  failed     fm/feat-coarsefail ${short}  2026-08-19 00:22
+  completed  fm/feat-coarsefail bbbbbbb  2026-08-18 09:36"
+  out=$(run_crew_state "$d" coarsefail)
+  assert_contains "$out" "state: failed" "a bound newest failed row still reports failed"
+  assert_contains "$out" "source: run-step" "the coarse failure is run-step sourced"
+  assert_contains "$out" "run failed" "the detail names the failure"
+  pass "coarse newest row that failed and binds still reports failed"
+}
+
+# A genuinely failed run read the full way, where the CLI binds it by run id and
+# both of its heads have moved beyond the sha binding's reach. The run-id binding
+# must not turn optimistic just because it is stronger.
+test_run_id_bound_failed_run_still_reports_failed() {
+  reset_fakes
+  local d wt_head gate_head rebased out
+  d=$(new_case runid-failed)
+  make_repo_on_branch "$d/wt" fm/feat-runidfail
+  git -C "$d/wt" commit -q --allow-empty -m 'implementation commit'
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  rebased=$(rebased_sibling_head "$d/wt")
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/runidfail.meta" "window=fm:fm-runidfail" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: validating\n' > "$d/state/runidfail.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-runidfail
+    branch_sync_block fm/feat-runidfail "$wt_head" "$rebased" "$gate_head" user_owned)"
+  FM_FAKE_RUNS_LIST="  failed       fm/feat-runidfail      ${gate_head:0:8}  2026-08-19 00:22"
+  out=$(run_crew_state "$d" runidfail)
+  assert_contains "$out" "state: failed" "a run-id-bound failed run still reports failed"
+  assert_contains "$out" "source: run-step" "the failure comes from the run step"
+  assert_not_contains "$out" "state: working" "run-id binding must not hide a real failure"
+  pass "run-id-bound failed run still reports failed"
+}
+
+# The run-id binding stays exact: a `branch_sync` block that names another
+# branch, or whose view of this checkout's HEAD disagrees with what is really
+# there, is not this crew's run and binds nothing on its own.
+test_run_id_binding_rejects_foreign_branch_sync() {
+  reset_fakes
+  local d wt_head gate_head rebased out
+  d=$(new_case runid-foreign)
+  make_repo_on_branch "$d/wt" fm/feat-runidforeign
+  git -C "$d/wt" commit -q --allow-empty -m 'implementation commit'
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  rebased=$(rebased_sibling_head "$d/wt")
+  gate_head=$(gate_only_head "$d")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/runidforeign.meta" "window=fm:fm-runidforeign" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: cannot reach the package registry\n' > "$d/state/runidforeign.status"
+  FM_FAKE_RUN_HEAD="$gate_head"
+  # Run object on this crew's branch, but the branch_sync block reports a
+  # DIFFERENT checkout's branch, so the pipeline never bound it to this one.
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-runidforeign
+    branch_sync_block fm/other-crew "$wt_head" "$rebased" "$gate_head" pipeline_owned)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" runidforeign
+  out=$(run_crew_state "$d" runidforeign)
+  assert_not_contains "$out" "source: run-step" "a foreign branch_sync block binds nothing"
+  assert_contains "$out" "state: blocked" "the crew's own blocked report stays current"
+  pass "run-id binding rejects a branch_sync block for another checkout"
+}
+
 test_active_run_is_authoritative
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
@@ -1663,6 +1851,12 @@ test_both_terminal_newest_passed_outranks_older_failed_row
 test_new_run_before_first_step_binds_by_head
 test_abandoned_active_run_after_local_rewrite_not_attributed
 test_single_live_run_with_gate_only_head_binds
+test_live_parked_run_never_reported_failed
+test_live_parked_run_pipeline_activity_is_parked
+test_coarse_unbindable_newest_row_never_falls_back_to_older_row
+test_coarse_newest_row_failed_and_bound_still_reports_failed
+test_run_id_bound_failed_run_still_reports_failed
+test_run_id_binding_rejects_foreign_branch_sync
 
 # --- (m) --pipeline-activity: the PIPELINE's own clock ----------------------
 #

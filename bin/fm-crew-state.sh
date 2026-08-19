@@ -24,12 +24,19 @@
 #      active or terminal (from `axi status`, or the coarse `no-mistakes runs`
 #      fallback)? Branch name alone is not enough: a historical run on a reused
 #      branch whose head was rewritten or diverged must not be attributed.
-#      A run matches when its head equals the worktree HEAD, or the worktree HEAD
-#      is an ancestor of the run head (pipeline fix commits advanced the run on
-#      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution. The head an in-flight run
-#      reports is often invisible to this worktree, so the head the worktree
-#      SUBMITTED binds the run too - see nm_run_head_matches_worktree.
+#      Attribution is by RUN ID wherever the CLI supplies one: `axi status`
+#      emits its `branch_sync:` block only for the run that owns the current
+#      checkout's branch, and `branch_sync.pipeline.run` names that run's id, so
+#      that id matching the reported run - with `branch_sync.local` agreeing on
+#      this crew's branch and HEAD - is the pipeline's own attribution and needs
+#      no commit guessing (nm_run_id_binds_worktree). Only an answer carrying no
+#      such block falls back to the sha binding: a run matches when its head
+#      equals the worktree HEAD, or the worktree HEAD is an ancestor of the run
+#      head (pipeline fix commits advanced the run on the same line of history).
+#      Local work that advanced past the run head, or diverged from it,
+#      invalidates that fallback, as does a pipeline that rebased its own head
+#      off this worktree's line of history - which is why the run id has to lead
+#      (see nm_run_head_matches_worktree, and the incident it records).
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. A failed run
@@ -50,7 +57,11 @@
 #      `resolved` never become current state or detail.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crew, a dead endpoint also reports unknown · none rather
-#      than trusting a stale status log.
+#      than trusting a stale status log. The coarse fallback reports unknown · none
+#      too when this branch's NEWEST run row cannot be bound to this worktree: it
+#      answers only for that row, never for an older one further down the list, so
+#      a run it cannot read is reported as unread rather than as some other run's
+#      outcome.
 #
 # `--pipeline-activity` is a second, narrower read of the SAME attributed run:
 # instead of the crew's state it prints how the PIPELINE's own process is doing,
@@ -100,6 +111,12 @@ case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
 FM_CREW_STATE_RUNS_LIMIT=${FM_CREW_STATE_RUNS_LIMIT:-200}
 case "$FM_CREW_STATE_RUNS_LIMIT" in ''|*[!0-9]*) FM_CREW_STATE_RUNS_LIMIT=200 ;; esac
 SEP=' · '
+# What the coarse runs-list walk below returns when this branch's NEWEST run row
+# exists but cannot be bound to this worktree's code. Deliberately not a status
+# word: an unbindable newest row must make the reader say `unknown`, never let it
+# keep walking and credit an OLDER row's terminal outcome to the newer run it
+# could not read.
+COARSE_UNBINDABLE='__unbindable__'
 
 # Emit the one canonical line and exit 0. Detail is optional.
 emit() {  # <state> <source> [detail]
@@ -425,12 +442,20 @@ nm_runs_status_for_branch() {  # <branch>
     rest=$(trim "$rest")
     sha=${rest%% *}
     if [ "$br" = "$branch" ]; then
-      # Same code-identity rule as axi status: skip a same-branch row whose
-      # short-sha does not match this worktree (rewritten or advanced tip).
-      if ! nm_coarse_head_matches_worktree "$sha"; then
-        continue
+      # The list is newest-first, so the FIRST row for this branch is the only
+      # candidate this walk may ever answer with. Same code-identity rule as axi
+      # status: a row whose short-sha does not bind this worktree is not
+      # attributable - but the answer is then that it is unbindable, NOT a look
+      # further down the list. Skipping onward is what produced the 2026-08-19
+      # false `failed`: the branch's live run sat at a gate-repo-only head, so its
+      # own newest row did not bind, and the walk continued to an older failed run
+      # of the SAME branch still sitting on the worktree sha and reported its
+      # terminal outcome as current.
+      if nm_coarse_head_matches_worktree "$sha"; then
+        printf '%s' "$st"
+      else
+        printf '%s' "$COARSE_UNBINDABLE"
       fi
-      printf '%s' "$st"
       return 0
     fi
   done <<< "$out"
@@ -460,15 +485,91 @@ nm_commit_binds_worktree() {  # <commit-ish>
   git -C "$WT" merge-base --is-ancestor "$local_full" "$cand_full" 2>/dev/null
 }
 
-# 0 if the axi-status run reported for this branch is validating this worktree's
-# code. Branch match is a precondition (caller). Two heads can bind it, and
+# 0 if <commit> IS this worktree's HEAD, resolving an abbreviation the CLI
+# printed. Deliberately identity-only, unlike nm_commit_binds_worktree above:
+# the run-id binding below uses it to check that the CLI's own view of this
+# checkout still matches the one being read, where an ancestor is not the same
+# thing as agreement.
+same_commit_as_worktree_head() {  # <commit-ish>
+  local cand=${1:-} local_full cand_full
+  [ -n "$cand" ] || return 1
+  local_full=$(git -C "$WT" rev-parse HEAD 2>/dev/null) || return 1
+  cand_full=$(git -C "$WT" rev-parse --verify "${cand}^{commit}" 2>/dev/null) || return 1
+  [ "$cand_full" = "$local_full" ]
+}
+
+# Scalar value of a key nested one level under the `branch_sync:` block, e.g.
+# `nm_branch_sync_field local branch`. Scoped to that block, so a same-named key
+# elsewhere in the run object (`head:` appears in both `run:` and
+# `branch_sync.local:`) can never answer for it.
+nm_branch_sync_field() {  # <sub-block> <key>
+  printf '%s\n' "$RUN_OUT" | awk -v blk="$1" -v key="$2" '
+    {
+      indent = match($0, /[^[:space:]]/) - 1
+      if (indent < 0) next
+      if (indent == 0) { inbs = ($0 ~ /^branch_sync:[[:space:]]*$/); insub = 0; next }
+      if (!inbs) next
+      if (indent == 2) { insub = ($0 ~ ("^  " blk ":[[:space:]]*$")); next }
+      if (insub && indent == 4 && $0 ~ ("^    " key ":")) {
+        v = $0
+        sub(/^[^:]*:[[:space:]]*/, "", v)
+        print v
+        exit
+      }
+    }'
+}
+
+# 0 when the CLI ITSELF binds the reported run to this checkout, by run id
+# rather than by guessing at commits. This is the strongest attribution
+# available and is tried first.
+#
+# `axi status` emits its `branch_sync:` block only when the run it reports is
+# the one owning the CURRENT checkout's branch: querying any other run - a
+# sibling branch's run picked up by the repo-global bare call, or an explicit
+# `--run <id>` for another branch - returns the run object with no `branch_sync`
+# at all (verified 2026-08-19 against the installed v1.48.0 from two live
+# worktrees). Inside it, `pipeline.run` names the run id the pipeline considers
+# to own that branch. So run id equal to `pipeline.run`, plus `local.branch`
+# equal to this crew's branch, is the pipeline's own statement that this run is
+# validating this crew - no sha ancestry involved.
+#
+# Why this had to lead: both heads the sha binding can try are commits the
+# pipeline REWRITES. The rebase step alone rewrites the submitted head onto a
+# newer base, and each fix round adds to it, so `submitted_head` is the head the
+# pipeline is validating and not, in general, "the commit this worktree handed
+# it". On 2026-08-19 a live run parked at its review gate reported
+# head c3c0cfa7 (gate-repo only) and submitted_head 0df68e38 - a rebase of the
+# worktree's 985dd8af onto a newer main, so neither equal to nor a descendant of
+# it. Both head tests missed, attribution fell through to the coarse runs list,
+# and that walk credited the branch's OWN older failed run to the live one.
+# The same output carried `pipeline.run` matching the reported run id the whole
+# time.
+#
+# `local.head` must still agree with this worktree's HEAD. That keeps the
+# binding exact rather than optimistic: a crew that rewrote its branch out from
+# under an abandoned still-active run is not the checkout that run is reporting
+# on, so it binds nothing here and falls through to the pane and log sources.
+nm_run_id_binds_worktree() {
+  local run_id bs_run bs_branch
+  run_id=$(strip_quotes "$(nm_field id)")
+  [ -n "$run_id" ] || return 1
+  bs_run=$(strip_quotes "$(nm_branch_sync_field pipeline run)")
+  [ -n "$bs_run" ] && [ "$bs_run" = "$run_id" ] || return 1
+  bs_branch=$(strip_quotes "$(nm_branch_sync_field local branch)")
+  [ -n "$bs_branch" ] && [ "$bs_branch" = "$CREW_BRANCH" ] || return 1
+  same_commit_as_worktree_head "$(strip_quotes "$(nm_branch_sync_field local head)")"
+}
+
+# The FALLBACK attribution, for an answer that carries no `branch_sync` block at
+# all - nm_run_id_binds_worktree above is the primary test and needs no commit
+# guessing. Branch match is a precondition (caller). Two heads can bind it, and
 # either one is sufficient:
 #   - `head`, where the run sits NOW. It binds a run whose commits this worktree
 #     can still see: no pipeline commit yet, or the crew already synchronized to
 #     the pipeline-pushed head.
-#   - `branch_sync.pipeline.submitted_head`, the exact commit this worktree
-#     handed the pipeline. A run in flight rewrites its own head inside the local
-#     gate repo - the rebase step alone does it, before any fix round - and those
+#   - `branch_sync.pipeline.submitted_head`, the head the pipeline records itself
+#     as validating. A run in flight rewrites its own head inside the local gate
+#     repo - the rebase step alone does it, before any fix round - and those
 #     commits are not in the crew worktree until the pipeline pushes, so `head`
 #     resolves to nothing here and, on its own, disowns the very run that is
 #     validating this crew right now (verified 2026-08-11 against a real live
@@ -476,13 +577,29 @@ nm_commit_binds_worktree() {  # <commit-ish>
 #     submitted_head c27c5d94). Attribution then fell through to the coarse runs
 #     list, which matched an OLDER superseded run still sitting on the worktree
 #     sha and reported a healthy crew as failed.
-# Binding on the submitted head stays exact rather than optimistic: it is the
-# pipeline's own record of whose code a run is validating, so a crew that rewrote
-# its branch under an abandoned still-active run matches neither head and
-# correctly falls through to the pane/log sources below.
+# Read the submitted head as the pipeline's record and NOT as "the commit this
+# worktree handed it": the rebase step replays that commit onto a newer base, so
+# once a run has rebased, the submitted head is a rewrite of the worktree's HEAD
+# rather than that HEAD or a descendant of it, and neither test here can bind it
+# (verified 2026-08-19 against a real live run: worktree 985dd8af, run head
+# c3c0cfa7 gate-only, submitted_head 0df68e38 a rebase of 985dd8af onto a newer
+# main). That is the whole reason the run-id binding has to lead rather than
+# being a refinement of this one.
+# Both tests stay exact rather than optimistic, so a crew that rewrote its branch
+# under an abandoned still-active run matches neither head and correctly falls
+# through to the pane/log sources below.
 nm_run_head_matches_worktree() {
   nm_commit_binds_worktree "$(strip_quotes "$(nm_field head)")" && return 0
   nm_commit_binds_worktree "$(strip_quotes "$(nm_field submitted_head)")"
+}
+
+# The one attribution test the reader uses: the CLI's own run-id binding first,
+# then the sha binding above as the fallback for an answer that carries no
+# `branch_sync` block at all (an older CLI, or a run the CLI does not tie to
+# this checkout).
+nm_run_binds_worktree() {
+  nm_run_id_binds_worktree && return 0
+  nm_run_head_matches_worktree
 }
 
 # Coarse runs-list rows are "<status> <branch> <short-sha> ...". That row carries
@@ -506,7 +623,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_binds_worktree; then
       HAVE_RUN=1
     else
       # The active-or-most-recent run is for another branch, or same branch with
@@ -539,6 +656,13 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
         fi
       fi
       COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+      if [ "$COARSE_STATUS" = "$COARSE_UNBINDABLE" ]; then
+        # This branch's newest run could not be bound to this code, and no older
+        # run may answer for it. Say so instead of asserting any state: an honest
+        # `unknown` costs a supervisor one look, while a terminal verdict invites
+        # abandoning a run whose gate is still answerable.
+        emit unknown none "this branch's newest pipeline run could not be tied to this code, and an older run of the same branch must not answer for it"
+      fi
       if [ -n "$COARSE_STATUS" ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
