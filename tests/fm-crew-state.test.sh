@@ -364,7 +364,7 @@ EOF
 # commit that exists only inside the local gate repo. `next_action.code` is
 # `continue_active_run` while a run is live and `recover_custody` once a terminal
 # run is only holding custody.
-branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state> [next-action-code]
+branch_sync_block() {  # <branch> <local-head> <submitted-head> <current-head> <state> [next-action-code] [owning-run-id]
   cat <<EOF
 branch_sync:
   state: $5
@@ -374,7 +374,7 @@ branch_sync:
     head: $2
     clean: true
   pipeline:
-    run: "01RUN"
+    run: "${7:-01RUN}"
     status: running
     phase: pre_push
     submitted_head: $3
@@ -421,12 +421,12 @@ rebased_sibling_head() {  # <worktree> -> echoes the rebased sha
 
 # A commit id that is valid and real but lives in another repository, exactly
 # like a pipeline commit the local gate holds and the crew worktree cannot see.
-gate_only_head() {  # <case-dir> -> echoes a sha absent from the crew worktree
-  local gate="$1/gate-repo"
+gate_only_head() {  # <case-dir> [round] -> echoes a sha absent from the crew worktree
+  local gate="$1/gate-repo${2:+-$2}"
   if [ ! -d "$gate" ]; then
     mkdir -p "$gate"
     git -C "$gate" init -q
-    git -C "$gate" commit -q --allow-empty -m 'pipeline fix commit inside the gate'
+    git -C "$gate" commit -q --allow-empty -m "pipeline commit inside the gate${2:+ ($2)}"
   fi
   git -C "$gate" rev-parse HEAD
 }
@@ -1858,18 +1858,110 @@ test_stale_terminal_run_after_local_fix_commit_not_attributed() {
   fm_write_meta "$d/state/movedon.meta" "window=fm:fm-movedon" "worktree=$d/wt" "kind=ship" "harness=claude"
   printf 'working: fixing what the failed run reported\n' > "$d/state/movedon.status"
   FM_FAKE_RUN_HEAD="$gate_head"
+  # `continue_active_run`, the STRONGEST ownership claim the CLI can make, so the
+  # refusal is decided by the submitted head not carrying the fix commit and by
+  # nothing else.
   FM_FAKE_AXI_STATUS="$(run_failed fm/feat-movedon
     branch_sync_block fm/feat-movedon "$(git -C "$d/wt" rev-parse HEAD)" "$run_head" "$gate_head" \
-      pipeline_owned recover_custody)"
+      pipeline_owned continue_active_run)"
   FM_FAKE_RUNS_LIST="  failed       fm/feat-movedon      ${run_head:0:8}  2026-08-19 00:22"
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" movedon
   out=$(run_crew_state "$d" movedon)
   assert_not_contains "$out" "state: failed" "a stale terminal run must not answer for a worker that moved on"
-  assert_not_contains "$out" "source: run-step" "a run holding only a custody claim binds nothing"
+  assert_not_contains "$out" "source: run-step" "a visible pipeline head missing this work binds nothing"
   assert_contains "$out" "source: status-log" "the crew's own report answers instead"
   assert_contains "$out" "state: working" "a crew fixing after a failed run is working"
   pass "stale terminal run whose worker moved on is not attributed"
+}
+
+# The ordinary shape of an in-flight run, end to end: the rebase step moved the
+# pipeline head and no fix round has pushed, so BOTH pipeline heads live only
+# inside the local gate and no local test can decide code identity either way.
+# The pipeline's own live-ownership instruction is then the evidence, and the
+# live step it names is what the crew is doing.
+test_in_flight_run_with_no_visible_pipeline_head_binds() {
+  reset_fakes
+  local d wt_head submitted current out
+  d=$(new_case in-flight-gate-only)
+  make_repo_on_branch "$d/wt" fm/feat-inflight
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  submitted=$(gate_only_head "$d" submitted)
+  current=$(gate_only_head "$d" current)
+  [ "$submitted" != "$current" ] || fail "fixture needs two distinct gate-only heads"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/inflight.meta" "window=fm:fm-inflight" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'paused: waiting on the pipeline\n' > "$d/state/inflight.status"
+  FM_FAKE_RUN_HEAD="$current"
+  FM_FAKE_AXI_STATUS="$(run_fixing fm/feat-inflight
+    branch_sync_block fm/feat-inflight "$wt_head" "$submitted" "$current" pipeline_owned)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" inflight
+  out=$(run_crew_state "$d" inflight)
+  assert_contains "$out" "source: run-step" "a live run owning this checkout is attributed"
+  assert_contains "$out" "state: working" "an in-flight fix round reads as working"
+  assert_contains "$out" "validating (fixing)" "the detail names the live fix round"
+  pass "in-flight run with neither pipeline head visible binds on live ownership"
+}
+
+# The invariant that keeps that path from ever becoming a false `failed`: with no
+# code evidence available, a run that has already ENDED binds nothing, even when
+# the same answer still claims live ownership of the branch. The reader enforces
+# this itself rather than trusting the CLI's two statements to agree.
+test_terminal_run_with_no_visible_pipeline_head_binds_nothing() {
+  reset_fakes
+  local d wt_head submitted current out
+  d=$(new_case terminal-gate-only)
+  make_repo_on_branch "$d/wt" fm/feat-terminalgo
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  submitted=$(gate_only_head "$d" submitted)
+  current=$(gate_only_head "$d" current)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/terminalgo.meta" "window=fm:fm-terminalgo" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: cannot reach the package registry\n' > "$d/state/terminalgo.status"
+  FM_FAKE_RUN_HEAD="$current"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-terminalgo
+    branch_sync_block fm/feat-terminalgo "$wt_head" "$submitted" "$current" pipeline_owned)"
+  FM_FAKE_RUNS_LIST="  failed       fm/feat-terminalgo      ${current:0:8}  2026-08-19 00:22"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" terminalgo
+  out=$(run_crew_state "$d" terminalgo)
+  assert_not_contains "$out" "state: failed" "ownership alone must never assert a terminal verdict"
+  assert_not_contains "$out" "source: run-step" "a terminal run with no code evidence binds nothing"
+  assert_contains "$out" "state: blocked" "the crew's own blocked report stays current"
+  pass "terminal run with neither pipeline head visible binds nothing"
+}
+
+# Once an answer carries a `branch_sync` block, that block is the whole rule: the
+# older sha binding, which reads the run object's own top-level heads rather than
+# the pipeline's, may not rescue a run the CLI's attribution already refused.
+# Here the reported run sits exactly on the worktree HEAD - the sha binding's
+# strongest match - while `branch_sync.pipeline.run` names a DIFFERENT run as the
+# branch's owner, so the reported one is stale and must not answer.
+test_branch_sync_refusal_is_not_rescued_by_the_sha_binding() {
+  reset_fakes
+  local d wt_head out
+  d=$(new_case sync-refusal-not-rescued)
+  make_repo_on_branch "$d/wt" fm/feat-notrescued
+  work_commit "$d/wt" implementation
+  wt_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/notrescued.meta" "window=fm:fm-notrescued" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: cannot reach the package registry\n' > "$d/state/notrescued.status"
+  FM_FAKE_RUN_HEAD="$wt_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-notrescued
+    branch_sync_block fm/feat-notrescued "$wt_head" "$wt_head" "$wt_head" pipeline_owned \
+      continue_active_run 01NEWERRUN)"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" notrescued
+  out=$(run_crew_state "$d" notrescued)
+  assert_not_contains "$out" "state: failed" "a run the pipeline does not name as owner must not report failed"
+  assert_not_contains "$out" "source: run-step" "the sha binding must not rescue a branch_sync refusal"
+  assert_contains "$out" "state: blocked" "the crew's own blocked report stays current"
+  pass "a branch_sync refusal is not rescued by the sha binding"
 }
 
 # The run-id binding stays exact: a `branch_sync` block that names another
@@ -1964,6 +2056,9 @@ test_coarse_unbindable_newest_row_still_reads_the_pane
 test_coarse_newest_row_failed_and_bound_still_reports_failed
 test_run_id_bound_failed_run_still_reports_failed
 test_stale_terminal_run_after_local_fix_commit_not_attributed
+test_in_flight_run_with_no_visible_pipeline_head_binds
+test_terminal_run_with_no_visible_pipeline_head_binds_nothing
+test_branch_sync_refusal_is_not_rescued_by_the_sha_binding
 test_run_id_binding_rejects_foreign_branch_sync
 
 # --- (m) --pipeline-activity: the PIPELINE's own clock ----------------------

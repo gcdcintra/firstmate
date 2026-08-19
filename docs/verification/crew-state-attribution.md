@@ -74,15 +74,18 @@ A worker that added a commit the pipeline never received gets a `+` line instead
 ## When no pipeline head is visible at all
 
 An in-flight run's own commits live only inside the local gate, so `current_head` - and, after a rebase, `submitted_head` too - can be unresolvable in the worktree, leaving no local evidence in either direction.
-Only there does the reader fall back to the pipeline's own live-ownership instruction, which distinguishes a live run from a dead one holding custody:
+Only there does the reader fall back to the pipeline's own live-ownership instruction, `next_action.code: continue_active_run`, which is addressed to this checkout ("do not make local follow-up commits").
+
+That instruction buys a LIVE step and nothing else, because the reader refuses this path outright for a run whose own status is already terminal.
+That refusal is enforced in `fm-crew-state.sh` rather than inferred from the CLI, and deliberately so: the two halves of the pairing below come from DIFFERENT commands, so treating them as a guarantee would make a false `failed` depend on an unchecked cross-command assumption.
 
 | | live run owning the branch | terminal run holding only custody |
 | --- | --- | --- |
+| observed via | `no-mistakes axi status`, the four runs above | `no-mistakes axi sync --check`, the reproduction in [`nm-custody-deadlock.md`](nm-custody-deadlock.md) |
 | `safety` | `blocked_pipeline_owned` | `blocked_pipeline_owned_recoverable` |
 | `next_action.code` | `continue_active_run` | `recover_custody` |
 
-The live row is from the four runs above; the terminal row is the reproduction in [`nm-custody-deadlock.md`](nm-custody-deadlock.md).
-`continue_active_run` is addressed to this checkout ("do not make local follow-up commits") and is issued only while the run is live, so that path can report a live run's step and can never assert a terminal verdict.
+No `axi status` read of a terminal run holding custody was captured, which is exactly why the reader does not depend on one.
 
 ## Why the commit-sha binding cannot carry attribution alone
 
@@ -166,6 +169,8 @@ $ no-mistakes axi status --run 01M0C0NMH09NBK495KFFC9TAF8
 - `test_live_parked_run_never_reported_failed` reproduces this exact condition - gate-only run head, rebased submitted head, and the branch's own older failed rows below its live row - and fails with `state: failed · source: run-step · run failed` without the fix.
 - `test_live_parked_run_pipeline_activity_is_parked` pins the same binding for the pipeline-clock mode.
 - `test_coarse_unbindable_newest_row_never_falls_back_to_older_row` and `test_coarse_unbindable_newest_row_still_reads_the_pane` pin that no older row answers for an unbindable newest one, and that refusing it still leaves the status log and the pane busy signature to answer.
-- `test_stale_terminal_run_after_local_fix_commit_not_attributed` pins the other false-`failed` shape: a terminal run still named in `pipeline.run` after its worker committed a local fix binds nothing, because the pipeline's submitted head does not carry that commit.
+- `test_stale_terminal_run_after_local_fix_commit_not_attributed` pins the other false-`failed` shape: a terminal run still named in `pipeline.run` after its worker committed a local fix binds nothing, because the pipeline's submitted head does not carry that commit. It supplies `continue_active_run`, the strongest ownership claim the CLI can make, so only the code evidence can be deciding it.
+- `test_in_flight_run_with_no_visible_pipeline_head_binds` and `test_terminal_run_with_no_visible_pipeline_head_binds_nothing` pin the no-code-evidence path in both directions, with BOTH pipeline heads gate-only: a live run binds and reads its live step, and a terminal run binds nothing even while the same answer claims live ownership.
+- `test_branch_sync_refusal_is_not_rescued_by_the_sha_binding` pins that the older sha binding is reached only for an answer carrying no `branch_sync` block.
 - `test_coarse_newest_row_failed_and_bound_still_reports_failed` and `test_run_id_bound_failed_run_still_reports_failed` pin that genuinely failed runs are still reported failed, through both attribution paths.
 - `test_run_id_binding_rejects_foreign_branch_sync` pins that a `branch_sync` block describing another checkout binds nothing.

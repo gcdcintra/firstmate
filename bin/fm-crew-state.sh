@@ -37,16 +37,21 @@
 #      When no pipeline head is visible in this worktree at all there is no local
 #      evidence either way, and only then does the pipeline's own live-ownership
 #      instruction - `branch_sync.next_action.code: continue_active_run` - stand
-#      in for it; it is issued to THIS checkout and only ever for a live run, so
-#      that path can never assert a terminal verdict (nm_run_id_binds_worktree).
-#      Only an answer carrying no `branch_sync` block at all falls back to the
-#      sha binding: a run matches when its head equals the worktree HEAD, or the
-#      worktree HEAD is an ancestor of the run head (pipeline fix commits
-#      advanced the run on the same line of history). Local work that advanced
-#      past the run head, or diverged from it, invalidates that fallback, as does
-#      a pipeline that rebased its own head off this worktree's line of history -
-#      which is why the run id has to lead (see nm_run_head_matches_worktree, and
-#      the incident it records).
+#      in for it; it is issued to THIS checkout, and it buys a LIVE step only.
+#      A run that has already ended is refused on that path outright, so no-code-
+#      evidence can never assert a terminal verdict - enforced here rather than
+#      assumed of the CLI (nm_run_id_binds_worktree, nm_run_is_terminal).
+#      Which half applies is decided by the block's presence, not by the run-id
+#      binding's result: an answer CARRYING a `branch_sync` block is answered
+#      entirely by that binding, so a refusal it reached on the pipeline's own
+#      heads is never rescued by a looser match; an answer carrying no such block
+#      (an older CLI) falls back to the sha binding, where a run matches when its
+#      head equals the worktree HEAD, or the worktree HEAD is an ancestor of the
+#      run head (pipeline fix commits advanced the run on the same line of
+#      history). Local work that advanced past the run head, or diverged from it,
+#      invalidates that fallback, as does a pipeline that rebased its own head
+#      off this worktree's line of history - which is why the run id has to lead
+#      (see nm_run_head_matches_worktree, and the incident it records).
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. A failed run
@@ -531,13 +536,42 @@ nm_commit_visible_here() {  # <commit-ish>
 # point: a crew that committed a local fix after its run went terminal, or that
 # rewrote its branch out from under an abandoned run, leaves at least one commit
 # the pipeline never received, `git cherry` prefixes it `+`, and nothing binds.
+#
+# The ancestor pre-check is not a second rule, only the cheap half of the same
+# one: if the worktree HEAD is reachable from the candidate then every commit of
+# HEAD is literally in it, carried without any diffing. That is the shape of
+# every run that has NOT rebased, which is the common case, and it matters
+# because this reader runs per-crew on the watcher's single-threaded poll while
+# `git cherry` patch-ids every commit on the candidate's side of the merge base -
+# for a rebased head, however far the default branch had advanced. The patch-id
+# walk is therefore paid only for the rebase shape it was added for.
 nm_commit_carries_worktree_work() {  # <commit-ish>
   local cand=${1:-} cand_full unmatched
   nm_commit_visible_here "$cand" || return 1
   cand_full=$(git -C "$WT" rev-parse --verify "${cand}^{commit}" 2>/dev/null) || return 1
+  git -C "$WT" merge-base --is-ancestor HEAD "$cand_full" 2>/dev/null && return 0
   unmatched=$(git -C "$WT" cherry "$cand_full" HEAD 2>/dev/null) || return 1
   printf '%s\n' "$unmatched" | grep -q '^+' && return 1
   return 0
+}
+
+# 0 when the answer carries a `branch_sync:` block at all. That block is the only
+# source of the CLI's own attribution, so its presence decides WHICH binding may
+# run: with it, the run-id binding is the whole rule; without it, the sha binding
+# below is.
+nm_has_branch_sync() {
+  printf '%s\n' "$RUN_OUT" | grep -qE '^branch_sync:[[:space:]]*$'
+}
+
+# 0 when the reported run has already reached an end state, by either of the two
+# ways `axi status` says so: an `outcome:` line at all, or a terminal `status:`.
+# Every one of those maps to a terminal crew verdict (done or failed) below.
+nm_run_is_terminal() {
+  [ -n "$(strip_quotes "$(nm_field outcome)")" ] && return 0
+  case "$(strip_quotes "$(nm_field status)")" in
+    completed|failed|cancelled) return 0 ;;
+  esac
+  return 1
 }
 
 # Scalar value of a key nested one level under the `branch_sync:` block, e.g.
@@ -601,11 +635,17 @@ nm_branch_sync_field() {  # <sub-block> <key>
 # only inside the local gate. Only there does the pipeline's own live-ownership
 # instruction stand in: `next_action.code: continue_active_run` means "the
 # pipeline still owns the branch, keep driving the active run, do not make local
-# follow-up commits", it is addressed to THIS checkout, and it is issued only
-# while the run is live - a terminal run holding custody says `recover_custody`
-# instead (both verified against the installed CLI). So that path can report a
-# live run's step and can never assert a terminal verdict, which is the failure
-# mode this whole reader exists to prevent.
+# follow-up commits", and it is addressed to THIS checkout.
+#
+# That instruction buys a LIVE step and nothing else. The reader refuses this
+# path outright for a run that has already ended, so "no code evidence" can never
+# produce a terminal verdict - the failure mode this whole reader exists to
+# prevent. That is enforced here rather than inferred from the CLI: the observed
+# pairing (live runs say `continue_active_run`, a terminal run holding custody
+# says `recover_custody`) comes from two different commands, so treating it as a
+# guarantee would make a false `failed` depend on an unchecked cross-command
+# assumption. A terminal run whose heads this checkout cannot see is simply
+# unattributed, and falls through to the pane and log sources.
 nm_run_id_binds_worktree() {
   local run_id bs_run bs_branch submitted current
   run_id=$(strip_quotes "$(nm_field id)")
@@ -624,12 +664,14 @@ nm_run_id_binds_worktree() {
   # gets to overrule it.
   nm_commit_visible_here "$submitted" && return 1
   nm_commit_visible_here "$current" && return 1
+  nm_run_is_terminal && return 1
   [ "$(strip_quotes "$(nm_branch_sync_field next_action code)")" = continue_active_run ]
 }
 
-# The FALLBACK attribution, for an answer that carries no `branch_sync` block at
-# all - nm_run_id_binds_worktree above is the primary test and needs no commit
-# guessing. Branch match is a precondition (caller). Two heads can bind it, and
+# The FALLBACK attribution, reached ONLY for an answer that carries no
+# `branch_sync` block at all - nm_run_id_binds_worktree above is the whole rule
+# for any answer that carries one, and needs no commit guessing.
+# Branch match is a precondition (caller). Two heads can bind it, and
 # either one is sufficient:
 #   - `head`, where the run sits NOW. It binds a run whose commits this worktree
 #     can still see: no pipeline commit yet, or the crew already synchronized to
@@ -660,12 +702,19 @@ nm_run_head_matches_worktree() {
   nm_commit_binds_worktree "$(strip_quotes "$(nm_field submitted_head)")"
 }
 
-# The one attribution test the reader uses: the CLI's own run-id binding first,
-# then the sha binding above as the fallback for an answer that carries no
-# `branch_sync` block at all (an older CLI, or a run the CLI does not tie to
-# this checkout).
+# The one attribution test the reader uses, and the block's presence picks which
+# half applies. An answer CARRYING a `branch_sync` block is answered entirely by
+# the run-id binding: that block is the CLI's own attribution, so once it has
+# refused - including when it refused on a visible pipeline head that does not
+# carry this worktree's work - a looser ancestry match on the top-level `head:`
+# and `submitted_head:` fields must not rescue it. An answer carrying no block
+# (an older CLI) has no such attribution to consult, and falls back to the sha
+# binding above.
 nm_run_binds_worktree() {
-  nm_run_id_binds_worktree && return 0
+  if nm_has_branch_sync; then
+    nm_run_id_binds_worktree
+    return
+  fi
   nm_run_head_matches_worktree
 }
 
