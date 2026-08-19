@@ -565,6 +565,13 @@ select_lane() {
 run_coverage_guard() {
   local tmp missing extra a b shard
   local -a saved_scripts=()
+  # Every listing below is sorted under the C collation, so the comparisons over
+  # them must read it too: `comm` validates its inputs against the AMBIENT
+  # collation and rejects C-sorted paths outright on any locale that orders them
+  # differently (pt_BR.UTF-8, en_US.UTF-8), which took the whole guard down on an
+  # operator's own machine while passing in CI. Pinned once for the function
+  # rather than per command, so no later comparison can be added without it.
+  local -x LC_ALL=C
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-coverage.XXXXXX")
 
   all_repo_tests | LC_ALL=C sort -u >"$tmp/all"

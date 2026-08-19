@@ -10,7 +10,8 @@ When this session owns supervision and away mode is not active:
    Do not invent a wake from an attach-status line alone; drain and act only on real wake records or a real watcher reason line.
 4. On the one `Stop hook feedback` automatic-mechanism failure notice (`firstmate watcher auto-arm FAILED ...`), drain, inspect the automatic mechanism failure, and do not turn the notice into a repeating manual-arm loop.
 5. If the Stop hook does not claim the home or reports an exhausted failure, inspect its registration and watcher startup path before ending blind.
-   The one exception is a turn-end block naming another live session as the owner of this home's fleet lock: the Stop hook is correctly inert there, recovery belongs to that session, and this session's registration is not the fault.
+   A turn-end block naming a live recorded lock owner this session could not match to its own is no exception: the Stop hook stays inert there, but a broken hook is silent in exactly the same way, so inspect this session's registration too.
+   That block reports which reading its evidence supports instead of asserting another session owns recovery; [`turnend-guard.md`](../turnend-guard.md) owns the stood-down outcome.
    Keep the Stop-owned automatic mechanism as the only Claude arm owner.
 6. Treat `watcher: started ...` and `watcher: attached ...` inside automatic arm output as proof that one live cycle exists.
    On attach, the arm follows verified identity-matched successors instead of exiting when the first cycle ends.

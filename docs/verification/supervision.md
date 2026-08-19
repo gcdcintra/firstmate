@@ -633,6 +633,96 @@ acquire rc=1
 lock after refused acquire: 1409153
 ```
 
+### Background-job sessions
+
+Measured on 2026-08-17 with Claude Code 2.1.232 and 2.1.233 on Linux, against a live backgrounded primary firstmate session and one throwaway background job in a throwaway home.
+
+Claude Code has a single background-session feature, and its own help names what that feature starts:
+
+```text
+  --bg, --background                    Start the session as a background agent
+  agents [options]                      Manage background agents
+```
+
+A firstmate primary session moved into the background is one of those jobs.
+Reading the live session's own environment (`tr '\0' '\n' < /proc/2529774/environ`) printed:
+
+```text
+CLAUDE_CODE_SESSION_KIND=bg
+CLAUDE_BG_BACKEND=daemon
+CLAUDE_BG_SOURCE=slash
+CLAUDE_JOB_DIR=/home/gustavo-cintra/.claude/jobs/e07f3cf4
+```
+
+So `CLAUDE_JOB_DIR` marks a job, not specifically a worker, and one job-launch code path sets that identical shape for every job.
+
+The job's own record does separate the two shapes.
+A job created by backgrounding an existing session names the session it continues, while a job seeded with its own task names itself:
+
+```text
+jobs/e07f3cf4/state.json  sessionId=e07f3cf4-89d3-4051-b967-9d4ea8ffeda1  resumeSessionId=af6cf465-da1c-4e36-a493-793b8757bb45
+jobs/5aa61ddf/state.json  sessionId=5aa61ddf-e070-4197-a3cf-a1af772523c7  resumeSessionId=5aa61ddf-e070-4197-a3cf-a1af772523c7
+```
+
+The task-seeded job above was started with `claude --bg 'Reply with exactly: hello'`.
+Comparing its transcript against every other transcript in the same project directory:
+
+```text
+agent uuids: 13
+shared uuids with each of the 8 other sessions: 0
+positional prefix match with each: 0
+```
+
+A task-seeded job therefore fails the transcript proof on its own evidence, independently of the job-record test.
+
+`CLAUDE_JOB_DIR` is exported to every descendant process, so a record read through it attributes nothing on its own.
+The claim therefore requires the record to name the claimant's own session id and to name the recorded lock owner's resolved session as the one it continues, which is what refuses a nested session reading an ancestor's record.
+
+### Resolving a lock that records a backgrounded run
+
+The live-session registry keys on the session process pid, never on the `claude bg-pty-host` process a backgrounded session runs under - and that host process is the outermost pid of the contiguous harness run, so it is what the lock records for such a session:
+
+```text
+state/.lock                      2529590
+ps -o pid=,ppid=  2529590        2529590 3177     (claude bg-pty-host)
+ps -o pid=,ppid=  2529774        2529774 2529590  (the session process)
+~/.claude/sessions/2529774.json  present
+~/.claude/sessions/2529590.json  absent
+```
+
+Ownership itself was never affected, because `fm_session_lock_owned_by_self` tests membership of the whole contiguous run.
+Fork recovery was: resolving the recorded owner only through its own registry record left a fork of a backgrounded source unable to reclaim its home, which is the same inert-auto-arm symptom one hop later, and this fleet's own primary runs in exactly that topology.
+
+`fm_claude_session_id_of_pid` therefore falls back to the one live record whose session pid the recorded pid's own contiguous Claude run hosts.
+Measured against that live table on 2026-08-17, from the repo checkout:
+
+```text
+direct record of host pid 2529590        UNRESOLVED
+widened resolve of host pid 2529590      0b5c32a9-054a-44ce-acc1-9ad39553f7d3
+run hosts (2529774 under 2529590)        yes
+run hosts (2529774 under 1315077)        no      (a different live bg-pty-host)
+widened resolve of unrelated pid 484999  UNRESOLVED
+```
+
+The boundary is unchanged in every other direction, because the walk never leaves one contiguous Claude run: a session in another run is not reachable at all, two session records inside one run are ambiguity rather than an answer, and a recorded owner the registry vouches for nowhere in its run keeps the unchanged refusal - as does every non-Claude primary, whose own liveness read discards it before any candidate walk starts.
+A non-Claude owner is published as its own `owner-not-claude` evidence rather than folded into the unresolved case, because a live harness of another kind is the one thing that cannot be the displaced predecessor of a Claude session, and the turn-end guard must not offer that reading for it.
+It replaces every token the fork walk can reach without resolving the owner, `no-session-identity` as well as `owner-unresolved`: both describe only what the walk failed to learn, while the owner's kind is already established by the liveness read, so a claimant that carries no session id of its own is still told what the recorded owner is rather than only what it could not prove about itself.
+
+This fallback runs whenever the direct record misses, which is the normal shape for a backgrounded primary, and the turn-end guard reaches it twice per Stop.
+Candidates are therefore discarded cheapest-first, and the matcher the walk calls per hop was moved onto shell builtins.
+Counting `clone` with `strace -f -c` for one resolution of host pid 2529590 against the same 4 live registry records:
+
+```text
+before  163 clones
+after    68 clones
+```
+
+Both resolve host pid 2529590 to the same session and both leave the unrelated live Claude pid 484999 unresolved.
+
+The counts above predate one further discard, which was not re-measured against a live table: the run walk also requires the RECORDED pid to be a live Claude harness process, which is one answer for every candidate, so it is now read once on the first live candidate instead of per candidate.
+A resolvable Claude owner pays one extra process-table read for it; a lock held by a live codex, opencode, grok, kimi or pi primary stops paying an ancestry walk per live registry record for a walk that could never have succeeded, on a path the turn-end guard and the auto-arm reach up to four times per Stop.
+The no-live-candidate case still costs no subprocess at all.
+
 Deterministic entry points:
 
 ```sh

@@ -78,11 +78,30 @@ pass() {
 # background jobs BEFORE removing directories, by exact pid from `jobs -p`: the
 # process table is shared with every other worker on the machine, so it must
 # never pattern-match a process name.
+#
+# `jobs -p` covers only this shell's DIRECT children, which is not every process
+# a suite creates: a fixture that starts a host process publishing a grandchild
+# leaves that grandchild invisible to the job table, and killing the host merely
+# reparents it. Such a pid must be handed to fm_test_cleanup_register_pid the
+# moment it is known, so a `fail` anywhere after the spawn still retires it -
+# relying on a per-suite stop helper reached only on the happy path is what
+# leaked one past every suite exit.
+#
+# A registered pid is nonetheless weaker evidence than a job pid, and the
+# difference decides whether the reap is safe. An unwaited job is held in the
+# table by its own zombie, so its pid cannot be reused while this shell can still
+# name it; a registered grandchild is nobody's job here, so the moment it dies it
+# is reaped by init and its pid is free for the next process on the machine. A
+# suite that retires such a run mid-run and keeps going therefore leaves a long
+# window in which a bare recorded pid names something unrelated. Registration
+# binds the pid to its incarnation for exactly that reason, and cleanup signals it
+# only while that binding still holds.
 
 # Deliberately NOT exported. A subshell inherits it, which is the whole point,
 # while a separate test process that sources this library gets its own registry
 # and so can never delete a parent's roots.
 FM_TEST_CLEANUP_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/fm-test-registry.XXXXXX")
+FM_TEST_CLEANUP_PID_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/fm-test-pids.XXXXXX")
 
 # fm_test_cleanup_register <dir>: register <dir> for removal on EXIT. Safe to
 # call from a command-substitution subshell.
@@ -91,20 +110,61 @@ fm_test_cleanup_register() {
   printf '%s\n' "$1" >> "$FM_TEST_CLEANUP_REGISTRY"
 }
 
+# fm_test_cleanup_register_pid <pid> [<proc-start>]: register a process this suite
+# spawned that `jobs -p` cannot see - typically a grandchild published by a
+# fixture host - so EXIT reaps it by exact pid. Safe to call from a
+# command-substitution subshell. A non-numeric argument is ignored rather than
+# signalled: cleanup must never widen a kill to anything the caller did not name.
+#
+# The pid is recorded together with the kernel start time naming THIS incarnation
+# of it, so the reap can never reach a later, unrelated holder of a recycled pid.
+# <proc-start> overrides the live reading, for a test staging a pid whose
+# incarnation has already changed. Where the host cannot supply a start time at
+# all the pid stands for itself, exactly as before.
+fm_test_cleanup_register_pid() {
+  local pid=${1:-} start=${2:-}
+  case "$pid" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  [ -n "$start" ] || start=$(fm_test_proc_start "$pid")
+  printf '%s %s\n' "$pid" "$start" >> "$FM_TEST_CLEANUP_PID_REGISTRY"
+}
+
+# True while pid $1 is still the incarnation that was registered with start time
+# $2. An empty $2 is the no-evidence case - a job pid, which needs none, or a host
+# with no /proc - and keeps the unconditional reap.
+fm_test_pid_is_registered_incarnation() {
+  [ -n "${2:-}" ] || return 0
+  [ "$2" = "$(fm_test_proc_start "$1")" ]
+}
+
 fm_test_cleanup() {
-  local d p pids
-  # Exact-pid reap of this shell's own background jobs, so nothing this suite
-  # spawned outlives it holding the runner's stdout pipe open.
-  pids=$(jobs -p 2>/dev/null || true)
-  for p in $pids; do
+  local d p start records signalled=''
+  # Exact-pid reap of this shell's own background jobs and of every explicitly
+  # registered descendant, so nothing this suite spawned outlives it holding the
+  # runner's stdout pipe open. Each escalation re-checks the binding, because a
+  # registered pid that the first signal retired is free for reuse before the
+  # second one is sent.
+  records=$(jobs -p 2>/dev/null || true)
+  if [ -f "$FM_TEST_CLEANUP_PID_REGISTRY" ]; then
+    records=$(printf '%s\n%s\n' "$records" "$(cat "$FM_TEST_CLEANUP_PID_REGISTRY" 2>/dev/null || true)")
+    rm -f "$FM_TEST_CLEANUP_PID_REGISTRY"
+  fi
+  records=$(printf '%s\n' "$records" | awk 'NF')
+  while IFS=' ' read -r p start; do
+    [ -n "$p" ] || continue
+    fm_test_pid_is_registered_incarnation "$p" "$start" || continue
     kill "$p" 2>/dev/null || true
-  done
-  if [ -n "$pids" ]; then
+    signalled="$signalled$p $start"$'\n'
+  done <<< "$records"
+  if [ -n "$signalled" ]; then
     sleep 0.2
-    for p in $pids; do
+    while IFS=' ' read -r p start; do
+      [ -n "$p" ] || continue
+      fm_test_pid_is_registered_incarnation "$p" "$start" || continue
       kill -9 "$p" 2>/dev/null || true
       wait "$p" 2>/dev/null || true
-    done
+    done <<< "$signalled"
   fi
   if [ -f "$FM_TEST_CLEANUP_REGISTRY" ]; then
     while IFS= read -r d; do
@@ -201,6 +261,136 @@ exit 0
 SH
     chmod +x "$fakebin/$tool"
   done
+}
+
+# --- Claude Code session fixtures -------------------------------------------
+#
+# ONE encoding of the three external record shapes Claude Code writes and
+# bin/fm-session-lock-lib.sh parses: the live-session registry at
+# <config>/sessions/<pid>.json, the session transcript at
+# <config>/projects/<project>/<session-id>.jsonl, and the background-job record
+# at <job-dir>/state.json. They are an external contract, not firstmate output,
+# so a suite carrying its own copy would keep passing on a stale assumption after
+# the real shape moved - which is exactly what three independent copies of them
+# risked.
+
+# fm_test_claude_config <dir>: create the private configuration root <dir> with
+# the subdirectories the writers below populate, and echo it. A private root is
+# what keeps a live-owner case from reading the sessions of whichever machine
+# happens to run the suite.
+fm_test_claude_config() {
+  local dir=$1
+  mkdir -p "$dir/sessions" "$dir/projects/probe"
+  printf '%s\n' "$dir"
+}
+
+# fm_test_proc_start <pid>: echo the kernel start time of <pid> exactly as the
+# registry records it, read straight from /proc so it never depends on the
+# library's own parsing. Empty where /proc does not exist.
+fm_test_proc_start() {
+  [ -r "/proc/$1/stat" ] || return 0
+  awk '{ print $22 }' "/proc/$1/stat" 2>/dev/null
+}
+
+# fm_test_claude_fork_evidence_available: true when this host can supply that
+# start time at all. It binds a record to one incarnation of a pid, so fork
+# recovery is deliberately Linux-only and every other platform must refuse.
+fm_test_claude_fork_evidence_available() {
+  [ -n "$(fm_test_proc_start $$)" ]
+}
+
+# fm_test_claude_register_session <config> <pid> <session-id> [<proc-start>]:
+# write the live-session record Claude Code keeps for <pid>. The start time
+# defaults to the live one, so the record binds to this incarnation of the pid;
+# pass a differing one to stage a recycled pid.
+fm_test_claude_register_session() {
+  local config=$1 pid=$2 session_id=$3 start=${4:-}
+  [ -n "$start" ] || start=$(fm_test_proc_start "$pid")
+  printf '{"pid":%s,"sessionId":"%s","cwd":"/probe","procStart":"%s","kind":"interactive"}\n' \
+    "$pid" "$session_id" "$start" > "$config/sessions/$pid.json"
+}
+
+# fm_test_claude_write_transcript <config> <session-id> <uuid>...: write the
+# transcript for <session-id> carrying those message uuids, in the record shape a
+# fork copies verbatim.
+fm_test_claude_write_transcript() {
+  local config=$1 session_id=$2 uuid file
+  shift 2
+  file="$config/projects/probe/$session_id.jsonl"
+  : > "$file"
+  for uuid in "$@"; do
+    printf '{"parentUuid":null,"type":"user","uuid":"%s","sessionId":"%s"}\n' \
+      "$uuid" "$session_id" >> "$file"
+  done
+}
+
+# fm_test_claude_msg_uuid <n>: a distinct, well-formed v4-shaped message uuid.
+fm_test_claude_msg_uuid() {
+  printf '00000000-0000-4000-8000-%012d\n' "$1"
+}
+
+# fm_test_claude_job_dir <dir> <own-session-id> <resumed-session-id>: write the
+# background-job record `claude --bg` leaves at <dir>/state.json and echo <dir>,
+# for CLAUDE_JOB_DIR. The same session id in both fields is the shape a job
+# seeded with its own task carries.
+fm_test_claude_job_dir() {
+  local dir=$1
+  mkdir -p "$dir"
+  printf '{\n  "sessionId": "%s",\n  "resumeSessionId": "%s",\n  "template": "bg",\n  "backend": "daemon"\n}\n' \
+    "$2" "$3" > "$dir/state.json"
+  printf '%s\n' "$dir"
+}
+
+# fm_test_spawn_bg_session_run <harness> <dir>: start a backgrounded Claude
+# session as the process table really shows it - a harness-named host process with
+# the session process as its own CHILD - using the harness-named interpreter
+# <harness> and publishing the session pid under <dir>. Sets
+# FM_TEST_BG_HOST_PID, the outermost pid of the contiguous run and so the pid a
+# session lock records, and FM_TEST_BG_SESSION_PID, the only pid in that run the
+# harness registry ever keys a record on.
+#
+# Both pids are registered for cleanup as soon as they are known, because the
+# session process is this shell's GRANDCHILD: `jobs -p` never sees it, and the
+# readiness `fail` below fires with the host already running. Its own loop is
+# bounded for the same reason, so even a pid this fixture never got to publish
+# retires itself instead of spinning for the life of the machine.
+FM_TEST_BG_HOST_PID=
+FM_TEST_BG_SESSION_PID=
+fm_test_spawn_bg_session_run() {
+  local harness=$1 dir=$2 script i=0
+  mkdir -p "$dir"
+  script="$dir/bg-host.sh"
+  cat > "$script" <<'SH'
+#!/usr/bin/env bash
+# $1 = directory to publish the session pid into, $2 = harness-named interpreter.
+"$2" -c 'printf "%s\n" "$$" > "$0/session-pid"; i=0; while [ "$i" -lt 900 ]; do sleep 0.2; i=$((i + 1)); done' "$1" &
+wait
+SH
+  FM_TEST_BG_HOST_PID=
+  FM_TEST_BG_SESSION_PID=
+  rm -f "$dir/session-pid"
+  "$harness" "$script" "$dir" "$harness" >/dev/null 2>&1 &
+  FM_TEST_BG_HOST_PID=$!
+  fm_test_cleanup_register_pid "$FM_TEST_BG_HOST_PID"
+  while [ "$i" -lt 200 ] && [ ! -s "$dir/session-pid" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -s "$dir/session-pid" ] || fail "the backgrounded-run fixture never started its session process"
+  FM_TEST_BG_SESSION_PID=$(tr -d '[:space:]' < "$dir/session-pid")
+  fm_test_cleanup_register_pid "$FM_TEST_BG_SESSION_PID"
+}
+
+# fm_test_stop_bg_session_run: retire the run fm_test_spawn_bg_session_run last
+# published. Cleanup reaps it regardless, so this is only for a suite whose next
+# assertion needs the recorded owner to be dead.
+fm_test_stop_bg_session_run() {
+  local pid
+  for pid in "$FM_TEST_BG_SESSION_PID" "$FM_TEST_BG_HOST_PID"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  [ -z "$FM_TEST_BG_HOST_PID" ] || wait "$FM_TEST_BG_HOST_PID" 2>/dev/null || true
 }
 
 # --- deterministic git identity and fixtures --------------------------------

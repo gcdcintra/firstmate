@@ -59,12 +59,23 @@
 #      hard 8-consecutive-block override - then allow one loud attended
 #      fail-open only for an already verified failure episode.
 #
-# Stood-down outcome (another live session owns the fleet lock): when
-# state/.lock is held by a live foreign harness session, the Stop-owned
-# auto-arm correctly stays INERT by design (bin/fm-claude-stop-autoarm.sh) and
-# never writes an epoch or an EXHAUSTED FAILURE notice for this home - so step 3
-# above can never become reachable while waiting on that failure. This guard
-# treats "stood down because another live session owns the fleet" as its own
+# Stood-down outcome (the fleet lock records a live owner this session cannot
+# match to its own): the Stop-owned auto-arm stays INERT
+# (bin/fm-claude-stop-autoarm.sh) and never writes an epoch or an EXHAUSTED
+# FAILURE notice for this home - so step 3 above can never become reachable while
+# waiting on that failure.
+# The recorded owner may be a second session that owns recovery, or this
+# session's own displaced predecessor whose continuity could not be proven. No
+# command available to the operator separates those readings - bin/fm-lock.sh
+# status prints the same live-pid line for both - so the banner and the alarm
+# name the recorded pid and REPORT which reading the refusing sub-check actually
+# supports (FM_SESSION_LOCK_OWNER_EVIDENCE, published by the shared predicate)
+# instead of asserting one or asking the operator to establish it. Neither tells
+# the operator to skip inspecting this session's hook registration - a
+# misconfigured hook is silent in exactly the same way, and the 2026-08-14
+# incident stayed hidden for an evening behind a message that ruled that
+# inspection out.
+# This guard treats the stood-down case as its own
 # first-class outcome: it accounts that case on the SAME bounded
 # state/.turnend-claude-blocks budget as step 3, incrementing once per turn
 # instead of deduping against an epoch that cannot advance, so the two reasons
@@ -159,7 +170,62 @@ OWNER_LOCK="$STATE/.claude-autoarm.lock"
 FAILURE_NOTICE="$STATE/.claude-autoarm-failure-notified"
 FAILURE_ALARM="$STATE/.claude-autoarm-failure-alarmed"
 FOREIGN_LOCK_OWNER_ALIVE=0
+# What the stood-down outcome actually read, taken from the shared predicate's
+# own published values so the banner and the alarm can never name a pid, a
+# session, or a reason the decision did not use - this guard never re-reads
+# state/.lock for its message. Naming them is what makes the outcome checkable
+# instead of an assertion about who owns the home.
+FOREIGN_LOCK_OWNER_PID='unknown'
+FOREIGN_LOCK_OWNER_SESSION=''
+FOREIGN_LOCK_OWNER_EVIDENCE='owner-unresolved'
 SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"' 2>/dev/null || printf 'unknown')
+
+# Capture the deciding read of fm_session_lock_foreign_owner_alive(). Called
+# only where that predicate has just returned true, so these always describe a
+# read that actually produced the stood-down outcome.
+capture_standdown_owner() {
+  FOREIGN_LOCK_OWNER_PID=$FM_SESSION_LOCK_OWNER_PID
+  FOREIGN_LOCK_OWNER_SESSION=$FM_SESSION_LOCK_OWNER_SESSION
+  FOREIGN_LOCK_OWNER_EVIDENCE=$FM_SESSION_LOCK_OWNER_EVIDENCE
+}
+
+# The ONE rendering of what the refusal actually established, shared by the
+# stderr banner and the JSON alarm so the two operator-facing texts can never
+# disagree. It reports the evidence rather than directing the operator to
+# establish the reading themselves: no command available to them separates a
+# second live session from this session's own displaced predecessor, because
+# bin/fm-lock.sh status prints the same live-pid line for both (2026-08-14
+# incident). Apostrophe-free, because the JSON alarm below is a single-quoted
+# printf format that cannot carry one.
+standdown_evidence() {
+  case "$FOREIGN_LOCK_OWNER_EVIDENCE" in
+    transcript-diverged)
+      printf 'The evidence supports a second live session: that process runs Claude session %s, whose transcript has diverged from the transcript of this session, so it has taken turns of its own.' \
+        "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    transcript-missing)
+      printf 'The evidence is inconclusive: that process runs Claude session %s, but a transcript needed to compare the two could not be read, so continuity was never tested.' \
+        "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    owner-not-claude)
+      printf 'The evidence supports a primary of another kind: that process is a live verified harness that is not Claude Code, so no Claude fork continuity with it is possible at all, and recovering supervision for this home belongs to that primary.' ;;
+    owner-unresolved)
+      printf 'The evidence is inconclusive: that process is a live Claude harness that no live session record vouches for, neither its own nor one for the harness run it heads, which is equally how the displaced predecessor of this session reads after a fork and how a session the registry has already dropped reads.' ;;
+    job-record-unproven)
+      printf 'The evidence is inconclusive: this session runs inside a Claude Code background job whose own record does not name Claude session %s as the session it continues, so continuity was never tested.' \
+        "$FOREIGN_LOCK_OWNER_SESSION" ;;
+    owner-is-this-session)
+      printf 'The evidence is contradictory: that process resolves to the session id of this very session while sitting outside the harness ancestry of this process.' ;;
+    no-session-identity)
+      printf 'The evidence is inconclusive: this process carries no Claude session id, so no continuity evidence could be produced at all, which is itself worth diagnosing.' ;;
+    # Every token the shared predicate publishes has a case above. The fallback
+    # therefore states only what it actually knows - which sub-check refused -
+    # rather than any one reading, so a token added there and not mirrored here
+    # cannot turn into a confident claim about this home in the very message this
+    # guard exists to keep honest.
+    *)
+      printf 'The evidence is inconclusive: the refusing sub-check was %s, which this guard has no specific reading for, so treat the owner as undetermined.' \
+        "$FOREIGN_LOCK_OWNER_EVIDENCE" ;;
+  esac
+}
 budget_reset() {
   [ "$CLAUDE_MODE" -eq 1 ] || return 0
   fm_lock_try_acquire "$BUDGET_LOCK" || return 0
@@ -185,7 +251,7 @@ block_stop() {
   x_mode=0
   [ -f "$CONFIG/x-mode.env" ] && x_mode=1
   if [ "$CLAUDE_MODE" -eq 1 ] && [ "$FOREIGN_LOCK_OWNER_ALIVE" -eq 1 ] && [ "$afk" -eq 0 ]; then
-    reason="another live session already owns this home's fleet lock, so the Stop-owned auto-arm here correctly stays inert by design and will never record a failure. Supervision recovery belongs to that other session; do not inspect this session's hook registration."
+    reason="this home's fleet lock records live process $FOREIGN_LOCK_OWNER_PID, which this session could not match to its own, so the Stop-owned auto-arm stayed inert and will never record a failure here. $(standdown_evidence) Inspect the Stop hook registration of this session as well, because a broken hook is silent in exactly this way."
   else
     reason=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
       || printf '%s\n' 'tasks in flight, no live watcher - repair missing watcher supervision according to the session-start operating block before ending the turn')
@@ -382,7 +448,7 @@ failure_episode_verified() {
   esac
 }
 
-# --- stood-down accounting (another live session owns the fleet lock) --------
+# --- stood-down accounting (the lock records an unmatched live owner) --------
 # Shares the one BUDGET_FILE record, and its BUDGET_LOCK, with
 # budget_account_current_epoch() above: a single persisted counter is what keeps
 # the two reasons for re-blocking from independently reaching BLOCK_BUDGET and
@@ -437,6 +503,7 @@ standdown_terminal_fail_open() {
     return 2
   fi
   fm_session_lock_foreign_owner_alive "$STATE" || return 1
+  capture_standdown_owner
   (set -C; : > "$FAILURE_ALARM") 2>/dev/null
 }
 
@@ -458,21 +525,23 @@ if autoarm_owns_recovery; then
   exit 0
 fi
 
-# Another live session may already own this home's fleet lock, in which case
-# the auto-arm above correctly stayed inert and never wrote the epoch/failure
+# The lock may record a live owner this session cannot match to its own, in which
+# case the auto-arm above stayed inert and never wrote the epoch/failure
 # evidence the ordinary progression below waits for (see the header comment).
 # Handle that stood-down outcome on the shared block budget before assuming a
 # genuine auto-arm failure. Away mode owns supervision itself, so it blocks here
 # without spending any of that budget (see the header comment).
 if fm_session_lock_foreign_owner_alive "$STATE"; then
   FOREIGN_LOCK_OWNER_ALIVE=1
+  capture_standdown_owner
   [ ! -e "$STATE/.afk" ] || block_stop
   standdown_account || block_stop
   standdown_terminal_fail_open
   standdown_status=$?
   if [ "$standdown_status" -eq 0 ]; then
     NEED_DESC=$(need_desc)
-    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, another live session already owns this home fleet lock so the Stop-owned auto-arm here correctly stays inert and will never record a failure, no watcher or automatic continuation exists here, and the block budget is exhausted. Keep this session attended: wait for that other session to restore supervision or take over the fleet lock, and diagnose why that session watcher stopped beating before relying on unattended supervision here."}\n' "$NEED_DESC"
+    printf '{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: %s, this home fleet lock records live process %s which this session could not match to its own so the Stop-owned auto-arm stayed inert and will never record a failure here, no watcher or automatic continuation exists here, and the block budget is exhausted. %s Keep this session attended, and inspect the Stop hook registration of this session as well, because a broken hook is silent in exactly this way."}\n' \
+      "$NEED_DESC" "$FOREIGN_LOCK_OWNER_PID" "$(standdown_evidence)"
     exit 0
   fi
   [ "$standdown_status" -eq 2 ] && exit 0

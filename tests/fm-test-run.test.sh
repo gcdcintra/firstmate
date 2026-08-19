@@ -785,6 +785,66 @@ SH
   pass "a failing suite with a live background child is reported red promptly instead of wedging the runner"
 }
 
+# The reap above is by exact pid, which is only as safe as the pid still naming
+# what the suite registered. A pid handed to fm_test_cleanup_register_pid is not
+# this shell's job - it is a grandchild the job table never sees - so once it dies
+# init reaps it and the number is immediately free for any other process on the
+# machine. A suite that retires such a run mid-run and then keeps going leaves a
+# window in which EXIT would signal a stranger; on a shared worker with a 32768
+# pid_max that is a real reachable state, not a theoretical one.
+#
+# The fixture below is driven directly rather than through the runner: the
+# contract under test is the suite-EXIT reap in tests/lib.sh, and the runner adds
+# only the pipe it is not about. The victim is spawned HERE, so it belongs to this
+# suite and outlives the fixture unless the fixture kills it.
+test_registered_pid_reap_is_bound_to_its_incarnation() {
+  local tmp fixture victim grandchild rc out
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-recycle.XXXXXX")
+  fm_test_cleanup_register "$tmp"
+  fixture="$tmp/reaper.test.sh"
+  out="$tmp/out.txt"
+
+  sleep 300 >/dev/null 2>&1 &
+  victim=$!
+
+  cat >"$fixture" <<SH
+#!/usr/bin/env bash
+set -u
+# shellcheck source=/dev/null
+. "$ROOT/tests/lib.sh"
+# A grandchild the job table cannot see: the inner shell exits at once, leaving
+# the sleep parented elsewhere. Registered with its live start time, so EXIT must
+# still reap it.
+bash -c 'sleep 300 >/dev/null 2>&1 & printf "%s\n" "\$!" > "$tmp/grandchild.txt"'
+fm_test_cleanup_register_pid "\$(cat "$tmp/grandchild.txt")"
+# The same registration for a pid whose incarnation has moved on - the shape a
+# recycled pid presents. EXIT must leave it alone.
+fm_test_cleanup_register_pid "$victim" 1
+pass "fixture registered both pids"
+SH
+  chmod +x "$fixture"
+
+  set +e
+  bash "$fixture" >"$out" 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || { kill "$victim" 2>/dev/null || true; fail "the reaper fixture failed: $(cat "$out")"; }
+
+  if ! kill -0 "$victim" 2>/dev/null; then
+    fail "suite EXIT killed a pid registered under a start time that no longer matches: a recycled pid is reapable"
+  fi
+  kill "$victim" 2>/dev/null || true
+  wait "$victim" 2>/dev/null || true
+
+  grandchild=$(cat "$tmp/grandchild.txt" 2>/dev/null || true)
+  [ -n "$grandchild" ] || fail "the reaper fixture never published its grandchild pid"
+  if kill -0 "$grandchild" 2>/dev/null; then
+    kill -9 "$grandchild" 2>/dev/null || true
+    fail "a registered grandchild with a matching start time outlived the suite that registered it"
+  fi
+  pass "EXIT reaps a registered pid only while it is still the incarnation registered"
+}
+
 test_list_all_exact_suite_coverage
 test_family_selection
 test_single_script_selection
@@ -804,3 +864,4 @@ test_jobs_requires_proven_isolated
 test_jobs_parallel_scheduler_and_failure_propagation
 test_aggregate_json
 test_failing_suite_with_background_child_cannot_wedge_runner
+test_registered_pid_reap_is_bound_to_its_incarnation
