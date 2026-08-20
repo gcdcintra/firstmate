@@ -3,6 +3,8 @@ state/
 data/
 .no-mistakes/
 .lavish/
+# Local worktree-pool config written by the treehouse tool.
+/treehouse.toml
 .fm-secondmate-home
 .DS_Store
 __pycache__/
